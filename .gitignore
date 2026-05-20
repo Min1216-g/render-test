@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.render.example
+__pycache__/
+*.pyc
+.DS_Store
+*.log
+*.err.log
+*_launchd.log
+*_launchd.err.log
+mobile_market_access.log
+.price_cache/
+.pycache_check/
+.vscode/
+MarketScannerIOS/DerivedData/
+*.xcactivitylog

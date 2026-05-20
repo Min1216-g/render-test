@@ -1,0 +1,19 @@
+services:
+  - type: web
+    name: market-scanner-api
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
+    autoDeploy: false
+    envVars:
+      - key: MARKET_API_TOKEN
+        sync: false
+      - key: MARKET_RESULTS_FILE
+        value: market_scanner_results.csv
+      - key: MARKET_RATE_LIMIT_PER_MINUTE
+        value: "90"
+      - key: MARKET_RESULTS_CACHE_TTL
+        value: "20"
+      - key: MARKET_ALLOW_UNAUTH_HEALTH
+        value: "true"
