@@ -31,6 +31,7 @@ API_TOKEN = os.getenv("MARKET_API_TOKEN", "")
 ALLOW_UNAUTH_HEALTH = os.getenv("MARKET_ALLOW_UNAUTH_HEALTH", "true").lower() == "true"
 RATE_LIMIT_PER_MINUTE = int(os.getenv("MARKET_RATE_LIMIT_PER_MINUTE", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("MARKET_RESULTS_CACHE_TTL", "20"))
+ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "false").lower() == "true"
 
 app = FastAPI(title="Market Scanner API", version="1.0.0")
 app.add_middleware(
@@ -112,6 +113,20 @@ def _run_scanner_background() -> None:
     global _scanner_running, _cache_loaded_at
     try:
         _write_scanner_status(running=True, state="running", message="스캐너 실행중")
+        if not ENABLE_FULL_SCANNER:
+            _cache_loaded_at = 0
+            rows = _read_rows()
+            ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
+            _write_scanner_status(
+                running=False,
+                state="completed",
+                message=f"라이트 새로고침 완료 · {ok_rows}/{len(rows)} 정상 · 풀스캐너는 서버에서 비활성",
+                rows=len(rows),
+                ok_rows=ok_rows,
+                mode="light",
+            )
+            return
+
         update = subprocess.run(
             [sys.executable, str(REFRESH_SCRIPT), "--force"],
             cwd=BASE_DIR,
