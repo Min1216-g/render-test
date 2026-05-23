@@ -4,8 +4,12 @@
 from __future__ import annotations
 
 import csv
+import json
 import os
 import secrets
+import subprocess
+import sys
+import threading
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
@@ -20,6 +24,9 @@ from fastapi.responses import JSONResponse
 BASE_DIR = Path(__file__).resolve().parent
 RESULT_FILE = Path(os.getenv("MARKET_RESULTS_FILE", BASE_DIR / "market_scanner_results.csv"))
 IOS_RESULT_FILE = BASE_DIR / "MarketScannerIOS" / "MarketScannerIOS" / "market_scanner_results.csv"
+REFRESH_SCRIPT = BASE_DIR / "run_market_scanner_update.py"
+MOBILE_INTEL_SCRIPT = BASE_DIR / "mobile_intelligence_feed.py"
+SCANNER_STATUS_FILE = BASE_DIR / "scanner_run_status.json"
 API_TOKEN = os.getenv("MARKET_API_TOKEN", "")
 ALLOW_UNAUTH_HEALTH = os.getenv("MARKET_ALLOW_UNAUTH_HEALTH", "true").lower() == "true"
 RATE_LIMIT_PER_MINUTE = int(os.getenv("MARKET_RATE_LIMIT_PER_MINUTE", "90"))
@@ -30,7 +37,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=[origin.strip() for origin in os.getenv("MARKET_CORS_ORIGINS", "*").split(",")],
     allow_credentials=False,
-    allow_methods=["GET"],
+    allow_methods=["GET", "POST"],
     allow_headers=["X-Market-Token", "X-API-Token", "Authorization", "Content-Type"],
 )
 
@@ -38,6 +45,8 @@ _request_log: Dict[str, Deque[float]] = defaultdict(deque)
 _cache_rows: List[Dict[str, str]] = []
 _cache_loaded_at = 0.0
 _cache_file_mtime = 0.0
+_scanner_lock = threading.Lock()
+_scanner_running = False
 
 
 def _now_iso() -> str:
@@ -77,6 +86,86 @@ def _read_rows() -> List[Dict[str, str]]:
     _cache_loaded_at = now
     _cache_file_mtime = file_mtime
     return _cache_rows
+
+
+def _read_scanner_status() -> Dict[str, object]:
+    if not SCANNER_STATUS_FILE.exists():
+        return {"running": False, "state": "idle", "message": "스캐너 대기"}
+    try:
+        return json.loads(SCANNER_STATUS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"running": False, "state": "unknown", "message": "상태 파일 확인 실패"}
+
+
+def _write_scanner_status(**payload: object) -> None:
+    status = {
+        "running": bool(payload.get("running", False)),
+        "state": payload.get("state", "idle"),
+        "message": payload.get("message", ""),
+        "updated_at": _now_iso(),
+    }
+    status.update(payload)
+    SCANNER_STATUS_FILE.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _run_scanner_background() -> None:
+    global _scanner_running, _cache_loaded_at
+    try:
+        _write_scanner_status(running=True, state="running", message="스캐너 실행중")
+        update = subprocess.run(
+            [sys.executable, str(REFRESH_SCRIPT), "--force"],
+            cwd=BASE_DIR,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=int(os.getenv("MARKET_SCANNER_REFRESH_TIMEOUT", "1800")),
+        )
+        if update.returncode != 0:
+            _write_scanner_status(
+                running=False,
+                state="failed",
+                message="스캐너 실패",
+                return_code=update.returncode,
+                output=(update.stdout + "\n" + update.stderr)[-4000:],
+            )
+            return
+
+        enrich = subprocess.run(
+            [sys.executable, str(MOBILE_INTEL_SCRIPT)],
+            cwd=BASE_DIR,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=300,
+        )
+        if enrich.returncode != 0:
+            _write_scanner_status(
+                running=False,
+                state="partial",
+                message="스캐너 완료 · 모바일 보강 실패",
+                return_code=enrich.returncode,
+                output=(update.stdout + "\n" + enrich.stdout + "\n" + enrich.stderr)[-4000:],
+            )
+            return
+
+        _cache_loaded_at = 0
+        rows = _read_rows()
+        ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
+        _write_scanner_status(
+            running=False,
+            state="completed",
+            message=f"스캐너 완료 · {ok_rows}/{len(rows)} 정상",
+            rows=len(rows),
+            ok_rows=ok_rows,
+            output=(update.stdout + "\n" + enrich.stdout)[-4000:],
+        )
+    except subprocess.TimeoutExpired:
+        _write_scanner_status(running=False, state="timeout", message="스캐너 시간 초과")
+    except Exception as exc:
+        _write_scanner_status(running=False, state="failed", message=f"스캐너 오류: {exc}")
+    finally:
+        with _scanner_lock:
+            _scanner_running = False
 
 
 def _float_value(row: Dict[str, str], *keys: str) -> float:
@@ -196,6 +285,7 @@ async def status(request: Request) -> Dict[str, object]:
     path = _result_path()
     mtime = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if path.exists() else ""
     ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
+    scanner_status = _read_scanner_status()
     return {
         "ok": True,
         "rows": len(rows),
@@ -203,6 +293,46 @@ async def status(request: Request) -> Dict[str, object]:
         "markets": sorted({row.get("market", "") for row in rows if row.get("market")}),
         "file_updated_at": mtime,
         "server_updated_at": _now_iso(),
+        "scanner": scanner_status,
+    }
+
+
+@app.post("/api/scanner/run")
+async def scanner_run(request: Request) -> Dict[str, object]:
+    global _scanner_running
+    await guarded(request)
+    with _scanner_lock:
+        if _scanner_running:
+            return {
+                "ok": True,
+                "started": False,
+                "running": True,
+                "message": "이미 스캐너 실행중",
+                "status": _read_scanner_status(),
+                "updated_at": _now_iso(),
+            }
+        _scanner_running = True
+        _write_scanner_status(running=True, state="queued", message="스캐너 실행 요청됨")
+        thread = threading.Thread(target=_run_scanner_background, daemon=True)
+        thread.start()
+    return {
+        "ok": True,
+        "started": True,
+        "running": True,
+        "message": "스캐너 백그라운드 실행 시작",
+        "status": _read_scanner_status(),
+        "updated_at": _now_iso(),
+    }
+
+
+@app.get("/api/scanner/status")
+async def scanner_status(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    status = _read_scanner_status()
+    return {
+        "ok": True,
+        "status": status,
+        "updated_at": _now_iso(),
     }
 
 
@@ -249,6 +379,6 @@ def root() -> Dict[str, object]:
     return {
         "ok": True,
         "service": "Market Scanner API",
-        "endpoints": ["/api/health", "/api/status", "/api/results", "/api/top-movers"],
+        "endpoints": ["/api/health", "/api/status", "/api/results", "/api/top-movers", "/api/scanner/run", "/api/scanner/status"],
         "auth": "Send X-Market-Token, X-API-Token, or Authorization: Bearer <token>",
     }
