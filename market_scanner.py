@@ -45,6 +45,7 @@ ETF_NOW_CACHE_LOCK = threading.Lock()
 ETF_NOW_CACHE = None
 ETF_HOLDINGS_CACHE_LOCK = threading.Lock()
 ETF_HOLDINGS_CACHE = {}
+ETF_HOLDINGS_SKIP_TICKERS = {"VFV.TO"}
 INTRADAY_CACHE_LOCK = threading.Lock()
 INTRADAY_CACHE = {}
 INTRADAY_SCAN_COUNT = 0
@@ -3185,6 +3186,9 @@ def fetch_etf_holdings_context(name, ticker, sector=""):
         return empty_etf_holdings_context("")
 
     cache_key = str(ticker or name or "").upper()
+    if cache_key in ETF_HOLDINGS_SKIP_TICKERS:
+        return empty_etf_holdings_context("보유비중 제외 · 가격/배당만 확인")
+
     with ETF_HOLDINGS_CACHE_LOCK:
         if cache_key in ETF_HOLDINGS_CACHE:
             return ETF_HOLDINGS_CACHE[cache_key]
