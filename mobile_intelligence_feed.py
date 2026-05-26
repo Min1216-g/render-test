@@ -388,6 +388,9 @@ def news_price_forecast(row: pd.Series) -> str:
 
     market = market_text(row)
     news_text = f"{text(row, 'news')} {text(row, 'news_one_line')} {text(row, 'headlines')} {text(row, 'risks')}"
+    if contains_any(news_text, ["최신 호재/악재 없음", "과거 뉴스 판단 제외", "과거 뉴스 · 판단 제외"]):
+        return "뉴스 영향 예상: 최신 재료 없음 · 과거 뉴스는 판단 제외"
+
     keyword_level, keyword_message = classify_sector_keyword_impact(text(row, "sector"), news_text)
     atr = max(2.5, min(12.0, number(row.get("atr_pct"), 5.0)))
     volume = max(0.5, min(5.0, number(row.get("volume_ratio"), 1.0)))

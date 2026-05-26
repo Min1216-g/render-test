@@ -2183,6 +2183,8 @@ def summarize_news_one_line(news_summary, headlines):
     ]
     headline = clean_headlines[0] if clean_headlines else ""
     headline_text = shorten_news_title_preserving_date(headline)
+    if headline and not is_fresh_signal_news_title(headline):
+        return f"과거 뉴스 · 판단 제외: {headline_text}"
     if "악재" in summary and headline:
         return f"악재 뉴스: {headline_text}"
     if "호재" in summary and headline:
@@ -2254,6 +2256,24 @@ def is_recent_news_datetime(value, max_age_days=None):
     return value.astimezone(pd.Timestamp.now(tz="UTC").tzinfo) >= cutoff
 
 
+def extract_news_date_from_title(title):
+    text = clean_news_title(title)
+    match = re.search(r"\((20\d{2})-(\d{2})-(\d{2})\)\s*$", text)
+    if not match:
+        return None
+    year, month, day = map(int, match.groups())
+    return datetime(year, month, day, tzinfo=pd.Timestamp.now(tz=SEOUL_TZ).tzinfo)
+
+
+def is_fresh_signal_news_title(title, max_age_days=None):
+    max_age_days = NEWS_SIGNAL_MAX_AGE_DAYS if max_age_days is None else max_age_days
+    published_at = extract_news_date_from_title(title)
+    if published_at is None:
+        return not NEWS_REQUIRE_DATED_SIGNAL
+    cutoff = pd.Timestamp.now(tz=SEOUL_TZ).to_pydatetime() - timedelta(days=max_age_days)
+    return published_at >= cutoff
+
+
 def format_news_title_with_date(title, published_at=None):
     clean = clean_news_title(title)
     if not clean:
@@ -2296,6 +2316,8 @@ MAX_STOCKS = int(os.getenv("MARKET_SCANNER_MAX_STOCKS", "0"))
 MIN_TRADE_VALUE = float(os.getenv("MARKET_SCANNER_MIN_TRADE_VALUE", "1000000000"))
 ENABLE_NEWS = os.getenv("MARKET_SCANNER_ENABLE_NEWS", "true").lower() == "true"
 NEWS_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_MAX_AGE_DAYS", "14"))
+NEWS_SIGNAL_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_SIGNAL_MAX_AGE_DAYS", "3"))
+NEWS_REQUIRE_DATED_SIGNAL = os.getenv("MARKET_SCANNER_NEWS_REQUIRE_DATED_SIGNAL", "true").lower() == "true"
 NEWS_ALLOW_STALE_FALLBACK = os.getenv("MARKET_SCANNER_NEWS_ALLOW_STALE_FALLBACK", "false").lower() == "true"
 NEWS_ALLOW_UNDATED_NAVER = os.getenv("MARKET_SCANNER_NEWS_ALLOW_UNDATED_NAVER", "false").lower() == "true"
 ENABLE_FLOW = os.getenv("MARKET_SCANNER_ENABLE_FLOW", "true").lower() == "true"
@@ -3507,6 +3529,8 @@ def score_news_headlines(headlines):
     severe_negative_hits = []
     capital_raise_notes = []
     for title in headlines[:8]:
+        if not is_fresh_signal_news_title(title):
+            continue
         capital_raise_type, capital_raise_hits = classify_capital_raise_news(title)
         for keyword, weight in POSITIVE_NEWS_KEYWORDS.items():
             if keyword in title:
@@ -3756,7 +3780,26 @@ def fetch_news_context(name, sector=None):
             "source_errors": " | ".join(errors[:2]),
         }
 
-    scored = score_news_headlines(headlines)
+    signal_headlines = [title for title in headlines if is_fresh_signal_news_title(title)]
+    if not signal_headlines:
+        latest_reference = shorten_news_title_preserving_date(headlines[0])
+        return {
+            "score": 0,
+            "risk": 0,
+            "strength": "none",
+            "strong_hits": [],
+            "medium_hits": [],
+            "weak_hits": [],
+            "negative_hits": [],
+            "severe_negative_hits": [],
+            "summary": "최신 호재/악재 없음",
+            "headlines": headlines[:2],
+            "one_line": f"최신 호재/악재 없음 · 과거 뉴스 판단 제외: {latest_reference}",
+            "status": "stale_only",
+            "source": "+".join(sources),
+        }
+
+    scored = score_news_headlines(signal_headlines)
 
     return {
         "score": scored["score"],
@@ -3768,8 +3811,8 @@ def fetch_news_context(name, sector=None):
         "negative_hits": scored["negative_hits"],
         "severe_negative_hits": scored.get("severe_negative_hits", []),
         "summary": scored["summary"],
-        "headlines": headlines[:2],
-        "one_line": summarize_news_one_line(scored["summary"], headlines[:2]),
+        "headlines": signal_headlines[:2],
+        "one_line": summarize_news_one_line(scored["summary"], signal_headlines[:2]),
         "status": "ok",
         "source": "+".join(sources),
     }
