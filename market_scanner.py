@@ -46,6 +46,21 @@ ETF_NOW_CACHE = None
 ETF_HOLDINGS_CACHE_LOCK = threading.Lock()
 ETF_HOLDINGS_CACHE = {}
 ETF_HOLDINGS_SKIP_TICKERS = {"VFV.TO"}
+FULL_SERVICE_ETF_NAMES = {"TIGER 미국우주테크"}
+FULL_SERVICE_ETF_PROXY_HOLDINGS = {
+    "TIGER 미국우주테크": [
+        {"symbol": "RKLB", "name": "Rocket Lab", "weight": 15.0},
+        {"symbol": "ASTS", "name": "AST SpaceMobile", "weight": 13.0},
+        {"symbol": "PL", "name": "Planet Labs", "weight": 10.0},
+        {"symbol": "LUNR", "name": "Intuitive Machines", "weight": 10.0},
+        {"symbol": "RDW", "name": "Redwire", "weight": 9.0},
+        {"symbol": "AVAV", "name": "AeroVironment", "weight": 8.0},
+        {"symbol": "KTOS", "name": "Kratos Defense", "weight": 8.0},
+        {"symbol": "JOBY", "name": "Joby Aviation", "weight": 7.0},
+        {"symbol": "ACHR", "name": "Archer Aviation", "weight": 7.0},
+        {"symbol": "TXT", "name": "Textron", "weight": 5.0},
+    ]
+}
 INTRADAY_CACHE_LOCK = threading.Lock()
 INTRADAY_CACHE = {}
 INTRADAY_SCAN_COUNT = 0
@@ -2870,6 +2885,15 @@ def is_tiger_etf(name, ticker):
     }
 
 
+def is_full_service_etf(name, ticker):
+    full_service_codes = {
+        korean_stock_code(TIGER_ETF_STOCKS[item])
+        for item in FULL_SERVICE_ETF_NAMES
+        if item in TIGER_ETF_STOCKS
+    }
+    return str(name or "").strip() in FULL_SERVICE_ETF_NAMES or korean_stock_code(ticker) in full_service_codes
+
+
 def is_etf_like(name, ticker, sector=""):
     sector_text = str(sector or "").upper()
     name_text = str(name or "").upper()
@@ -2880,6 +2904,43 @@ def is_etf_like(name, ticker, sector=""):
         or "ETF" in sector_text.split("/")
         or bool(re.search(r"\bETF\b", name_text))
     )
+
+
+def is_lightweight_etf(name, ticker, sector=""):
+    return is_etf_like(name, ticker, sector) and not is_full_service_etf(name, ticker)
+
+
+def lightweight_etf_summary(name=None):
+    return "ETF 경량 모드 · TIGER 미국우주테크만 풀분석"
+
+
+def empty_news_context(summary="뉴스 생략"):
+    return {
+        "score": 0,
+        "risk": 0,
+        "strength": "none",
+        "strong_hits": [],
+        "medium_hits": [],
+        "weak_hits": [],
+        "negative_hits": [],
+        "severe_negative_hits": [],
+        "summary": summary,
+        "headlines": [],
+        "one_line": summary,
+        "status": "skipped",
+        "source": "skipped",
+    }
+
+
+def empty_flow_context(summary="수급 생략"):
+    return {
+        "score": 0,
+        "risk": 0,
+        "summary": summary,
+        "foreign_net": 0.0,
+        "institution_net": 0.0,
+        "status": "skipped",
+    }
 
 
 def empty_etf_now_context(summary="ETF NOW 확인 대기"):
@@ -2965,6 +3026,8 @@ def fetch_etf_now_cache():
 def fetch_etf_now_context(name, ticker):
     if not is_tiger_etf(name, ticker):
         return empty_etf_now_context("")
+    if not is_full_service_etf(name, ticker):
+        return empty_etf_now_context(lightweight_etf_summary(name))
 
     code = korean_stock_code(ticker)
     if not code:
@@ -3206,6 +3269,8 @@ def fetch_holding_daily_moves(holdings):
 def fetch_etf_holdings_context(name, ticker, sector=""):
     if not is_etf_like(name, ticker, sector):
         return empty_etf_holdings_context("")
+    if not is_full_service_etf(name, ticker):
+        return empty_etf_holdings_context(lightweight_etf_summary(name))
 
     cache_key = str(ticker or name or "").upper()
     if cache_key in ETF_HOLDINGS_SKIP_TICKERS:
@@ -3216,7 +3281,12 @@ def fetch_etf_holdings_context(name, ticker, sector=""):
             return ETF_HOLDINGS_CACHE[cache_key]
 
     try:
-        holdings, source_date, source_url = fetch_stockanalysis_holdings(ticker)
+        if str(name or "").strip() in FULL_SERVICE_ETF_PROXY_HOLDINGS:
+            holdings = FULL_SERVICE_ETF_PROXY_HOLDINGS[str(name or "").strip()]
+            source_date = pd.Timestamp.now(tz=SEOUL_TZ).strftime("%Y-%m-%d")
+            source_url = "theme_proxy:space_aerospace"
+        else:
+            holdings, source_date, source_url = fetch_stockanalysis_holdings(ticker)
         if not holdings:
             context = empty_etf_holdings_context("보유비중 확인 대기 · 구성종목 데이터 없음")
         else:
@@ -3240,7 +3310,8 @@ def fetch_etf_holdings_context(name, ticker, sector=""):
                 label = symbol if symbol and symbol.upper() != "N/A" else name_text
                 lines.append(f"{label} {weight:.2f}% · {change_text} · {contribution_text}")
             date_text = f" · {source_date} 기준" if source_date else ""
-            summary = f"상위 {min(len(lines), 10)}개 보유비중{date_text} · 가중 등락 {weighted_move:+.2f}%p"
+            proxy_text = "대표 우주테크 구성 흐름" if str(source_url).startswith("theme_proxy:") else f"상위 {min(len(lines), 10)}개 보유비중"
+            summary = f"{proxy_text}{date_text} · 가중 등락 {weighted_move:+.2f}%p"
             context = {
                 "etf_holdings_source": source_url,
                 "etf_holdings_source_date": source_date,
@@ -3964,7 +4035,12 @@ def analyze_stock(name, ticker, market_context):
             etf_holdings = fetch_etf_holdings_context(name, ticker, SECTOR_MAP.get(name, "국장/TIGER ETF"))
             price = latest_price or 0.0
             change_pct = latest_change or 0.0
-            intraday = build_intraday_1m_context(ticker, change_pct)
+            lightweight_etf = is_lightweight_etf(name, ticker, SECTOR_MAP.get(name, "국장/TIGER ETF"))
+            intraday = empty_intraday_context(lightweight_etf_summary(name)) if lightweight_etf else build_intraday_1m_context(ticker, change_pct)
+            news = fetch_news_context(name, SECTOR_MAP.get(name, "국장/TIGER ETF")) if is_full_service_etf(name, ticker) else empty_news_context(lightweight_etf_summary(name))
+            data_sources = ["naver_realtime", "naver_etf_nav"]
+            if is_full_service_etf(name, ticker):
+                data_sources.extend([f"news:{news.get('source', 'unknown')}", "etf_now", "etf_holdings"])
             return {
                 "name": name,
                 "ticker": ticker,
@@ -4010,9 +4086,9 @@ def analyze_stock(name, ticker, market_context):
                 "technical_score": 15 if price > 0 else 0,
                 "volume_score": 0,
                 "flow_score": 0,
-                "news_score": 0,
+                "news_score": news["score"],
                 "market_score": market_context["score_adjust"],
-                "risk": 6 if price > 0 else 0,
+                "risk": (6 + int(news["risk"])) if price > 0 else 0,
                 "overheated": False,
                 "chase_risk": False,
                 "market_regime": market_context["regime"],
@@ -4033,20 +4109,27 @@ def analyze_stock(name, ticker, market_context):
                 "atr_pct": 0.0,
                 "patterns": "ETF 괴리율 확인",
                 "reasons": " · ".join(
-                    item for item in [etf["etf_summary"], etf_now["etf_now_summary"], etf_holdings["etf_holdings_summary"]] if item
+                    item
+                    for item in [
+                        etf["etf_summary"],
+                        etf_now["etf_now_summary"],
+                        etf_holdings["etf_holdings_summary"],
+                        news.get("one_line", ""),
+                    ]
+                    if item
                 )
                 or "ETF 현재가 확인",
-                "risks": "신규 ETF는 장기 데이터 부족",
+                "risks": "신규 ETF는 장기 데이터 부족" if not news["risk"] else f"신규 ETF는 장기 데이터 부족, 뉴스 리스크: {news['summary']}",
                 "flow": "ETF 수급 별도 확인",
                 "flow_status": "etf",
                 "foreign_net": 0.0,
                 "institution_net": 0.0,
-                "news": "ETF 기초자산 흐름 확인",
-                "news_source": "etf",
-                "news_one_line": "ETF는 현재가와 NAV 괴리율을 같이 확인합니다.",
-                "news_strength": "none",
-                "headlines": "-",
-                "data_sources": "naver_realtime, naver_etf_nav, etf_now, etf_holdings",
+                "news": news["summary"] if is_full_service_etf(name, ticker) else "ETF 경량 모드",
+                "news_source": news.get("source", "etf"),
+                "news_one_line": news.get("one_line", "ETF는 현재가와 NAV 괴리율을 같이 확인합니다.") if is_full_service_etf(name, ticker) else lightweight_etf_summary(name),
+                "news_strength": news.get("strength", "none"),
+                "headlines": " | ".join(news["headlines"]) if news.get("headlines") else "-",
+                "data_sources": ", ".join(data_sources),
             }
         return {
             "name": name,
@@ -4085,10 +4168,12 @@ def analyze_stock(name, ticker, market_context):
     daily_close = price
     price, price_source, price_drift_pct = apply_latest_price(ticker, price, prev_close, open_price)
     change_pct, change_source = latest_change_pct(ticker, price, prev_close, price_source)
+    sector = SECTOR_MAP.get(name, "기타")
+    lightweight_etf = is_lightweight_etf(name, ticker, sector)
     etf = fetch_etf_nav_context(name, ticker, price)
     etf_now = fetch_etf_now_context(name, ticker)
-    etf_holdings = fetch_etf_holdings_context(name, ticker, SECTOR_MAP.get(name, "기타"))
-    intraday = build_intraday_1m_context(ticker, change_pct)
+    etf_holdings = fetch_etf_holdings_context(name, ticker, sector)
+    intraday = empty_intraday_context(lightweight_etf_summary(name)) if lightweight_etf else build_intraday_1m_context(ticker, change_pct)
     gap_pct = ((open_price / prev_close) - 1) * 100 if prev_close else 0
 
     ma5 = float(close.rolling(5).mean().iloc[-1])
@@ -4109,9 +4194,8 @@ def analyze_stock(name, ticker, market_context):
     low_20 = float(close.tail(20).min())
     range_pos = ((price - low_20) / (high_20 - low_20)) * 100 if high_20 > low_20 else 0
 
-    sector = SECTOR_MAP.get(name, "기타")
-    flow = fetch_flow_context(ticker)
-    news = fetch_news_context(name, sector)
+    flow = empty_flow_context(lightweight_etf_summary(name)) if lightweight_etf else fetch_flow_context(ticker)
+    news = empty_news_context(lightweight_etf_summary(name)) if lightweight_etf else fetch_news_context(name, sector)
 
     technical_score = 0
     volume_score = 0
@@ -4370,9 +4454,9 @@ def analyze_stock(name, ticker, market_context):
                     price_source,
                     f"news:{news.get('source', 'unknown')}",
                     f"flow:{flow.get('status', 'unknown')}",
-                    "intraday_1m" if should_fetch_intraday_1m(ticker) else "",
-                    "etf_now" if is_tiger_etf(name, ticker) else "",
-                    "etf_holdings" if is_etf_like(name, ticker, sector) else "",
+                    "intraday_1m" if should_fetch_intraday_1m(ticker) and not lightweight_etf else "",
+                    "etf_now" if is_full_service_etf(name, ticker) else "",
+                    "etf_holdings" if is_full_service_etf(name, ticker) else "",
                 ]
                 if item
             )
