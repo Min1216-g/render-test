@@ -17,3 +17,18 @@ services:
         value: "20"
       - key: MARKET_ALLOW_UNAUTH_HEALTH
         value: "true"
+
+  - type: cron
+    name: market-scanner-vancouver-schedule
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python render_cron_runner.py --mode auto
+    schedule: "0 23,0,1 * * *"
+    envVars:
+      - key: MARKET_API_TOKEN
+        sync: false
+      - key: MARKET_SCANNER_REMOTE_UPLOAD_URL
+        value: https://market-scanner-api-fo2m.onrender.com/api/results/upload
+      - key: MARKET_RESULTS_FILE
+        value: market_scanner_results.csv

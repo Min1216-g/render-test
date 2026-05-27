@@ -37,6 +37,28 @@ MARKET_RATE_LIMIT_PER_MINUTE=90
 MARKET_RESULTS_CACHE_TTL=20
 ```
 
+## Scheduled Updates
+
+Render cron schedules use UTC. The repo includes `render_cron_runner.py` so the job can wake at both daylight-saving candidates and only run when the current Vancouver hour matches.
+
+Configured in `render.yaml` as one cron service:
+
+- `market-scanner-vancouver-schedule`
+  - Wakes at UTC candidates for Vancouver 16:00 and 17:00.
+  - Runs `python render_cron_runner.py --mode auto`.
+  - Vancouver 16:00: quick scanner refresh and upload to the mobile API.
+  - Vancouver 17:00: full program refresh, including scanner, quiet money, news pulse, US/Canada scanners, today hot predictor, and mobile intelligence.
+
+The job skips Friday and Saturday in Vancouver time.
+
+Required cron environment variables:
+
+```text
+MARKET_API_TOKEN=your-existing-api-token
+MARKET_SCANNER_REMOTE_UPLOAD_URL=https://market-scanner-api-fo2m.onrender.com/api/results/upload
+MARKET_RESULTS_FILE=market_scanner_results.csv
+```
+
 ## Test
 
 ```bash
