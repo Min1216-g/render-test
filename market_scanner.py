@@ -2330,8 +2330,8 @@ TOP_N = int(os.getenv("MARKET_SCANNER_TOP_N", "10"))
 MAX_STOCKS = int(os.getenv("MARKET_SCANNER_MAX_STOCKS", "0"))
 MIN_TRADE_VALUE = float(os.getenv("MARKET_SCANNER_MIN_TRADE_VALUE", "1000000000"))
 ENABLE_NEWS = os.getenv("MARKET_SCANNER_ENABLE_NEWS", "true").lower() == "true"
-NEWS_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_MAX_AGE_DAYS", "14"))
-NEWS_SIGNAL_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_SIGNAL_MAX_AGE_DAYS", "3"))
+NEWS_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_MAX_AGE_DAYS", "3"))
+NEWS_SIGNAL_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_SIGNAL_MAX_AGE_DAYS", "2"))
 NEWS_REQUIRE_DATED_SIGNAL = os.getenv("MARKET_SCANNER_NEWS_REQUIRE_DATED_SIGNAL", "true").lower() == "true"
 NEWS_ALLOW_STALE_FALLBACK = os.getenv("MARKET_SCANNER_NEWS_ALLOW_STALE_FALLBACK", "false").lower() == "true"
 NEWS_ALLOW_UNDATED_NAVER = os.getenv("MARKET_SCANNER_NEWS_ALLOW_UNDATED_NAVER", "false").lower() == "true"
@@ -3853,7 +3853,6 @@ def fetch_news_context(name, sector=None):
 
     signal_headlines = [title for title in headlines if is_fresh_signal_news_title(title)]
     if not signal_headlines:
-        latest_reference = shorten_news_title_preserving_date(headlines[0])
         return {
             "score": 0,
             "risk": 0,
@@ -3863,9 +3862,9 @@ def fetch_news_context(name, sector=None):
             "weak_hits": [],
             "negative_hits": [],
             "severe_negative_hits": [],
-            "summary": "최신 호재/악재 없음",
-            "headlines": headlines[:2],
-            "one_line": f"최신 호재/악재 없음 · 과거 뉴스 판단 제외: {latest_reference}",
+            "summary": "오늘 기준 호재/악재 없음",
+            "headlines": [],
+            "one_line": "오늘 기준 호재/악재 없음 · 오래된 뉴스는 표시 제외",
             "status": "stale_only",
             "source": "+".join(sources),
         }
@@ -3949,13 +3948,15 @@ def build_ai_recommendation(
     dividend_yield = float(dividend.get("dividend_yield_pct") or 0)
     news_score = int(news.get("score") or 0)
     news_risk = int(news.get("risk") or 0)
+    news_status = str(news.get("status") or "")
 
     ai_score = final_score
-    early_setup = -2.5 <= change_pct <= 3.5 and 40 <= rsi_value <= 68 and 0.8 <= volume_ratio <= 2.4
-    pullback_setup = ("눌림" in action_reason or "재상승" in action_reason) and change_pct <= 4
+    early_setup = -2.5 <= change_pct <= 2.8 and 40 <= rsi_value <= 66 and 0.9 <= volume_ratio <= 2.2
+    pullback_setup = ("눌림" in action_reason or "재상승" in action_reason) and change_pct <= 3.5 and rsi_value <= 68
+    confirmed_setup = liquidity_confirmed and not chase_risk and not overheated and (early_setup or pullback_setup or volume_ratio >= 1.15)
     chase_penalty = 0
 
-    if news_score > 0:
+    if news_score > 0 and news_status == "ok":
         ai_score += min(8, news_score)
     if early_setup:
         ai_score += 12
@@ -3969,10 +3970,12 @@ def build_ai_recommendation(
         ai_score -= min(10, news_risk)
     if news_risk >= 7 and news_score <= 0:
         ai_score = min(ai_score, 84)
+    if news_status in {"stale_only", "skipped", "unavailable"}:
+        ai_score -= 4
     if risk >= MARKET_RISK_DOWNGRADE_THRESHOLD:
         ai_score -= 8
     if not liquidity_confirmed:
-        ai_score -= 8
+        ai_score -= 14
     if change_pct >= 5:
         chase_penalty += 10
     if change_pct >= 8:
@@ -3990,18 +3993,24 @@ def build_ai_recommendation(
     failure_adjustment, failure_reason = failure_adjustment_for(name, ticker, market_label, sector)
     if failure_adjustment:
         ai_score += failure_adjustment
+        if failure_adjustment < 0:
+            ai_score = min(ai_score, 69)
 
     if chase_penalty >= 18:
         ai_score = min(ai_score, 71)
     elif chase_penalty >= 10:
         ai_score = min(ai_score, 83)
+    if not confirmed_setup:
+        ai_score = min(ai_score, 79)
+    if news_risk >= 10:
+        ai_score = min(ai_score, 68)
 
-    if ai_score >= 88 and risk < MARKET_RISK_DOWNGRADE_THRESHOLD and not chase_risk and not overheated and change_pct <= 4.5:
+    if ai_score >= 88 and risk < MARKET_RISK_DOWNGRADE_THRESHOLD and confirmed_setup and change_pct <= 3.5:
         label = "AI 추천"
-        reason = "아직 추격 구간이 아니고 점수, 거래, 뉴스가 같이 양호합니다."
+        reason = "추격 구간이 아니고 거래량, 가격 위치, 리스크가 같이 맞습니다."
     elif ai_score >= 72 and risk < MARKET_RISK_BLOCK_THRESHOLD:
         label = "AI 관심"
-        reason = "조건은 괜찮지만 진입 전 가격 위치를 확인해야 합니다."
+        reason = "조건은 일부 괜찮지만 바로 매수보다 가격 위치 확인이 필요합니다."
     else:
         label = "AI 관망"
         reason = "지금은 확실한 우위가 부족합니다."
@@ -4012,6 +4021,12 @@ def build_ai_recommendation(
     elif chase_penalty >= 10 and label == "AI 추천":
         label = "AI 관심"
         reason = "모멘텀은 강하지만 추격 위험이 있어 눌림 확인이 필요합니다."
+    if not confirmed_setup and label == "AI 추천":
+        label = "AI 관심"
+        reason = "점수는 높지만 거래량·가격 위치 확인이 부족해 추천에서 내렸습니다."
+    if news_risk >= 10 and label != "AI 관망":
+        label = "AI 관망"
+        reason = "최근 악재 리스크가 커서 신규 추천에서 제외합니다."
 
     if market_label == "캐나다" and dividend_yield >= 3 and label != "AI 관망":
         reason = f"{reason} 배당률 {dividend_yield:.2f}%도 참고할 만합니다."

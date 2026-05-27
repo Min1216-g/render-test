@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import os
 import shutil
 import subprocess
 import sys
@@ -9,6 +10,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import requests
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -23,6 +25,8 @@ VANCOUVER_RUN_TIMES = {(15, 0), (15, 30), (16, 0)}
 VANCOUVER_SKIP_WEEKDAYS = {4, 5}
 MIN_TOTAL_ROWS_FOR_APP_SYNC = 500
 MIN_OK_ROWS_FOR_APP_SYNC = 50
+REMOTE_UPLOAD_URL = os.getenv("MARKET_SCANNER_REMOTE_UPLOAD_URL", "https://market-scanner-api-fo2m.onrender.com/api/results/upload").strip()
+REMOTE_API_TOKEN = os.getenv("MARKET_API_TOKEN", "").strip()
 
 
 def should_run_now(force: bool) -> tuple[bool, str]:
@@ -55,6 +59,30 @@ def result_file_is_safe_for_app(path: Path) -> tuple[bool, str]:
     if ok_rows < MIN_OK_ROWS_FOR_APP_SYNC:
         return False, f"app sync blocked: only {ok_rows} ok rows, likely network/data failure"
     return True, f"result safe: {total_rows} rows, {ok_rows} ok rows"
+
+
+def upload_results_to_remote(path: Path) -> None:
+    if not REMOTE_UPLOAD_URL or not REMOTE_API_TOKEN:
+        print("remote upload skipped: MARKET_API_TOKEN not set", flush=True)
+        return
+    try:
+        response = requests.post(
+            REMOTE_UPLOAD_URL,
+            data=path.read_bytes(),
+            headers={
+                "X-Market-Token": REMOTE_API_TOKEN,
+                "Content-Type": "text/csv; charset=utf-8",
+            },
+            timeout=45,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        print(
+            f"remote upload ok: {payload.get('ok_rows', '?')}/{payload.get('rows', '?')} rows",
+            flush=True,
+        )
+    except Exception as exc:
+        print(f"remote upload failed: {exc}", flush=True)
 
 
 def main() -> int:
@@ -97,6 +125,7 @@ def main() -> int:
         IOS_RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(RESULT_FILE, IOS_RESULT_FILE)
         print(f"synced {RESULT_FILE.name} -> {IOS_RESULT_FILE}", flush=True)
+        upload_results_to_remote(RESULT_FILE)
         STATE_FILE.write_text(datetime.now(VANCOUVER_TZ).strftime("%Y-%m-%d-%H-%M"), encoding="utf-8")
     finally:
         LOCK_FILE.unlink(missing_ok=True)

@@ -9,6 +9,7 @@ import os
 import secrets
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections import defaultdict, deque
@@ -32,6 +33,9 @@ ALLOW_UNAUTH_HEALTH = os.getenv("MARKET_ALLOW_UNAUTH_HEALTH", "true").lower() ==
 RATE_LIMIT_PER_MINUTE = int(os.getenv("MARKET_RATE_LIMIT_PER_MINUTE", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("MARKET_RESULTS_CACHE_TTL", "20"))
 ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "false").lower() == "true"
+MAX_UPLOAD_BYTES = int(os.getenv("MARKET_RESULTS_UPLOAD_MAX_BYTES", "6000000"))
+MIN_UPLOAD_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_ROWS", "500"))
+MIN_UPLOAD_OK_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_OK_ROWS", "50"))
 
 app = FastAPI(title="Market Scanner API", version="1.0.0")
 app.add_middleware(
@@ -87,6 +91,41 @@ def _read_rows() -> List[Dict[str, str]]:
     _cache_loaded_at = now
     _cache_file_mtime = file_mtime
     return _cache_rows
+
+
+def _parse_csv_bytes(payload: bytes) -> List[Dict[str, str]]:
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"CSV decode failed: {exc}") from exc
+
+    reader = csv.DictReader(text.splitlines())
+    rows = [_public_row(row) for row in reader]
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV has no rows")
+    if len(rows) < MIN_UPLOAD_ROWS:
+        raise HTTPException(status_code=400, detail=f"CSV row count too low: {len(rows)}")
+    ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
+    if ok_rows < MIN_UPLOAD_OK_ROWS:
+        raise HTTPException(status_code=400, detail=f"CSV ok row count too low: {ok_rows}")
+    return rows
+
+
+def _replace_result_file(payload: bytes, rows: List[Dict[str, str]]) -> None:
+    global _cache_rows, _cache_loaded_at, _cache_file_mtime
+
+    RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(RESULT_FILE.parent), prefix=".results-", suffix=".csv") as tmp:
+        tmp.write(payload)
+        tmp_path = Path(tmp.name)
+    tmp_path.replace(RESULT_FILE)
+
+    if IOS_RESULT_FILE.parent.exists():
+        IOS_RESULT_FILE.write_bytes(payload)
+
+    _cache_rows = rows
+    _cache_loaded_at = time.time()
+    _cache_file_mtime = RESULT_FILE.stat().st_mtime
 
 
 def _read_scanner_status() -> Dict[str, object]:
@@ -364,6 +403,39 @@ async def results(
         "ok": True,
         "count": len(rows),
         "rows": rows,
+        "updated_at": _now_iso(),
+    }
+
+
+@app.post("/api/results/upload")
+async def upload_results(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    content_type = request.headers.get("Content-Type", "")
+    if "text/csv" not in content_type and "application/octet-stream" not in content_type:
+        raise HTTPException(status_code=415, detail="upload requires text/csv or application/octet-stream")
+
+    payload = await request.body()
+    if not payload:
+        raise HTTPException(status_code=400, detail="empty upload")
+    if len(payload) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"upload too large: {len(payload)} bytes")
+
+    rows = _parse_csv_bytes(payload)
+    _replace_result_file(payload, rows)
+    ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
+    _write_scanner_status(
+        running=False,
+        state="uploaded",
+        message=f"CSV 즉시 업로드 완료 · {ok_rows}/{len(rows)} 정상",
+        rows=len(rows),
+        ok_rows=ok_rows,
+        mode="upload",
+    )
+    return {
+        "ok": True,
+        "rows": len(rows),
+        "ok_rows": ok_rows,
+        "file_updated_at": datetime.fromtimestamp(RESULT_FILE.stat().st_mtime).isoformat(timespec="seconds"),
         "updated_at": _now_iso(),
     }
 
