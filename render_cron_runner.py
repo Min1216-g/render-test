@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 from datetime import datetime
@@ -20,6 +21,14 @@ def run_command(command: list[str]) -> int:
     completed = subprocess.run(command, cwd=BASE_DIR, check=False)
     print("exit code:", completed.returncode, flush=True)
     return completed.returncode
+
+
+def require_upload_token() -> bool:
+    if os.getenv("MARKET_API_TOKEN", "").strip():
+        print("upload token: configured", flush=True)
+        return True
+    print("upload token: missing MARKET_API_TOKEN, mobile app will not receive cron results", flush=True)
+    return False
 
 
 def main() -> int:
@@ -52,9 +61,13 @@ def main() -> int:
         return 0
 
     if mode == "scanner":
-        return run_command([sys.executable, str(BASE_DIR / "run_market_scanner_update.py"), "--force"])
+        if not require_upload_token():
+            return 2
+        return run_command([sys.executable, str(BASE_DIR / "render_mobile_refresh.py")])
 
-    return run_command([sys.executable, str(BASE_DIR / "run_all_market_programs.py")])
+    if not require_upload_token():
+        return 2
+    return run_command([sys.executable, str(BASE_DIR / "render_mobile_refresh.py")])
 
 
 if __name__ == "__main__":

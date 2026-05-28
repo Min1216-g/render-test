@@ -47,7 +47,7 @@ Configured in `render.yaml` as one cron service:
   - Wakes at UTC candidates for Vancouver 16:00 and 17:00.
   - Runs `python render_cron_runner.py --mode auto`.
   - Vancouver 16:00: quick scanner refresh and upload to the mobile API.
-  - Vancouver 17:00: full program refresh, including scanner, quiet money, news pulse, US/Canada scanners, today hot predictor, and mobile intelligence.
+  - Vancouver 17:00: second mobile refresh and upload to the mobile API.
 
 The job skips Friday and Saturday in Vancouver time.
 
@@ -58,6 +58,19 @@ MARKET_API_TOKEN=your-existing-api-token
 MARKET_SCANNER_REMOTE_UPLOAD_URL=https://market-scanner-api-fo2m.onrender.com/api/results/upload
 MARKET_RESULTS_FILE=market_scanner_results.csv
 ```
+
+Important:
+
+- Pushing `render.yaml` does not always create a new Cron Job by itself.
+- In Render, open **Blueprints** and sync this repo, or create a Cron Job manually with:
+  - Name: `market-scanner-vancouver-schedule`
+  - Runtime: Python
+  - Build Command: `pip install -r requirements.txt`
+  - Command: `python render_cron_runner.py --mode auto`
+  - Schedule: `0 23,0,1 * * *`
+- If the Cron Job log says `missing MARKET_API_TOKEN`, add the same API token used by the web service to the Cron Job's Environment Variables.
+- A successful run should print `remote upload ok` in the logs. Without that line, the iPhone app will keep showing the previous CSV.
+- Render cron currently runs the mobile-safe refresh path only: `market_scanner_update` + `mobile_intelligence_feed` + final CSV upload. Do not point Render at local-only scripts unless those files are committed and secrets are moved to environment variables.
 
 ## Test
 
