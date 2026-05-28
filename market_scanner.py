@@ -2108,6 +2108,58 @@ COMPANY_RISK_CONTEXT_TERMS = {
     "HDC현대산업개발": ["붕괴", "부실시공", "안전사고", "하자", "국토부", "제재"],
     "한미반도체": ["어닝콜", "어닝쇼크", "실적쇼크", "컨센서스", "하회"],
 }
+NEWS_COMMON_COMPANY_WORDS = {
+    "bank",
+    "corp",
+    "corporation",
+    "company",
+    "group",
+    "holdings",
+    "holding",
+    "financial",
+    "resources",
+    "energy",
+    "power",
+    "reit",
+    "inc",
+    "ltd",
+    "limited",
+    "class",
+    "the",
+    "of",
+    "canada",
+    "canadian",
+    "national",
+}
+NEWS_REJECT_TITLE_HINTS = (
+    "주주 ",
+    "지분율",
+    "주식등의 수",
+    "임원",
+    "내부자",
+    "부사장",
+    "이사 ",
+    "최대주주",
+)
+NEWS_COMPANY_ALIASES = {
+    "Apple": ["애플"],
+    "Microsoft": ["마이크로소프트"],
+    "Nvidia": ["엔비디아", "엔비디아"],
+    "Tesla": ["테슬라"],
+    "Amazon": ["아마존"],
+    "Meta Platforms": ["메타"],
+    "Alphabet": ["알파벳", "구글"],
+    "Shopify": ["쇼피파이"],
+    "Royal Bank of Canada": ["로열뱅크", "캐나다왕립은행", "RBC"],
+    "TD Bank": ["TD은행", "토론토도미니언"],
+    "Bank of Nova Scotia": ["노바스코샤은행", "스코샤은행"],
+    "Bank of Montreal": ["몬트리올은행", "BMO"],
+    "CIBC": ["CIBC"],
+    "Magna": ["마그나 인터내셔널", "마그나인터내셔널"],
+    "National Bank": ["내셔널뱅크", "캐나다 내셔널은행"],
+    "Constellation Software": ["컨스텔레이션 소프트웨어", "컨스텔레이션소프트웨어"],
+    "Northland Power": ["노스랜드 파워", "노스랜드파워"],
+}
 
 
 def classify_positive_news(keyword_hits, keyword_weights):
@@ -2171,11 +2223,83 @@ def clean_news_title(title):
     return text
 
 
+def compact_text_for_match(value):
+    return re.sub(r"[^0-9A-Za-z가-힣]+", "", clean_news_title(value)).lower()
+
+
+def ticker_symbol_for_news(name):
+    ticker = str(DEFAULT_STOCKS.get(name, "") or "")
+    return ticker.split(".")[0].replace("-", ".").upper()
+
+
+def company_name_tokens_for_news(name):
+    raw_tokens = re.findall(r"[A-Za-z0-9]+", str(name or "").lower())
+    tokens = []
+    for token in raw_tokens:
+        if len(token) < 2 or token in NEWS_COMMON_COMPANY_WORDS:
+            continue
+        if token not in tokens:
+            tokens.append(token)
+    return tokens
+
+
+def is_korean_company_name(name):
+    return bool(re.search(r"[가-힣]", str(name or "")))
+
+
+def is_company_relevant_news_title(name, title, ticker=None, allow_context_terms=None):
+    title_text = clean_news_title(title)
+    if not title_text or is_noise_news_title(title_text):
+        return False
+
+    compact_title = compact_text_for_match(title_text)
+    compact_name = compact_text_for_match(name)
+    ticker_base = (ticker or ticker_symbol_for_news(name)).replace(".", "").replace("-", "").upper()
+    upper_title = title_text.upper()
+
+    if compact_name and compact_name in compact_title:
+        return True
+
+    for alias in NEWS_COMPANY_ALIASES.get(str(name or ""), []):
+        if compact_text_for_match(alias) in compact_title:
+            return True
+
+    if ticker_base and len(ticker_base) >= 2:
+        if re.search(rf"\b{re.escape(ticker_base)}\b", upper_title):
+            return True
+        if f"TSX:{ticker_base}" in upper_title or f"NASDAQ:{ticker_base}" in upper_title or f"NYSE:{ticker_base}" in upper_title:
+            return True
+
+    tokens = company_name_tokens_for_news(name)
+    if tokens:
+        token_hits = sum(1 for token in tokens if re.search(rf"\b{re.escape(token)}\b", title_text, re.IGNORECASE))
+        if token_hits >= min(2, len(tokens)):
+            return True
+        if len(tokens) == 1 and tokens[0] in {"shopify", "dollarama", "cameco", "telus", "enbridge", "bombardier"}:
+            if re.search(rf"\b{re.escape(tokens[0])}\b", title_text, re.IGNORECASE):
+                return True
+
+    if allow_context_terms and any(term in title_text for term in allow_context_terms):
+        return True
+
+    return False
+
+
+def filter_company_news_headlines(name, headlines, ticker=None, allow_context_terms=None):
+    filtered = []
+    for title in headlines:
+        if is_company_relevant_news_title(name, title, ticker=ticker, allow_context_terms=allow_context_terms):
+            filtered.append(title)
+    return filtered
+
+
 def is_noise_news_title(title):
     text = clean_news_title(title)
     if not text:
         return True
     if re.search(r"(LCK|e스포츠|야구|축구|농구|배구|선발|라인업|전날 패배|연패|연승)", text, re.IGNORECASE):
+        return True
+    if re.search(r"(전공\s*학생|대학생|고등학생|중학생|초등학생|입학|졸업|동아리|윷놀이|축제|체험학습)", text, re.IGNORECASE):
         return True
     if re.search(r"(주가전망|투자분석|돌파임박|한방에|급등주|추천주|목표가\s*얼마)", text, re.IGNORECASE):
         return True
@@ -3631,6 +3755,10 @@ def score_news_headlines(headlines):
     positive_hits = list(dict.fromkeys(positive_hits))
     negative_hits = list(dict.fromkeys(negative_hits))
     severe_negative_hits = list(dict.fromkeys(severe_negative_hits))
+    if severe_negative_hits:
+        positive_hits = []
+    elif risk >= 8 and risk >= score:
+        positive_hits = [hit for hit in positive_hits if POSITIVE_NEWS_KEYWORDS.get(hit, 0) >= 7]
     positive = classify_positive_news(positive_hits, POSITIVE_NEWS_KEYWORDS)
 
     summary_parts = []
@@ -3682,7 +3810,11 @@ def fetch_google_news_headlines_for_query(query, limit=5):
 
 
 def fetch_google_news_headlines(name, sector=None):
-    return fetch_google_news_headlines_for_query(f"{name} 주식", limit=5)
+    ticker = ticker_symbol_for_news(name)
+    market_hint = "TSX" if str(DEFAULT_STOCKS.get(name, "")).endswith(".TO") else "주식"
+    query = f'"{name}" {ticker} {market_hint} stock' if ticker and not is_korean_company_name(name) else f'"{name}" 주식'
+    headlines = fetch_google_news_headlines_for_query(query, limit=8)
+    return filter_company_news_headlines(name, headlines, ticker=ticker)[:5]
 
 
 def normalize_sector_for_news(sector):
@@ -3744,18 +3876,14 @@ def fetch_company_risk_news_headlines(name, sector):
             headlines.extend(fetch_naver_news_headlines_for_query(query, limit=4))
         except Exception:
             pass
-    name_compact = name.replace(" ", "")
     context_terms = COMPANY_RISK_CONTEXT_TERMS.get(name, [])
     allow_context_only = name == "현대건설"
-    COMPANY_RISK_NEWS_CACHE[cache_key] = [
-        title
-        for title in dict.fromkeys(headlines)
-        if title
-        and (
-            name_compact in title.replace(" ", "")
-            or (allow_context_only and context_terms and any(term in title for term in context_terms))
-        )
-    ][:4]
+    COMPANY_RISK_NEWS_CACHE[cache_key] = filter_company_news_headlines(
+        name,
+        list(dict.fromkeys(headlines)),
+        ticker=ticker_symbol_for_news(name),
+        allow_context_terms=context_terms if allow_context_only else None,
+    )[:4]
     return COMPANY_RISK_NEWS_CACHE[cache_key]
 
 
@@ -3804,7 +3932,14 @@ def fetch_naver_news_headlines_for_query(query, limit=5):
 
 
 def fetch_naver_news_headlines(name, sector=None):
-    return fetch_naver_news_headlines_for_query(f"{name} 주식", limit=5)
+    ticker = ticker_symbol_for_news(name)
+    if is_korean_company_name(name):
+        query = f'"{name}" 주식'
+    else:
+        market_hint = "TSX" if str(DEFAULT_STOCKS.get(name, "")).endswith(".TO") else "NYSE NASDAQ"
+        query = f'"{name}" {ticker} {market_hint}'
+    headlines = fetch_naver_news_headlines_for_query(query, limit=8)
+    return filter_company_news_headlines(name, headlines, ticker=ticker)[:5]
 
 
 def fetch_news_context(name, sector=None):
@@ -3819,14 +3954,15 @@ def fetch_news_context(name, sector=None):
             "source": "disabled",
         }
 
-    headlines = []
-    sources = []
+    company_headlines = []
+    sector_headlines = []
+    company_sources = []
+    sector_sources = []
     errors = []
 
     for source, fetcher in (
         ("company_risk_news", fetch_company_risk_news_headlines),
         ("google_news", fetch_google_news_headlines),
-        ("sector_news", fetch_sector_news_headlines),
         ("naver_news", fetch_naver_news_headlines),
     ):
         try:
@@ -3835,17 +3971,27 @@ def fetch_news_context(name, sector=None):
             errors.append(f"{source}:{sanitize_error(exc)}")
             continue
         if source_headlines:
-            sources.append(source)
-            headlines.extend(source_headlines)
+            company_sources.append(source)
+            company_headlines.extend(source_headlines)
 
-    headlines = [title for title in dict.fromkeys(headlines) if not is_noise_news_title(title)][:6]
+    try:
+        sector_headlines = fetch_sector_news_headlines(name, sector)
+        if sector_headlines:
+            sector_sources.append("sector_news")
+    except Exception as exc:
+        errors.append(f"sector_news:{sanitize_error(exc)}")
+
+    company_headlines = [title for title in dict.fromkeys(company_headlines) if not is_noise_news_title(title)][:6]
+    sector_headlines = [title for title in dict.fromkeys(sector_headlines) if not is_noise_news_title(title)][:3]
+    headlines = company_headlines or sector_headlines
+    sources = company_sources if company_headlines else sector_sources
     if not headlines:
         return {
             "score": 0,
             "risk": 0,
-            "summary": "뉴스 수집 실패",
+            "summary": "오늘 기준 관련 뉴스 없음",
             "headlines": [],
-            "one_line": "뉴스를 가져오지 못해 가격 흐름만 참고하세요.",
+            "one_line": "오늘 기준 회사 관련 뉴스 없음 · 엉뚱한 뉴스는 제외",
             "status": "unavailable",
             "source": "none",
             "source_errors": " | ".join(errors[:2]),
@@ -3870,6 +4016,10 @@ def fetch_news_context(name, sector=None):
         }
 
     scored = score_news_headlines(signal_headlines)
+    if not company_headlines:
+        scored["score"] = min(scored["score"], 4)
+        scored["risk"] = min(scored["risk"], 8)
+        scored["summary"] = "섹터 뉴스 참고: " + scored["summary"]
 
     return {
         "score": scored["score"],
