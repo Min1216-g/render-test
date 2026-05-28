@@ -260,6 +260,24 @@ def _filter_rows(
         filtered.append(row)
         if len(filtered) >= limit:
             break
+    if query:
+        def rank(row: Dict[str, str]) -> tuple[int, str]:
+            name = row.get("name", "").strip().lower()
+            ticker = row.get("ticker", "").strip().lower()
+            sector = row.get("sector", "").strip().lower()
+            if name == query or ticker == query:
+                return (0, name)
+            if name.startswith(query) or ticker.startswith(query):
+                return (1, name)
+            if query in name:
+                return (2, name)
+            if query in ticker:
+                return (3, name)
+            if query in sector:
+                return (4, name)
+            return (5, name)
+
+        filtered.sort(key=rank)
     return filtered
 
 
