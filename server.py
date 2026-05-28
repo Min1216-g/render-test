@@ -46,6 +46,16 @@ app.add_middleware(
     allow_headers=["X-Market-Token", "X-API-Token", "Authorization", "Content-Type"],
 )
 
+
+@app.middleware("http")
+async def no_store_api_cache(request: Request, call_next):
+    response = await call_next(request)
+    if request.url.path.startswith("/api/"):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
+        response.headers["Expires"] = "0"
+    return response
+
 _request_log: Dict[str, Deque[float]] = defaultdict(deque)
 _cache_rows: List[Dict[str, str]] = []
 _cache_loaded_at = 0.0
@@ -416,11 +426,14 @@ async def results(
     limit: int = Query(default=800, ge=1, le=1200),
 ) -> Dict[str, object]:
     await guarded(request)
+    path = _result_path()
+    file_updated_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if path.exists() else ""
     rows = _filter_rows(_read_rows(), market=market, q=q, limit=limit)
     return {
         "ok": True,
         "count": len(rows),
         "rows": rows,
+        "file_updated_at": file_updated_at,
         "updated_at": _now_iso(),
     }
 
