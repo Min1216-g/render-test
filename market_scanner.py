@@ -1688,28 +1688,38 @@ STRATEGIC_SECTOR_FILL_MAP = {
 
 TIGER_ETF_STOCKS = {
     "TIGER 미국우주테크": "0183J0",
-    "TIGER 미국S&P500": "360750.KS",
-    "TIGER 미국나스닥100": "133690.KS",
-    "TIGER 미국테크TOP10 INDXX": "381170.KS",
-    "TIGER 미국필라델피아반도체나스닥": "381180.KS",
-    "TIGER 미국AI빅테크10": "490090.KS",
-    "TIGER 미국배당다우존스": "458730.KS",
-    "TIGER 미국테크TOP10타겟커버드콜": "474220.KS",
-    "TIGER 2차전지TOP10": "364980.KS",
-    "TIGER 반도체TOP10": "396500.KS",
 }
 
 TIGER_ETF_SECTOR_MAP = {
     "TIGER 미국우주테크": "국장/TIGER ETF/미국우주",
-    "TIGER 미국S&P500": "국장/TIGER ETF/미국지수",
-    "TIGER 미국나스닥100": "국장/TIGER ETF/미국지수",
-    "TIGER 미국테크TOP10 INDXX": "국장/TIGER ETF/미국빅테크",
-    "TIGER 미국필라델피아반도체나스닥": "국장/TIGER ETF/미국반도체",
-    "TIGER 미국AI빅테크10": "국장/TIGER ETF/미국AI",
-    "TIGER 미국배당다우존스": "국장/TIGER ETF/미국배당",
-    "TIGER 미국테크TOP10타겟커버드콜": "국장/TIGER ETF/커버드콜",
-    "TIGER 2차전지TOP10": "국장/TIGER ETF/2차전지",
-    "TIGER 반도체TOP10": "국장/TIGER ETF/국내반도체",
+}
+
+NEW_LISTING_GROWTH_STOCKS = {
+    "이노스페이스": "462350.KQ",
+    "루미르": "474170.KQ",
+    "엔젤로보틱스": "455900.KQ",
+    "피앤에스미캐닉스": "460940.KQ",
+    "씨메스": "475400.KQ",
+    "전진건설로봇": "079900.KS",
+    "산일전기": "062040.KS",
+    "에이치브이엠": "295310.KQ",
+    "위츠": "459100.KQ",
+    "엠앤씨솔루션": "484870.KS",
+    "HD현대마린솔루션": "443060.KS",
+}
+
+NEW_LISTING_GROWTH_SECTOR_MAP = {
+    "이노스페이스": "우주항공/발사체",
+    "루미르": "우주항공/위성",
+    "엔젤로보틱스": "로봇/웨어러블",
+    "피앤에스미캐닉스": "로봇/재활",
+    "씨메스": "로봇/AI비전",
+    "전진건설로봇": "건설기계/로봇",
+    "산일전기": "전력기기/변압기",
+    "에이치브이엠": "우주항공/첨단소재",
+    "위츠": "전력/무선충전",
+    "엠앤씨솔루션": "방산/구동장치",
+    "HD현대마린솔루션": "조선/선박서비스",
 }
 
 REDUCED_FOR_TIGER_ETF_TICKERS = {
@@ -1910,6 +1920,8 @@ DEFAULT_STOCKS.update(STRATEGIC_SECTOR_FILL_STOCKS)
 SECTOR_MAP.update(STRATEGIC_SECTOR_FILL_MAP)
 DEFAULT_STOCKS.update(TIGER_ETF_STOCKS)
 SECTOR_MAP.update(TIGER_ETF_SECTOR_MAP)
+DEFAULT_STOCKS.update(NEW_LISTING_GROWTH_STOCKS)
+SECTOR_MAP.update(NEW_LISTING_GROWTH_SECTOR_MAP)
 DEFAULT_STOCKS.update(KOREA_SECTOR_MINIMUM_STOCKS)
 SECTOR_MAP.update(KOREA_SECTOR_MINIMUM_MAP)
 
@@ -5092,6 +5104,7 @@ def main():
             (name, ticker)
             for name, ticker in stock_items
             if name in REQUIRED_KOREA_STOCK_NAMES
+            or name in NEW_LISTING_GROWTH_STOCKS
             or is_tiger_etf(name, ticker)
             or market_label_for_ticker(ticker) in {"미장", "캐나다"}
         ]
@@ -5099,6 +5112,7 @@ def main():
             (name, ticker)
             for name, ticker in stock_items
             if name not in REQUIRED_KOREA_STOCK_NAMES
+            and name not in NEW_LISTING_GROWTH_STOCKS
             and not is_tiger_etf(name, ticker)
             and market_label_for_ticker(ticker) not in {"미장", "캐나다"}
         ]
