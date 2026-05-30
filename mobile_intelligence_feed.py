@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import hashlib
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -26,6 +27,7 @@ QUIET_RESULTS = BASE_DIR / "quiet_money_results.csv"
 NEWS_RESULTS = BASE_DIR / "news_pulse_results.csv"
 IOS_RESULTS = BASE_DIR / "MarketScannerIOS" / "MarketScannerIOS" / "market_scanner_results.csv"
 TRENDLINE_STATE_FILE = BASE_DIR / "mobile_trendline_state.json"
+NEWS_IMPACT_STATE_FILE = BASE_DIR / "mobile_news_impact_state.json"
 VANCOUVER_TZ = ZoneInfo("America/Vancouver")
 MIN_TOTAL_ROWS_FOR_APP_SYNC = 500
 MIN_OK_ROWS_FOR_APP_SYNC = 50
@@ -51,6 +53,10 @@ def load_json(path: Path) -> dict:
 
 def save_json(path: Path, data: dict) -> None:
     path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def stable_hash(value: str) -> str:
+    return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
 
 
 def number(value, default: float = 0.0) -> float:
@@ -381,7 +387,14 @@ def fixed_trendline_levels(row: pd.Series, state: dict, generated_at: datetime) 
     }
 
 
-def news_price_forecast(row: pd.Series) -> str:
+def news_impact_key(row: pd.Series, news_text: str) -> str:
+    ticker = text(row, "ticker") or text(row, "name")
+    headline = text(row, "headlines") or text(row, "news_one_line") or news_text
+    primary = headline.split("|", 1)[0].strip()[:220]
+    return stable_hash(f"{ticker}|{primary}")
+
+
+def news_price_forecast(row: pd.Series, state: dict | None = None, generated_at: datetime | None = None) -> str:
     price = number(row.get("price"))
     if price <= 0:
         return "뉴스 영향 예상가: 현재가 확인 대기"
@@ -406,6 +419,15 @@ def news_price_forecast(row: pd.Series) -> str:
         or contains_any(news_text, ["강한 호재", "호재", "수주", "계약", "승인", "흑자", "실적 서프라이즈", "공급"])
     )
 
+    if not bad and not good:
+        return "뉴스 영향 예상: 방향성 약함 · 가격/거래량 확인 우선"
+
+    state = state if state is not None else {}
+    forecast_key = news_impact_key(row, news_text)
+    saved = state.get(forecast_key)
+    if isinstance(saved, dict) and saved.get("forecast"):
+        return saved["forecast"]
+
     if bad:
         shock_pct = atr * (1.0 + min(risk, 50) / 100) + max(0, volume - 1) * 1.2
         if contains_any(news_text, ["철근", "누락", "붕괴", "부실시공", "영업정지"]):
@@ -416,10 +438,23 @@ def news_price_forecast(row: pd.Series) -> str:
         high_pct = max(low_pct + 1.5, min(28.0, shock_pct))
         low_price = price * (1 - high_pct / 100)
         rebound_line = price * (1 + max(2.0, atr * 0.45) / 100)
-        return (
+        forecast = (
             f"악재 영향 예상: -{low_pct:.1f}~-{high_pct:.1f}% "
             f"({format_price(low_price, market)} 부근까지 경계) · 회복 기준 {format_price(rebound_line, market)} 돌파"
+            f" · 최초예측 고정 {price:,.0f} 기준"
         )
+        state[forecast_key] = {
+            "ticker": text(row, "ticker"),
+            "name": text(row, "name"),
+            "type": "bad",
+            "base_price": round(price, 4),
+            "low_pct": round(low_pct, 2),
+            "high_pct": round(high_pct, 2),
+            "forecast": forecast,
+            "headline": (text(row, "headlines") or text(row, "news_one_line"))[:240],
+            "created_at": (generated_at or datetime.now(VANCOUVER_TZ)).isoformat(),
+        }
+        return forecast
 
     if good:
         upside_pct = atr * 0.75 + max(0, volume - 1) * 1.4
@@ -431,10 +466,23 @@ def news_price_forecast(row: pd.Series) -> str:
         high_pct = max(low_pct + 1.2, min(22.0, upside_pct))
         high_price = price * (1 + high_pct / 100)
         fail_line = price * (1 - max(2.0, atr * 0.45) / 100)
-        return (
+        forecast = (
             f"호재 영향 예상: +{low_pct:.1f}~+{high_pct:.1f}% "
             f"({format_price(high_price, market)} 부근까지 시도) · 이탈 기준 {format_price(fail_line, market)}"
+            f" · 최초예측 고정 {price:,.0f} 기준"
         )
+        state[forecast_key] = {
+            "ticker": text(row, "ticker"),
+            "name": text(row, "name"),
+            "type": "good",
+            "base_price": round(price, 4),
+            "low_pct": round(low_pct, 2),
+            "high_pct": round(high_pct, 2),
+            "forecast": forecast,
+            "headline": (text(row, "headlines") or text(row, "news_one_line"))[:240],
+            "created_at": (generated_at or datetime.now(VANCOUVER_TZ)).isoformat(),
+        }
+        return forecast
 
     return "뉴스 영향 예상: 방향성 약함 · 가격/거래량 확인 우선"
 
@@ -503,6 +551,7 @@ def enrich() -> int:
     generated_dt = datetime.now(VANCOUVER_TZ)
     generated_at = generated_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
     trendline_state = load_json(TRENDLINE_STATE_FILE)
+    news_impact_state = load_json(NEWS_IMPACT_STATE_FILE)
 
     enriched_rows = []
     for _, row in results.iterrows():
@@ -536,7 +585,7 @@ def enrich() -> int:
         row["mobile_theme_link"] = theme_chain(row)
         row["mobile_position_ai"] = position_signal(row)
         row["mobile_sector_keywords"] = sector_keyword_signal(row)
-        row["mobile_news_price_forecast"] = news_price_forecast(row)
+        row["mobile_news_price_forecast"] = news_price_forecast(row, news_impact_state, generated_dt)
         row["mobile_news_focus"] = " · ".join(part for part in [news_text, row["mobile_sector_keywords"]] if part) or "주요 뉴스 대기"
         row["mobile_trendline_anchor_date"] = trendline["date"]
         row["mobile_trendline_anchor_price"] = round(float(trendline["anchor"]), 4)
@@ -550,6 +599,7 @@ def enrich() -> int:
     IOS_RESULTS.parent.mkdir(parents=True, exist_ok=True)
     enriched.to_csv(IOS_RESULTS, index=False, encoding="utf-8-sig")
     save_json(TRENDLINE_STATE_FILE, trendline_state)
+    save_json(NEWS_IMPACT_STATE_FILE, news_impact_state)
     enforce_runtime_security(BASE_DIR, output_files=[MARKET_RESULTS, IOS_RESULTS])
     print(f"[mobile-intel] enriched {len(enriched)} rows -> {MARKET_RESULTS.name}, iOS csv")
     return 0
