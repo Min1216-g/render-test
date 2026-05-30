@@ -157,10 +157,20 @@ def _read_scanner_status() -> Dict[str, object]:
             started_at = float(status.get("started_at") or time.time())
             elapsed = max(0.0, time.time() - started_at)
             current_progress = int(status.get("progress") or 0)
-            estimated_progress = min(90, max(current_progress, int(8 + elapsed / 1800 * 82)))
+            if status.get("state") == "queued":
+                estimated_progress = min(12, max(current_progress, int(elapsed / 8)))
+            elif status.get("state") == "enriching":
+                estimated_progress = min(94, max(current_progress, int(82 + elapsed / 120 * 12)))
+            elif status.get("state") == "finalizing":
+                estimated_progress = min(99, max(current_progress, 95))
+            else:
+                estimated_progress = min(90, max(current_progress, int(15 + elapsed / 600 * 75)))
             status["progress"] = estimated_progress
-            if estimated_progress >= 20 and status.get("state") == "running":
-                status["message"] = f"스캐너 실행중... {estimated_progress}%"
+            elapsed_minutes = max(1, int(elapsed // 60) + 1)
+            if status.get("state") == "running":
+                status["message"] = f"AI 분석/뉴스 수집중... {estimated_progress}% · 약 {elapsed_minutes}분째"
+            elif status.get("state") == "queued":
+                status["message"] = f"스캐너 실행 대기... {estimated_progress}%"
         return status
     except Exception:
         return {"running": False, "state": "unknown", "message": "상태 파일 확인 실패"}
@@ -215,7 +225,7 @@ def _run_scanner_background() -> None:
             check=False,
             capture_output=True,
             text=True,
-            timeout=int(os.getenv("MARKET_SCANNER_REFRESH_TIMEOUT", "1800")),
+            timeout=int(os.getenv("MARKET_SCANNER_REFRESH_TIMEOUT", "3600")),
         )
         if update.returncode != 0:
             _write_scanner_status(
