@@ -16,6 +16,7 @@ import pandas as pd
 import requests
 import security_check
 from ops_guard import enforce_runtime_security
+from news_impact_engine import analyze_news_impact
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -48,7 +49,7 @@ load_env_file(ENV_FILE)
 
 BOT_TOKEN = os.getenv("NEWS_PULSE_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("NEWS_PULSE_CHAT_ID", "").strip()
-NEWS_WINDOW_HOURS = int(os.getenv("NEWS_PULSE_WINDOW_HOURS", "24"))
+NEWS_WINDOW_HOURS = int(os.getenv("NEWS_PULSE_WINDOW_HOURS", str(14 * 24)))
 NEWS_FETCH_LIMIT = int(os.getenv("NEWS_PULSE_FETCH_LIMIT", "8"))
 NEWS_QUERY_LIMIT = int(os.getenv("NEWS_PULSE_QUERY_LIMIT", "25"))
 NEWS_ALERT_TOP_N = int(os.getenv("NEWS_PULSE_ALERT_TOP_N", "7"))
@@ -610,7 +611,7 @@ def classify_capital_raise_news(text: str) -> tuple[str, list[str]]:
     return "mixed", ["자금조달 목적 확인 필요"]
 
 
-def classify_news_sentiment(text: str) -> tuple[str, list[str]]:
+def classify_news_sentiment(text: str) -> tuple[str, list[str], dict]:
     lowered = safe_text(text, "").lower()
     positive_hits = []
     negative_hits = []
@@ -649,13 +650,34 @@ def classify_news_sentiment(text: str) -> tuple[str, list[str]]:
     positive_score = sum(POSITIVE_NEWS_WEIGHTS.get(keyword, 3) for keyword in positive_hits) + positive_score_extra
     negative_score = sum(NEGATIVE_NEWS_WEIGHTS.get(keyword, 4) for keyword in negative_hits) + negative_score_extra
 
+    adaptive = analyze_news_impact(
+        name="뉴스",
+        ticker="",
+        market="",
+        sector="",
+        news_text=text,
+        price=0,
+        change_pct=0,
+        volume_ratio=1,
+        risk=0,
+        now=datetime.now(SEOUL_TZ).replace(tzinfo=None),
+        state={},
+    )
+
+    if abs(int(adaptive.get("impact_score", 0))) >= 10:
+        label = str(adaptive.get("label", "중립"))
+        if "호재" in label:
+            return "호재", list(dict.fromkeys((capital_reason or []) + positive_hits + adaptive.get("patterns", []))), adaptive
+        if "악재" in label:
+            return "악재", list(dict.fromkeys((capital_reason or []) + negative_hits + adaptive.get("patterns", []))), adaptive
+
     if negative_score >= max(positive_score, 4):
-        return "악재", (capital_reason or []) + negative_hits
+        return "악재", (capital_reason or []) + negative_hits, adaptive
     if positive_score >= 5 and positive_score > negative_score:
-        return "호재", (capital_reason or []) + positive_hits
+        return "호재", (capital_reason or []) + positive_hits, adaptive
     if positive_hits and negative_hits:
-        return "혼재", (capital_reason or []) + positive_hits[:1] + negative_hits[:1]
-    return "중립", []
+        return "혼재", (capital_reason or []) + positive_hits[:1] + negative_hits[:1], adaptive
+    return "중립", [], adaptive
 
 
 def analyze_news_target(target: dict, current_time: datetime) -> Optional[dict]:
@@ -680,9 +702,12 @@ def analyze_news_target(target: dict, current_time: datetime) -> Optional[dict]:
         for hit in hits:
             if hit not in keyword_hits:
                 keyword_hits.append(hit)
-        sentiment, reasons = classify_news_sentiment(item["title"])
+        sentiment, reasons, impact = classify_news_sentiment(item["title"])
         item["sentiment"] = sentiment
         item["sentiment_reasons"] = reasons
+        item["impact_score"] = impact.get("impact_score", 0)
+        item["confidence"] = impact.get("confidence", 0)
+        item["impact_basis"] = impact.get("basis", "")
         sentiment_counts[sentiment] = sentiment_counts.get(sentiment, 0) + 1
         if sentiment in {"호재", "악재"}:
             for reason in reasons:
@@ -697,7 +722,10 @@ def analyze_news_target(target: dict, current_time: datetime) -> Optional[dict]:
     if target.get("source") != "sector" and not keyword_hits and not sentiment_counts["호재"] and not sentiment_counts["악재"]:
         return None
 
-    score = len(recent_items) * 10 + len(keyword_hits) * 4 + net_sentiment * 3
+    impact_scores = [int(item.get("impact_score", 0) or 0) for item in recent_items]
+    avg_impact = round(sum(impact_scores) / max(len(impact_scores), 1))
+    avg_confidence = round(sum(int(item.get("confidence", 0) or 0) for item in recent_items) / max(len(recent_items), 1))
+    score = len(recent_items) * 10 + len(keyword_hits) * 4 + net_sentiment * 3 + int(abs(avg_impact) * 0.25)
     if sentiment_counts["호재"] > sentiment_counts["악재"]:
         sentiment_summary = "호재 우세"
     elif sentiment_counts["악재"] > sentiment_counts["호재"]:
@@ -723,6 +751,11 @@ def analyze_news_target(target: dict, current_time: datetime) -> Optional[dict]:
         "neutral_count": sentiment_counts["중립"],
         "positive_reasons": ", ".join(sentiment_reasons["호재"][:4]) if sentiment_reasons["호재"] else "-",
         "negative_reasons": ", ".join(sentiment_reasons["악재"][:4]) if sentiment_reasons["악재"] else "-",
+        "impact_score": avg_impact,
+        "confidence": avg_confidence,
+        "impact_basis": ", ".join(
+            list(dict.fromkeys(str(item.get("impact_basis", "")).strip() for item in recent_items if item.get("impact_basis")))[:4]
+        ) or "-",
     }
 
 
@@ -754,6 +787,7 @@ def build_report(rows: list[dict], current_time: datetime, state: dict) -> tuple
         lines.append(
             f"{idx}. {row['name']} ({safe_text(row['code'])}) | 뉴스 {row['mentions_24h']}건 | 점수 {row['score']} | {row['sentiment_summary']}"
         )
+        lines.append(f"   영향도 {int(row.get('impact_score', 0)):+d} · 신뢰도 {int(row.get('confidence', 0))}% · 근거 {row.get('impact_basis', '-')}")
         lines.append(
             f"   키워드 {row['keyword_hits']} | 호재 {row['positive_count']} / 악재 {row['negative_count']} / 혼재 {row['mixed_count']}"
         )
@@ -801,9 +835,15 @@ def save_results(rows: list[dict]) -> None:
                     "neutral_count": row["neutral_count"],
                     "positive_reasons": row["positive_reasons"],
                     "negative_reasons": row["negative_reasons"],
+                    "impact_score": row.get("impact_score", 0),
+                    "confidence": row.get("confidence", 0),
+                    "impact_basis": row.get("impact_basis", "-"),
                     "headline": localize_news_title(headline.get("title")),
                     "headline_sentiment": headline.get("sentiment", "중립"),
                     "headline_sentiment_reasons": ", ".join(headline.get("sentiment_reasons", [])) if headline.get("sentiment_reasons") else "-",
+                    "headline_impact_score": headline.get("impact_score", 0),
+                    "headline_confidence": headline.get("confidence", 0),
+                    "headline_impact_basis": headline.get("impact_basis", "-"),
                     "published_at": headline.get("published_at").isoformat() if isinstance(headline.get("published_at"), datetime) else "",
                     "link": headline.get("link"),
                     "publisher": headline.get("source"),

@@ -12,6 +12,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from ops_guard import enforce_runtime_security
+from news_impact_engine import analyze_news_impact, learned_keyword_summary, update_news_outcomes
 from sector_keyword_profiles import classify_sector_keyword_impact, sector_keyword_text
 
 try:
@@ -28,6 +29,7 @@ NEWS_RESULTS = BASE_DIR / "news_pulse_results.csv"
 IOS_RESULTS = BASE_DIR / "MarketScannerIOS" / "MarketScannerIOS" / "market_scanner_results.csv"
 TRENDLINE_STATE_FILE = BASE_DIR / "mobile_trendline_state.json"
 NEWS_IMPACT_STATE_FILE = BASE_DIR / "mobile_news_impact_state.json"
+ADAPTIVE_NEWS_STATE_FILE = BASE_DIR / "adaptive_news_impact_state.json"
 VANCOUVER_TZ = ZoneInfo("America/Vancouver")
 MIN_TOTAL_ROWS_FOR_APP_SYNC = 500
 MIN_OK_ROWS_FOR_APP_SYNC = 50
@@ -536,6 +538,22 @@ def news_price_forecast(row: pd.Series, state: dict | None = None, generated_at:
     return "뉴스 영향 예상: 방향성 약함 · 가격/거래량 확인 우선"
 
 
+def adaptive_news_impact(row: pd.Series, news_text: str, state: dict, generated_at: datetime) -> dict:
+    return analyze_news_impact(
+        name=text(row, "name"),
+        ticker=text(row, "ticker"),
+        market=market_text(row),
+        sector=text(row, "sector"),
+        news_text=f"{news_text} {text(row, 'news')} {text(row, 'news_one_line')} {text(row, 'headlines')} {text(row, 'risks')}",
+        price=number(row.get("price")),
+        change_pct=number(row.get("change_pct")),
+        volume_ratio=number(row.get("volume_ratio"), 1.0),
+        risk=number(row.get("risk")),
+        now=generated_at,
+        state=state,
+    )
+
+
 def explain_signal(row: pd.Series, score: int, sector_signal: str, news_text: str) -> str:
     parts = []
     volume = number(row.get("volume_ratio"), 1)
@@ -601,6 +619,8 @@ def enrich() -> int:
     generated_at = generated_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
     trendline_state = load_json(TRENDLINE_STATE_FILE)
     news_impact_state = load_json(NEWS_IMPACT_STATE_FILE)
+    adaptive_news_state = load_json(ADAPTIVE_NEWS_STATE_FILE)
+    update_news_outcomes(results.to_dict("records"), adaptive_news_state, generated_dt.replace(tzinfo=None))
 
     enriched_rows = []
     for _, row in results.iterrows():
@@ -618,6 +638,7 @@ def enrich() -> int:
         market_risk = market_risks.get(market, "시장 위험도 계산 대기")
         quiet_text = quiet_map.get(text(row, "ticker"), "")
         news_text = news_map.get(text(row, "name"), text(row, "news_one_line"))
+        news_impact = adaptive_news_impact(row, news_text, adaptive_news_state, generated_dt.replace(tzinfo=None))
         score = today_score(row, sectors)
         trendline = fixed_trendline_levels(row, trendline_state, generated_dt)
 
@@ -635,6 +656,14 @@ def enrich() -> int:
         row["mobile_position_ai"] = position_signal(row)
         row["mobile_sector_keywords"] = sector_keyword_signal(row)
         row["mobile_news_price_forecast"] = news_price_forecast(row, news_impact_state, generated_dt)
+        row["mobile_news_impact_label"] = news_impact["label"]
+        row["mobile_news_impact_score"] = news_impact["impact_score"]
+        row["mobile_news_confidence"] = news_impact["confidence"]
+        row["mobile_news_basis"] = news_impact["basis"]
+        row["mobile_news_similar"] = news_impact["similar"]
+        row["mobile_news_expectation"] = news_impact["expectation"]
+        row["mobile_news_impact_summary"] = news_impact["summary"]
+        row["mobile_news_learned_keywords"] = learned_keyword_summary(adaptive_news_state)
         row["mobile_news_focus"] = " · ".join(part for part in [news_text, row["mobile_sector_keywords"]] if part) or "주요 뉴스 대기"
         row["mobile_trendline_anchor_date"] = trendline["date"]
         row["mobile_trendline_anchor_price"] = round(float(trendline["anchor"]), 4)
@@ -649,6 +678,7 @@ def enrich() -> int:
     enriched.to_csv(IOS_RESULTS, index=False, encoding="utf-8-sig")
     save_json(TRENDLINE_STATE_FILE, trendline_state)
     save_json(NEWS_IMPACT_STATE_FILE, news_impact_state)
+    save_json(ADAPTIVE_NEWS_STATE_FILE, adaptive_news_state)
     enforce_runtime_security(BASE_DIR, output_files=[MARKET_RESULTS, IOS_RESULTS])
     print(f"[mobile-intel] enriched {len(enriched)} rows -> {MARKET_RESULTS.name}, iOS csv")
     return 0
