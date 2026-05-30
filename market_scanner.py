@@ -3078,6 +3078,14 @@ def empty_etf_now_context(summary="ETF NOW 확인 대기"):
     }
 
 
+def empty_etf_nav_context(summary=""):
+    return {
+        "etf_nav": 0.0,
+        "etf_premium_pct": 0.0,
+        "etf_summary": summary,
+    }
+
+
 def normalize_etf_now_text(text):
     clean = re.sub(r"<script[\s\S]*?</script>", " ", text, flags=re.IGNORECASE)
     clean = re.sub(r"<style[\s\S]*?</style>", " ", clean, flags=re.IGNORECASE)
@@ -3176,11 +3184,9 @@ def fetch_etf_now_context(name, ticker):
 
 def fetch_etf_nav_context(name, ticker, price):
     if not is_tiger_etf(name, ticker):
-        return {
-            "etf_nav": 0.0,
-            "etf_premium_pct": 0.0,
-            "etf_summary": "",
-        }
+        return empty_etf_nav_context("")
+    if not is_full_service_etf(name, ticker):
+        return empty_etf_nav_context(lightweight_etf_summary(name))
 
     code = korean_stock_code(ticker)
     nav = 0.0
@@ -5072,13 +5078,25 @@ def main():
                         "dividend_summary": "확인 실패",
                         "etf_nav": 0.0,
                         "etf_premium_pct": 0.0,
-                        "etf_summary": "NAV 확인 실패" if is_tiger_etf(name, ticker) else "",
+                        "etf_summary": (
+                            "NAV 확인 실패"
+                            if is_full_service_etf(name, ticker)
+                            else lightweight_etf_summary(name)
+                            if is_lightweight_etf(name, ticker)
+                            else ""
+                        ),
                         "etf_holdings_source": "",
                         "etf_holdings_source_date": "",
                         "etf_holdings_count": 0,
                         "etf_holdings_top": "",
                         "etf_holdings_weighted_move_pct": 0.0,
-                        "etf_holdings_summary": "보유비중 확인 실패" if is_etf_like(name, ticker) else "",
+                        "etf_holdings_summary": (
+                            "보유비중 확인 실패"
+                            if is_full_service_etf(name, ticker)
+                            else lightweight_etf_summary(name)
+                            if is_lightweight_etf(name, ticker)
+                            else ""
+                        ),
                         "ai_label": "AI 관망",
                         "ai_score": 0,
                         "ai_reason": "분석 중 오류가 발생했습니다.",
