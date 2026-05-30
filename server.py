@@ -164,7 +164,7 @@ def _read_scanner_status() -> Dict[str, object]:
             elif status.get("state") == "finalizing":
                 estimated_progress = min(99, max(current_progress, 95))
             else:
-                estimated_progress = min(90, max(current_progress, int(15 + elapsed / 600 * 75)))
+                estimated_progress = min(90, max(current_progress, int(25 + elapsed / 480 * 65)))
             status["progress"] = estimated_progress
             elapsed_minutes = max(1, int(elapsed // 60) + 1)
             if status.get("state") == "running":
@@ -215,8 +215,8 @@ def _run_scanner_background() -> None:
         _write_scanner_status(
             running=True,
             state="running",
-            message="AI 분석/뉴스 수집 실행중... 15%",
-            progress=15,
+            message="AI 분석/뉴스 수집 실행중... 25%",
+            progress=25,
             started_at=started_at,
         )
         update = subprocess.run(
