@@ -140,7 +140,17 @@ def _replace_result_file(payload: bytes, rows: List[Dict[str, str]]) -> None:
 
 def _read_scanner_status() -> Dict[str, object]:
     if not SCANNER_STATUS_FILE.exists():
-        return {"running": False, "state": "idle", "message": "스캐너 대기"}
+        path = _result_path()
+        if path.exists():
+            file_updated_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+            return {
+                "running": False,
+                "state": "ready",
+                "message": "데이터 준비됨 · 상태 파일은 아직 없음",
+                "file_updated_at": file_updated_at,
+                "mode": "file",
+            }
+        return {"running": False, "state": "idle", "message": "스캐너 대기 · 결과 파일 없음"}
     try:
         return json.loads(SCANNER_STATUS_FILE.read_text(encoding="utf-8"))
     except Exception:
