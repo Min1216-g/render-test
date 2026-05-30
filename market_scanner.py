@@ -2014,6 +2014,28 @@ NEGATIVE_NEWS_KEYWORDS = {
     "제재": 8,
     "벌점": 8,
     "국토부": 5,
+    "폭발": 12,
+    "실패": 10,
+    "발사 실패": 12,
+    "로켓 폭발": 12,
+    "launch failure": 12,
+    "rocket explosion": 12,
+    "explosion": 12,
+    "delay": 6,
+    "delays": 6,
+    "launch delay": 8,
+    "wrong orbit": 10,
+    "downgrade": 8,
+    "tumble": 8,
+    "plunge": 8,
+    "crash": 8,
+    "falls": 6,
+    "fall": 6,
+    "stocks fall": 7,
+    "blows up": 10,
+    "sinks": 8,
+    "sank": 8,
+    "lower": 5,
 }
 
 CAPITAL_RAISE_TERMS = ("유상증자", "증자")
@@ -2060,6 +2082,8 @@ SECTOR_NEWS_RISK_KEYWORDS = {
     "통신": "과징금 규제 해킹 장애",
     "전선": "구리 가격 원가 상승 공급 지연",
     "알루미늄": "원가 상승 관세 수요 둔화",
+    "우주항공": "블루오리진 로켓 폭발 발사 실패 발사 지연 궤도 실패 급락 downgrade tumble launch failure rocket explosion wrong orbit",
+    "항공": "로켓 폭발 발사 실패 운항 차질 지연 리콜 안전사고 급락",
 }
 
 SECTOR_NEWS_POSITIVE_KEYWORDS = "수주 계약 공급 승인 실적 흑자 투자 확대 정책"
@@ -3732,14 +3756,15 @@ def score_news_headlines(headlines):
     for title in headlines[:8]:
         if not is_fresh_signal_news_title(title):
             continue
+        lowered_title = title.lower()
         capital_raise_type, capital_raise_hits = classify_capital_raise_news(title)
         for keyword, weight in POSITIVE_NEWS_KEYWORDS.items():
-            if keyword in title:
+            if keyword.lower() in lowered_title:
                 positive_hits.append(keyword)
         for keyword, weight in NEGATIVE_NEWS_KEYWORDS.items():
             if keyword == "유상증자" and capital_raise_type == "good":
                 continue
-            if keyword in title:
+            if keyword.lower() in lowered_title:
                 risk += weight
                 negative_hits.append(keyword)
                 if weight >= 10:
@@ -3795,23 +3820,31 @@ def score_news_headlines(headlines):
 
 
 def fetch_google_news_headlines_for_query(query, limit=5):
-    recency_query = f"{query} when:{NEWS_MAX_AGE_DAYS}d"
-    url = f"https://news.google.com/rss/search?q={quote(recency_query)}&hl=ko&gl=KR&ceid=KR:ko"
     items = []
-    response = requests.get(url, timeout=8)
-    response.raise_for_status()
-    root = ET.fromstring(response.text)
-    for item in root.findall("./channel/item")[: max(limit * 3, 10)]:
-        title = clean_news_title(item.findtext("title", default="").strip())
-        published_at = parse_google_news_pub_date(item.findtext("pubDate", default="").strip())
-        if not title:
-            continue
-        if published_at and is_recent_news_datetime(published_at):
-            items.append((published_at, format_news_title_with_date(title, published_at)))
-        elif NEWS_ALLOW_STALE_FALLBACK:
-            items.append((published_at or datetime.min.replace(tzinfo=pd.Timestamp.now(tz="UTC").tzinfo), title))
+    searches = [
+        (f"{query} when:{NEWS_MAX_AGE_DAYS}d", "ko", "KR", "KR:ko"),
+        (query, "ko", "KR", "KR:ko"),
+    ]
+    if re.search(r"[A-Za-z]", query):
+        searches.append((query, "en-US", "US", "US:en"))
+
+    for search_query, hl, gl, ceid in searches:
+        url = f"https://news.google.com/rss/search?q={quote(search_query)}&hl={hl}&gl={gl}&ceid={ceid}"
+        response = requests.get(url, timeout=8)
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+        for item in root.findall("./channel/item")[: max(limit * 4, 16)]:
+            title = clean_news_title(item.findtext("title", default="").strip())
+            published_at = parse_google_news_pub_date(item.findtext("pubDate", default="").strip())
+            if not title:
+                continue
+            if published_at and is_recent_news_datetime(published_at):
+                items.append((published_at, format_news_title_with_date(title, published_at)))
+            elif NEWS_ALLOW_STALE_FALLBACK:
+                items.append((published_at or datetime.min.replace(tzinfo=pd.Timestamp.now(tz="UTC").tzinfo), title))
     items.sort(key=lambda pair: pair[0], reverse=True)
-    headlines = [title for _, title in items[:limit]]
+    headlines = [title for _, title in items]
+    headlines = list(dict.fromkeys(headlines))[:limit]
     return headlines
 
 
@@ -3827,6 +3860,12 @@ def normalize_sector_for_news(sector):
     sector_text = clean_news_title(sector)
     if not sector_text or sector_text == "기타":
         return ""
+    lowered = sector_text.lower()
+    if any(
+        keyword in sector_text
+        for keyword in ("우주", "항공", "로켓", "위성")
+    ) or any(keyword in lowered for keyword in ("space", "aerospace", "rocket", "satellite")):
+        return "우주항공"
     return re.split(r"[/·,\s]", sector_text)[0].strip()
 
 
@@ -3840,6 +3879,14 @@ def fetch_sector_news_headlines(name, sector):
 
     risk_terms = SECTOR_NEWS_RISK_KEYWORDS.get(base_sector, "악재 리스크 실적 부진 규제")
     queries = [f"{base_sector} 관련주 {SECTOR_NEWS_POSITIVE_KEYWORDS} {risk_terms}"]
+    if base_sector == "우주항공":
+        queries.extend(
+            [
+                "TIGER 미국우주테크 블루오리진 로켓 폭발 우주주 급락",
+                "space stocks Blue Origin rocket explosion AST SpaceMobile Rocket Lab",
+                "AST SpaceMobile Rocket Lab tumble Blue Origin rocket explosion",
+            ]
+        )
 
     headlines = []
     for query in queries:
@@ -3988,9 +4035,18 @@ def fetch_news_context(name, sector=None):
         errors.append(f"sector_news:{sanitize_error(exc)}")
 
     company_headlines = [title for title in dict.fromkeys(company_headlines) if not is_noise_news_title(title)][:6]
-    sector_headlines = [title for title in dict.fromkeys(sector_headlines) if not is_noise_news_title(title)][:3]
-    headlines = company_headlines or sector_headlines
-    sources = company_sources if company_headlines else sector_sources
+    sector_headlines = [title for title in dict.fromkeys(sector_headlines) if not is_noise_news_title(title)][:4]
+    company_signal_headlines = [title for title in company_headlines if is_fresh_signal_news_title(title)]
+    sector_signal_headlines = [title for title in sector_headlines if is_fresh_signal_news_title(title)]
+    if company_signal_headlines:
+        headlines = company_headlines
+        sources = company_sources
+    elif sector_signal_headlines:
+        headlines = sector_headlines
+        sources = sector_sources
+    else:
+        headlines = company_headlines or sector_headlines
+        sources = company_sources if company_headlines else sector_sources
     if not headlines:
         return {
             "score": 0,
