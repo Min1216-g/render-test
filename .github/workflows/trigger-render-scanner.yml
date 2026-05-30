@@ -1,0 +1,84 @@
+name: Trigger Render Market Scanner
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Vancouver 16:00/17:00 across daylight saving changes.
+    # PDT: 16:00=23:00 UTC, 17:00=00:00 UTC
+    # PST: 16:00=00:00 UTC, 17:00=01:00 UTC
+    - cron: "0 23,0,1 * * *"
+
+jobs:
+  trigger:
+    runs-on: ubuntu-latest
+    timeout-minutes: 70
+    env:
+      MARKET_API_BASE_URL: https://market-scanner-api-fo2m.onrender.com
+      MARKET_API_TOKEN: ${{ secrets.MARKET_API_TOKEN }}
+    steps:
+      - name: Check Vancouver schedule
+        id: schedule
+        run: |
+          python - <<'PY'
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          import os
+
+          now = datetime.now(ZoneInfo("America/Vancouver"))
+          should_run = now.hour in {16, 17} and now.weekday() not in {4, 5}
+          print(f"Vancouver now: {now:%Y-%m-%d %H:%M:%S %Z}")
+          print(f"should_run={str(should_run).lower()}")
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+              f.write(f"should_run={str(should_run).lower()}\n")
+          PY
+
+      - name: Ensure token exists
+        if: github.event_name == 'workflow_dispatch' || steps.schedule.outputs.should_run == 'true'
+        run: |
+          if [ -z "$MARKET_API_TOKEN" ]; then
+            echo "Missing GitHub secret MARKET_API_TOKEN"
+            exit 2
+          fi
+
+      - name: Start scanner on Render
+        if: github.event_name == 'workflow_dispatch' || steps.schedule.outputs.should_run == 'true'
+        run: |
+          curl -fsS -X POST \
+            -H "X-Market-Token: ${MARKET_API_TOKEN}" \
+            "${MARKET_API_BASE_URL}/api/scanner/run"
+
+      - name: Poll scanner status
+        if: github.event_name == 'workflow_dispatch' || steps.schedule.outputs.should_run == 'true'
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import time
+          import urllib.request
+
+          base_url = os.environ["MARKET_API_BASE_URL"].rstrip("/")
+          token = os.environ["MARKET_API_TOKEN"]
+
+          for attempt in range(70):
+              req = urllib.request.Request(
+                  f"{base_url}/api/status",
+                  headers={"X-Market-Token": token},
+              )
+              with urllib.request.urlopen(req, timeout=60) as response:
+                  payload = json.loads(response.read().decode("utf-8"))
+              scanner = payload.get("scanner", {})
+              state = scanner.get("state", "")
+              print(
+                  f"attempt={attempt + 1} state={state} "
+                  f"rows={payload.get('rows')} ok={payload.get('ok_rows')} "
+                  f"file={payload.get('file_updated_at')} message={scanner.get('message', '')}"
+              )
+              if state in {"completed", "uploaded", "partial"}:
+                  raise SystemExit(0)
+              if state in {"failed", "timeout", "disabled"}:
+                  raise SystemExit(1)
+              time.sleep(60)
+
+          print("scanner did not finish in time")
+          raise SystemExit(1)
+          PY
