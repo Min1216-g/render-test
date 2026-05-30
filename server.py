@@ -152,7 +152,16 @@ def _read_scanner_status() -> Dict[str, object]:
             }
         return {"running": False, "state": "idle", "message": "스캐너 대기 · 결과 파일 없음"}
     try:
-        return json.loads(SCANNER_STATUS_FILE.read_text(encoding="utf-8"))
+        status = json.loads(SCANNER_STATUS_FILE.read_text(encoding="utf-8"))
+        if status.get("running"):
+            started_at = float(status.get("started_at") or time.time())
+            elapsed = max(0.0, time.time() - started_at)
+            current_progress = int(status.get("progress") or 0)
+            estimated_progress = min(90, max(current_progress, int(8 + elapsed / 1800 * 82)))
+            status["progress"] = estimated_progress
+            if estimated_progress >= 20 and status.get("state") == "running":
+                status["message"] = f"스캐너 실행중... {estimated_progress}%"
+        return status
     except Exception:
         return {"running": False, "state": "unknown", "message": "상태 파일 확인 실패"}
 
@@ -171,13 +180,21 @@ def _write_scanner_status(**payload: object) -> None:
 def _run_scanner_background() -> None:
     global _scanner_running, _cache_loaded_at
     try:
-        _write_scanner_status(running=True, state="running", message="스캐너 실행중")
+        started_at = time.time()
+        _write_scanner_status(
+            running=True,
+            state="running",
+            message="스캐너 실행중... 8%",
+            progress=8,
+            started_at=started_at,
+        )
         if not ENABLE_FULL_SCANNER:
             _write_scanner_status(
                 running=False,
                 state="disabled",
                 message="서버 풀스캐너 비활성 · MARKET_ENABLE_FULL_SCANNER 확인 필요",
                 mode="disabled",
+                progress=0,
             )
             return
 
@@ -185,6 +202,13 @@ def _run_scanner_background() -> None:
         if REFRESH_SCRIPT.name == "run_market_scanner_update.py":
             command.append("--force")
 
+        _write_scanner_status(
+            running=True,
+            state="running",
+            message="AI 분석/뉴스 수집 실행중... 15%",
+            progress=15,
+            started_at=started_at,
+        )
         update = subprocess.run(
             command,
             cwd=BASE_DIR,
@@ -200,10 +224,18 @@ def _run_scanner_background() -> None:
                 message="스캐너 실패",
                 return_code=update.returncode,
                 output=(update.stdout + "\n" + update.stderr)[-4000:],
+                progress=0,
             )
             return
 
         if REFRESH_SCRIPT.name != "render_mobile_refresh.py" and MOBILE_INTEL_SCRIPT.exists():
+            _write_scanner_status(
+                running=True,
+                state="enriching",
+                message="모바일 데이터 보강중... 82%",
+                progress=82,
+                started_at=started_at,
+            )
             enrich = subprocess.run(
                 [sys.executable, str(MOBILE_INTEL_SCRIPT)],
                 cwd=BASE_DIR,
@@ -219,9 +251,17 @@ def _run_scanner_background() -> None:
                     message="스캐너 완료 · 모바일 보강 실패",
                     return_code=enrich.returncode,
                     output=(update.stdout + "\n" + enrich.stdout + "\n" + enrich.stderr)[-4000:],
+                    progress=90,
                 )
                 return
 
+        _write_scanner_status(
+            running=True,
+            state="finalizing",
+            message="최신 CSV 반영중... 95%",
+            progress=95,
+            started_at=started_at,
+        )
         _cache_loaded_at = 0
         rows = _read_rows()
         ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
@@ -233,11 +273,12 @@ def _run_scanner_background() -> None:
             ok_rows=ok_rows,
             mode="full",
             output=(update.stdout + "\n" + update.stderr)[-4000:],
+            progress=100,
         )
     except subprocess.TimeoutExpired:
-        _write_scanner_status(running=False, state="timeout", message="스캐너 시간 초과")
+        _write_scanner_status(running=False, state="timeout", message="스캐너 시간 초과", progress=0)
     except Exception as exc:
-        _write_scanner_status(running=False, state="failed", message=f"스캐너 오류: {exc}")
+        _write_scanner_status(running=False, state="failed", message=f"스캐너 오류: {exc}", progress=0)
     finally:
         with _scanner_lock:
             _scanner_running = False
@@ -405,7 +446,13 @@ async def scanner_run(request: Request) -> Dict[str, object]:
                 "updated_at": _now_iso(),
             }
         _scanner_running = True
-        _write_scanner_status(running=True, state="queued", message="스캐너 실행 요청됨")
+        _write_scanner_status(
+            running=True,
+            state="queued",
+            message="스캐너 실행 요청됨... 0%",
+            progress=0,
+            started_at=time.time(),
+        )
         thread = threading.Thread(target=_run_scanner_background, daemon=True)
         thread.start()
     return {
@@ -416,6 +463,16 @@ async def scanner_run(request: Request) -> Dict[str, object]:
         "status": _read_scanner_status(),
         "updated_at": _now_iso(),
     }
+
+
+@app.post("/run-scanner")
+async def scanner_run_alias(request: Request) -> Dict[str, object]:
+    return await scanner_run(request)
+
+
+@app.post("/api/run-scanner")
+async def scanner_run_api_alias(request: Request) -> Dict[str, object]:
+    return await scanner_run(request)
 
 
 @app.get("/api/scanner/status")
@@ -472,6 +529,7 @@ async def upload_results(request: Request) -> Dict[str, object]:
         rows=len(rows),
         ok_rows=ok_rows,
         mode="upload",
+        progress=100,
     )
     return {
         "ok": True,
