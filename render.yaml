@@ -17,6 +17,12 @@ services:
         value: "20"
       - key: MARKET_ALLOW_UNAUTH_HEALTH
         value: "true"
+      - key: MARKET_ENABLE_FULL_SCANNER
+        value: "true"
+      - key: MARKET_SCANNER_REFRESH_SCRIPT
+        value: render_mobile_refresh.py
+      - key: MARKET_SCANNER_REFRESH_TIMEOUT
+        value: "3000"
 
   - type: cron
     name: market-scanner-vancouver-schedule

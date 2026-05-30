@@ -25,14 +25,14 @@ from fastapi.responses import JSONResponse
 BASE_DIR = Path(__file__).resolve().parent
 RESULT_FILE = Path(os.getenv("MARKET_RESULTS_FILE", BASE_DIR / "market_scanner_results.csv"))
 IOS_RESULT_FILE = BASE_DIR / "MarketScannerIOS" / "MarketScannerIOS" / "market_scanner_results.csv"
-REFRESH_SCRIPT = BASE_DIR / "run_market_scanner_update.py"
+REFRESH_SCRIPT = BASE_DIR / os.getenv("MARKET_SCANNER_REFRESH_SCRIPT", "render_mobile_refresh.py")
 MOBILE_INTEL_SCRIPT = BASE_DIR / "mobile_intelligence_feed.py"
 SCANNER_STATUS_FILE = BASE_DIR / "scanner_run_status.json"
 API_TOKEN = os.getenv("MARKET_API_TOKEN", "")
 ALLOW_UNAUTH_HEALTH = os.getenv("MARKET_ALLOW_UNAUTH_HEALTH", "true").lower() == "true"
 RATE_LIMIT_PER_MINUTE = int(os.getenv("MARKET_RATE_LIMIT_PER_MINUTE", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("MARKET_RESULTS_CACHE_TTL", "20"))
-ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "false").lower() == "true"
+ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "true").lower() == "true"
 MAX_UPLOAD_BYTES = int(os.getenv("MARKET_RESULTS_UPLOAD_MAX_BYTES", "6000000"))
 MIN_UPLOAD_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_ROWS", "500"))
 MIN_UPLOAD_OK_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_OK_ROWS", "50"))
@@ -163,21 +163,20 @@ def _run_scanner_background() -> None:
     try:
         _write_scanner_status(running=True, state="running", message="스캐너 실행중")
         if not ENABLE_FULL_SCANNER:
-            _cache_loaded_at = 0
-            rows = _read_rows()
-            ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
             _write_scanner_status(
                 running=False,
-                state="completed",
-                message=f"라이트 새로고침 완료 · {ok_rows}/{len(rows)} 정상 · 풀스캐너는 서버에서 비활성",
-                rows=len(rows),
-                ok_rows=ok_rows,
-                mode="light",
+                state="disabled",
+                message="서버 풀스캐너 비활성 · MARKET_ENABLE_FULL_SCANNER 확인 필요",
+                mode="disabled",
             )
             return
 
+        command = [sys.executable, str(REFRESH_SCRIPT)]
+        if REFRESH_SCRIPT.name == "run_market_scanner_update.py":
+            command.append("--force")
+
         update = subprocess.run(
-            [sys.executable, str(REFRESH_SCRIPT), "--force"],
+            command,
             cwd=BASE_DIR,
             check=False,
             capture_output=True,
@@ -194,23 +193,24 @@ def _run_scanner_background() -> None:
             )
             return
 
-        enrich = subprocess.run(
-            [sys.executable, str(MOBILE_INTEL_SCRIPT)],
-            cwd=BASE_DIR,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=300,
-        )
-        if enrich.returncode != 0:
-            _write_scanner_status(
-                running=False,
-                state="partial",
-                message="스캐너 완료 · 모바일 보강 실패",
-                return_code=enrich.returncode,
-                output=(update.stdout + "\n" + enrich.stdout + "\n" + enrich.stderr)[-4000:],
+        if REFRESH_SCRIPT.name != "render_mobile_refresh.py" and MOBILE_INTEL_SCRIPT.exists():
+            enrich = subprocess.run(
+                [sys.executable, str(MOBILE_INTEL_SCRIPT)],
+                cwd=BASE_DIR,
+                check=False,
+                capture_output=True,
+                text=True,
+                timeout=300,
             )
-            return
+            if enrich.returncode != 0:
+                _write_scanner_status(
+                    running=False,
+                    state="partial",
+                    message="스캐너 완료 · 모바일 보강 실패",
+                    return_code=enrich.returncode,
+                    output=(update.stdout + "\n" + enrich.stdout + "\n" + enrich.stderr)[-4000:],
+                )
+                return
 
         _cache_loaded_at = 0
         rows = _read_rows()
@@ -221,7 +221,8 @@ def _run_scanner_background() -> None:
             message=f"스캐너 완료 · {ok_rows}/{len(rows)} 정상",
             rows=len(rows),
             ok_rows=ok_rows,
-            output=(update.stdout + "\n" + enrich.stdout)[-4000:],
+            mode="full",
+            output=(update.stdout + "\n" + update.stderr)[-4000:],
         )
     except subprocess.TimeoutExpired:
         _write_scanner_status(running=False, state="timeout", message="스캐너 시간 초과")
