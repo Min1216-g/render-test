@@ -530,6 +530,60 @@ def is_noise_news_title(text: str) -> bool:
     return any(keyword in lowered for keyword in NEWS_NOISE_KEYWORDS)
 
 
+def looks_mostly_english(text: str) -> bool:
+    letters = [char for char in safe_text(text, "") if char.isalpha()]
+    if not letters:
+        return False
+    latin_count = sum(1 for char in letters if "A" <= char.upper() <= "Z")
+    return latin_count / max(len(letters), 1) >= 0.55
+
+
+def contains_any(text: str, keywords: list[str]) -> bool:
+    lowered = safe_text(text, "").lower()
+    return any(keyword.lower() in lowered for keyword in keywords)
+
+
+def localize_news_title(title: str) -> str:
+    value = safe_text(title, "")
+    if not looks_mostly_english(value):
+        return value
+
+    lower = value.lower()
+    subjects = []
+    for label, keys in [
+        ("AST SpaceMobile", ["ast spacemobile", "asts"]),
+        ("Rocket Lab", ["rocket lab", "rklb"]),
+        ("Blue Origin", ["blue origin"]),
+        ("SpaceX", ["spacex"]),
+        ("Oracle", ["oracle", "orcl"]),
+        ("Broadcom", ["broadcom", "avgo"]),
+        ("Microsoft", ["microsoft", "msft"]),
+        ("Nvidia", ["nvidia", "nvda"]),
+    ]:
+        if any(key in lower for key in keys):
+            subjects.append(label)
+    subject_text = "/".join(subjects[:3]) if subjects else "해외 종목"
+
+    signals = []
+    if contains_any(lower, ["rocket explosion", "blows up", "explosion"]):
+        signals.append("로켓 폭발 여파")
+    if contains_any(lower, ["launch delay", "launch failure", "setback", "wrong orbit"]):
+        signals.append("발사 지연/실패 우려")
+    if contains_any(lower, ["plunge", "tumble", "falls", "stocks fall", "sinks", "drops", "lower"]):
+        signals.append("주가 하락 압력")
+    if contains_any(lower, ["downgrade", "cuts", "cut target", "analyst"]):
+        signals.append("증권사 하향/목표가 이슈")
+    if contains_any(lower, ["earnings", "revenue", "profit", "guidance", "sales"]):
+        signals.append("실적/가이던스 이슈")
+    if contains_any(lower, ["beats", "record", "growth", "surges", "jumps", "gains", "rises"]):
+        signals.append("성장/상승 모멘텀")
+    if contains_any(lower, ["deal", "contract", "order", "acquisition", "merger"]):
+        signals.append("계약/인수 이슈")
+    if not signals:
+        signals.append("해외 주요 뉴스")
+    return f"{subject_text}: {' · '.join(signals[:3])}"
+
+
 def classify_capital_raise_news(text: str) -> tuple[str, list[str]]:
     value = safe_text(text, "")
     lowered = value.lower()
@@ -713,7 +767,7 @@ def build_report(rows: list[dict], current_time: datetime, state: dict) -> tuple
             if link and link not in state.get("sent_links", {}):
                 fresh_links.append(link)
             lines.append(
-                f"   - [{format_news_time(published_at)}] {headline.get('sentiment', '중립')} | {safe_text(headline.get('title'))}"
+                f"   - [{format_news_time(published_at)}] {headline.get('sentiment', '중립')} | {localize_news_title(headline.get('title'))}"
             )
         lines.append("")
 
@@ -747,7 +801,7 @@ def save_results(rows: list[dict]) -> None:
                     "neutral_count": row["neutral_count"],
                     "positive_reasons": row["positive_reasons"],
                     "negative_reasons": row["negative_reasons"],
-                    "headline": headline.get("title"),
+                    "headline": localize_news_title(headline.get("title")),
                     "headline_sentiment": headline.get("sentiment", "중립"),
                     "headline_sentiment_reasons": ", ".join(headline.get("sentiment_reasons", [])) if headline.get("sentiment_reasons") else "-",
                     "published_at": headline.get("published_at").isoformat() if isinstance(headline.get("published_at"), datetime) else "",

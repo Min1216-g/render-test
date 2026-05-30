@@ -98,6 +98,55 @@ def contains_any(value: str, words: list[str]) -> bool:
     return any(word.lower() in lower for word in words)
 
 
+def looks_mostly_english(value: str) -> bool:
+    letters = [char for char in str(value or "") if char.isalpha()]
+    if not letters:
+        return False
+    latin_count = sum(1 for char in letters if "A" <= char.upper() <= "Z")
+    return latin_count / max(len(letters), 1) >= 0.55
+
+
+def localize_news_text(value: str) -> str:
+    text_value = str(value or "").strip()
+    if not looks_mostly_english(text_value):
+        return text_value
+
+    lowered = text_value.lower()
+    subjects = []
+    for label, keys in [
+        ("AST SpaceMobile", ["ast spacemobile", "asts"]),
+        ("Rocket Lab", ["rocket lab", "rklb"]),
+        ("Blue Origin", ["blue origin"]),
+        ("SpaceX", ["spacex"]),
+        ("Oracle", ["oracle", "orcl"]),
+        ("Broadcom", ["broadcom", "avgo"]),
+        ("Microsoft", ["microsoft", "msft"]),
+        ("Nvidia", ["nvidia", "nvda"]),
+    ]:
+        if any(key in lowered for key in keys):
+            subjects.append(label)
+    subject_text = "/".join(subjects[:3]) if subjects else "해외 종목"
+
+    signals = []
+    if contains_any(lowered, ["rocket explosion", "blows up", "explosion"]):
+        signals.append("로켓 폭발 여파")
+    if contains_any(lowered, ["launch delay", "launch failure", "setback", "wrong orbit"]):
+        signals.append("발사 지연/실패 우려")
+    if contains_any(lowered, ["plunge", "tumble", "falls", "stocks fall", "sinks", "drops", "lower"]):
+        signals.append("주가 하락 압력")
+    if contains_any(lowered, ["downgrade", "cuts", "analyst", "target"]):
+        signals.append("증권사 의견/목표가 이슈")
+    if contains_any(lowered, ["earnings", "revenue", "profit", "guidance", "sales"]):
+        signals.append("실적/가이던스 이슈")
+    if contains_any(lowered, ["beats", "record", "growth", "surges", "jumps", "gains", "rises"]):
+        signals.append("성장/상승 모멘텀")
+    if contains_any(lowered, ["deal", "contract", "order", "acquisition", "merger"]):
+        signals.append("계약/인수 이슈")
+    if not signals:
+        signals.append("해외 주요 뉴스")
+    return f"{subject_text}: {' · '.join(signals[:3])}"
+
+
 def build_sector_context(results: pd.DataFrame) -> dict[str, dict[str, object]]:
     if results.empty or "sector" not in results.columns:
         return {}
@@ -180,7 +229,7 @@ def news_lookup(news: pd.DataFrame) -> dict[str, str]:
         if not name:
             continue
         sentiment = text(row, "headline_sentiment") or text(row, "sentiment_summary")
-        headline = text(row, "headline")
+        headline = localize_news_text(text(row, "headline"))
         published = text(row, "published_at")
         summary = " · ".join(part for part in [sentiment, headline, published] if part)
         if summary:

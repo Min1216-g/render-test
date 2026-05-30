@@ -2371,8 +2371,77 @@ def summarize_news_one_line(news_summary, headlines):
     return "뚜렷한 뉴스는 없어 가격 흐름만 참고하세요."
 
 
+def looks_mostly_english(text):
+    letters = [char for char in str(text or "") if char.isalpha()]
+    if not letters:
+        return False
+    latin_count = sum(1 for char in letters if "A" <= char.upper() <= "Z")
+    return latin_count / max(len(letters), 1) >= 0.55
+
+
+def contains_any(text, keywords):
+    lower = str(text or "").lower()
+    return any(str(keyword).lower() in lower for keyword in keywords)
+
+
+def localize_news_title(title):
+    text = clean_news_title(title)
+    if not looks_mostly_english(text):
+        return text
+
+    date_text = ""
+    date_match = re.search(r"\s*(\(20\d{2}-\d{2}-\d{2}\))\s*$", text)
+    if date_match:
+        date_text = " " + date_match.group(1)
+        body = text[: date_match.start()].strip()
+    else:
+        body = text
+
+    lower = body.lower()
+    subjects = []
+    subject_map = [
+        ("AST SpaceMobile", ["ast spacemobile", "asts"]),
+        ("Rocket Lab", ["rocket lab", "rklb"]),
+        ("Blue Origin", ["blue origin"]),
+        ("SpaceX", ["spacex"]),
+        ("Redwire", ["redwire", "rdw"]),
+        ("Planet Labs", ["planet labs"]),
+        ("Oracle", ["oracle", "orcl"]),
+        ("Broadcom", ["broadcom", "avgo"]),
+        ("Microsoft", ["microsoft", "msft"]),
+        ("Tesla", ["tesla", "tsla"]),
+        ("Nvidia", ["nvidia", "nvda"]),
+    ]
+    for label, keys in subject_map:
+        if any(key in lower for key in keys) and label not in subjects:
+            subjects.append(label)
+    subject_text = "/".join(subjects[:3]) if subjects else "해외 종목"
+
+    signals = []
+    if contains_any(lower, ["rocket explosion", "blows up", "explosion"]):
+        signals.append("로켓 폭발 여파")
+    if contains_any(lower, ["launch delay", "launch failure", "setback", "wrong orbit"]):
+        signals.append("발사 지연/실패 우려")
+    if contains_any(lower, ["plunge", "tumble", "falls", "stocks fall", "sinks", "drops", "lower"]):
+        signals.append("주가 하락 압력")
+    if contains_any(lower, ["downgrade", "cuts", "cut target", "analyst"]):
+        signals.append("증권사 하향/목표가 이슈")
+    if contains_any(lower, ["earnings", "revenue", "profit", "guidance", "sales"]):
+        signals.append("실적/가이던스 이슈")
+    if contains_any(lower, ["beats", "record", "growth", "surges", "jumps", "gains", "rises"]):
+        signals.append("성장/상승 모멘텀")
+    if contains_any(lower, ["deal", "contract", "order", "acquisition", "merger"]):
+        signals.append("계약/인수 이슈")
+    if contains_any(lower, ["dividend", "yield", "distribution"]):
+        signals.append("배당 이슈")
+
+    if not signals:
+        signals.append("해외 주요 뉴스")
+    return f"{subject_text}: {' · '.join(signals[:3])}{date_text}"
+
+
 def shorten_news_title_preserving_date(headline, max_length=96):
-    text = clean_news_title(headline)
+    text = localize_news_title(clean_news_title(headline))
     if len(text) <= max_length:
         return text
     date_match = re.search(r"\(20\d{2}-\d{2}-\d{2}\)\s*$", text)
@@ -4094,6 +4163,7 @@ def fetch_news_context(name, sector=None):
         scored["score"] = min(scored["score"], 4)
         scored["risk"] = min(scored["risk"], 8)
         scored["summary"] = "섹터 뉴스 참고: " + scored["summary"]
+    display_headlines = [localize_news_title(title) for title in signal_headlines[:2]]
 
     return {
         "score": scored["score"],
@@ -4105,8 +4175,8 @@ def fetch_news_context(name, sector=None):
         "negative_hits": scored["negative_hits"],
         "severe_negative_hits": scored.get("severe_negative_hits", []),
         "summary": scored["summary"],
-        "headlines": signal_headlines[:2],
-        "one_line": summarize_news_one_line(scored["summary"], signal_headlines[:2]),
+        "headlines": display_headlines,
+        "one_line": summarize_news_one_line(scored["summary"], display_headlines),
         "status": "ok",
         "source": "+".join(sources),
     }
