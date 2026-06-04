@@ -6,6 +6,7 @@ from __future__ import annotations
 import csv
 import json
 import os
+import shutil
 import secrets
 import subprocess
 import sys
@@ -36,6 +37,12 @@ ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "true").lower() ==
 MAX_UPLOAD_BYTES = int(os.getenv("MARKET_RESULTS_UPLOAD_MAX_BYTES", "6000000"))
 MIN_UPLOAD_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_ROWS", "500"))
 MIN_UPLOAD_OK_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_OK_ROWS", "50"))
+RUNTIME_CLEANUP_MAX_AGE_HOURS = int(os.getenv("MARKET_RUNTIME_CLEANUP_MAX_AGE_HOURS", "24"))
+RUNTIME_CLEANUP_DIRS = (
+    Path(tempfile.gettempdir()) / "market-cache",
+    Path(tempfile.gettempdir()) / "market-pycache",
+    Path(tempfile.gettempdir()) / "market-mpl",
+)
 
 app = FastAPI(title="Market Scanner API", version="1.0.0")
 app.add_middleware(
@@ -45,6 +52,11 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["X-Market-Token", "X-API-Token", "Authorization", "Content-Type"],
 )
+
+
+@app.on_event("startup")
+def startup_cleanup() -> None:
+    _cleanup_runtime_storage()
 
 
 @app.middleware("http")
@@ -60,15 +72,62 @@ _request_log: Dict[str, Deque[float]] = defaultdict(deque)
 _cache_rows: List[Dict[str, str]] = []
 _cache_loaded_at = 0.0
 _cache_file_mtime = 0.0
+_cache_file_path = ""
 _scanner_lock = threading.Lock()
 _scanner_running = False
+
+
+def _safe_cleanup_path(path: Path, max_age_hours: int = RUNTIME_CLEANUP_MAX_AGE_HOURS) -> int:
+    if not path.exists():
+        return 0
+    cutoff = time.time() - max_age_hours * 3600
+    removed = 0
+    for item in path.iterdir():
+        try:
+            if item.stat().st_mtime > cutoff:
+                continue
+            if item.is_dir():
+                shutil.rmtree(item, ignore_errors=True)
+            else:
+                item.unlink(missing_ok=True)
+            removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _cleanup_runtime_storage() -> None:
+    for path in RUNTIME_CLEANUP_DIRS:
+        path.mkdir(parents=True, exist_ok=True)
+        _safe_cleanup_path(path)
+    for pattern in ("*.tmp", ".results-*.csv", "tmp*.csv"):
+        for item in BASE_DIR.glob(pattern):
+            try:
+                if time.time() - item.stat().st_mtime > 3600:
+                    item.unlink(missing_ok=True)
+            except OSError:
+                continue
 
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _csv_row_count(path: Path) -> int:
+    if not path.exists():
+        return 0
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            return sum(1 for _ in csv.DictReader(handle))
+    except Exception:
+        return 0
+
+
 def _result_path() -> Path:
+    if RESULT_FILE.exists() and _csv_row_count(RESULT_FILE) >= MIN_UPLOAD_ROWS:
+        return RESULT_FILE
+    if IOS_RESULT_FILE.exists() and _csv_row_count(IOS_RESULT_FILE) >= MIN_UPLOAD_ROWS:
+        return IOS_RESULT_FILE
     if RESULT_FILE.exists():
         return RESULT_FILE
     return IOS_RESULT_FILE
@@ -84,7 +143,7 @@ def _public_row(row: Dict[str, str]) -> Dict[str, str]:
 
 
 def _read_rows() -> List[Dict[str, str]]:
-    global _cache_rows, _cache_loaded_at, _cache_file_mtime
+    global _cache_rows, _cache_loaded_at, _cache_file_mtime, _cache_file_path
 
     path = _result_path()
     if not path.exists():
@@ -92,7 +151,13 @@ def _read_rows() -> List[Dict[str, str]]:
 
     now = time.time()
     file_mtime = path.stat().st_mtime
-    if _cache_rows and now - _cache_loaded_at < CACHE_TTL_SECONDS and file_mtime == _cache_file_mtime:
+    file_path = str(path)
+    if (
+        _cache_rows
+        and now - _cache_loaded_at < CACHE_TTL_SECONDS
+        and file_mtime == _cache_file_mtime
+        and file_path == _cache_file_path
+    ):
         return _cache_rows
 
     with path.open("r", encoding="utf-8-sig", newline="") as handle:
@@ -100,6 +165,7 @@ def _read_rows() -> List[Dict[str, str]]:
         _cache_rows = [_public_row(row) for row in reader]
     _cache_loaded_at = now
     _cache_file_mtime = file_mtime
+    _cache_file_path = file_path
     return _cache_rows
 
 
@@ -122,7 +188,7 @@ def _parse_csv_bytes(payload: bytes) -> List[Dict[str, str]]:
 
 
 def _replace_result_file(payload: bytes, rows: List[Dict[str, str]]) -> None:
-    global _cache_rows, _cache_loaded_at, _cache_file_mtime
+    global _cache_rows, _cache_loaded_at, _cache_file_mtime, _cache_file_path
 
     RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(RESULT_FILE.parent), prefix=".results-", suffix=".csv") as tmp:
@@ -136,6 +202,7 @@ def _replace_result_file(payload: bytes, rows: List[Dict[str, str]]) -> None:
     _cache_rows = rows
     _cache_loaded_at = time.time()
     _cache_file_mtime = RESULT_FILE.stat().st_mtime
+    _cache_file_path = str(RESULT_FILE)
 
 
 def _read_scanner_status() -> Dict[str, object]:
@@ -190,6 +257,7 @@ def _write_scanner_status(**payload: object) -> None:
 def _run_scanner_background() -> None:
     global _scanner_running, _cache_loaded_at
     try:
+        _cleanup_runtime_storage()
         started_at = time.time()
         _write_scanner_status(
             running=True,
@@ -285,6 +353,7 @@ def _run_scanner_background() -> None:
             output=(update.stdout + "\n" + update.stderr)[-4000:],
             progress=100,
         )
+        _cleanup_runtime_storage()
     except subprocess.TimeoutExpired:
         _write_scanner_status(running=False, state="timeout", message="스캐너 시간 초과", progress=0)
     except Exception as exc:
@@ -429,13 +498,16 @@ async def status(request: Request) -> Dict[str, object]:
     path = _result_path()
     mtime = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if path.exists() else ""
     ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
+    generated_at = max((row.get("mobile_intel_generated_at", "") for row in rows), default="")
     scanner_status = _read_scanner_status()
     return {
         "ok": True,
         "rows": len(rows),
         "ok_rows": ok_rows,
         "markets": sorted({row.get("market", "") for row in rows if row.get("market")}),
+        "result_file": path.name,
         "file_updated_at": mtime,
+        "data_generated_at": generated_at,
         "server_updated_at": _now_iso(),
         "scanner": scanner_status,
     }
@@ -507,11 +579,14 @@ async def results(
     path = _result_path()
     file_updated_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if path.exists() else ""
     rows = _filter_rows(_read_rows(), market=market, q=q, limit=limit)
+    generated_at = max((row.get("mobile_intel_generated_at", "") for row in rows), default="")
     return {
         "ok": True,
         "count": len(rows),
         "rows": rows,
+        "result_file": path.name,
         "file_updated_at": file_updated_at,
+        "data_generated_at": generated_at,
         "updated_at": _now_iso(),
     }
 
