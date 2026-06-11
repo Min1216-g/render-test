@@ -38,7 +38,7 @@ services:
     plan: starter
     buildCommand: pip install --no-cache-dir -r requirements.txt && python -m compileall -q render_cron_runner.py render_mobile_refresh.py
     startCommand: python render_cron_runner.py --mode auto
-    schedule: "0 23,0,1 * * *"
+    schedule: "0 13,14,23,0,1 * * *"
     envVars:
       - key: MARKET_API_TOKEN
         sync: false

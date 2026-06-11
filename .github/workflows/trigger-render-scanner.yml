@@ -4,9 +4,11 @@ on:
   workflow_dispatch:
   schedule:
     # Vancouver 16:00/17:00 across daylight saving changes.
+    # Pre-market SpaceX/IPO watch: 05:00 Vancouver.
+    # PDT: 05:00=12:00 UTC, PST: 05:00=13:00 UTC
     # PDT: 16:00=23:00 UTC, 17:00=00:00 UTC
     # PST: 16:00=00:00 UTC, 17:00=01:00 UTC
-    - cron: "0 23,0,1 * * *"
+    - cron: "0 12,13,23,0,1 * * *"
 
 jobs:
   trigger:
@@ -25,7 +27,7 @@ jobs:
           import os
 
           now = datetime.now(ZoneInfo("America/Vancouver"))
-          should_run = now.hour in {16, 17} and now.weekday() not in {4, 5}
+          should_run = now.hour in {5, 16, 17} and now.weekday() not in {4, 5}
           print(f"Vancouver now: {now:%Y-%m-%d %H:%M:%S %Z}")
           print(f"should_run={str(should_run).lower()}")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:

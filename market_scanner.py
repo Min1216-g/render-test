@@ -29,8 +29,11 @@ except Exception:
         return 0, ""
 
 try:
-    from spacex_listing_watch import load_spacex_public_listing
+    from spacex_listing_watch import load_space_industry_watch_state, load_spacex_public_listing
 except Exception:
+    def load_space_industry_watch_state():
+        return {}
+
     def load_spacex_public_listing():
         return {}, {}
 
@@ -1630,6 +1633,16 @@ US_SPACE_AEROSPACE_SECTOR_MAP = {
 }
 
 SPACEX_PUBLIC_STOCKS, SPACEX_PUBLIC_SECTOR_MAP = load_spacex_public_listing()
+SPACEX_WATCH_STATE = load_space_industry_watch_state()
+SPACEX_PUBLIC_TICKER = str(SPACEX_PUBLIC_STOCKS.get("SpaceX", "") or "").strip().upper()
+if SPACEX_PUBLIC_TICKER:
+    FULL_SERVICE_ETF_PROXY_HOLDINGS["TIGER 미국우주테크"][0] = {
+        "symbol": SPACEX_PUBLIC_TICKER,
+        "name": "SpaceX",
+        "weight": 12.0,
+        "quote_symbol": SPACEX_PUBLIC_TICKER,
+        "spacex_public": True,
+    }
 
 STRATEGIC_SECTOR_FILL_STOCKS = {
     "퍼스텍": "010820.KS",
@@ -3551,7 +3564,15 @@ def fetch_etf_holdings_context(name, ticker, sector=""):
                 name_text = str(item.get("name", "")).strip()
                 weight = float(item.get("weight", 0.0) or 0.0)
                 if item.get("private"):
-                    lines.append(f"{name_text} {weight:.2f}% · 비상장 가치/IPO 이벤트 반영 · 실시간 등락 제외")
+                    status_text = str(SPACEX_WATCH_STATE.get("display_status") or "비상장 기업 · 상장 감시중")
+                    news_items = SPACEX_WATCH_STATE.get("listing_news") or []
+                    news_hint = ""
+                    if isinstance(news_items, list) and news_items:
+                        first_news = news_items[0] if isinstance(news_items[0], dict) else {}
+                        title = str(first_news.get("title") or "").strip()
+                        if title:
+                            news_hint = f" · 감시 뉴스: {title[:42]}"
+                    lines.append(f"{name_text} {weight:.2f}% · {status_text} · IPO 자동 감시{news_hint} · 실시간 등락 제외")
                     continue
                 quote_symbol = item.get("quote_symbol") or symbol.upper()
                 change = changes.get(str(quote_symbol).upper()) or changes.get(symbol.upper())
@@ -4644,6 +4665,14 @@ def analyze_stock(name, ticker, market_context):
         risk += abs(intraday["preopen_score"])
         risks.append(intraday["preopen_summary"])
 
+    spacex_ipo_analysis = {}
+    if name == "SpaceX" and SPACEX_PUBLIC_TICKER:
+        spacex_ipo_analysis = SPACEX_WATCH_STATE.get("ipo_initial_analysis") or {}
+        news_score += 8
+        market_score += 6
+        reasons.append("SpaceX 상장 감지 · IPO 초기 분석 대상")
+        risks.append("IPO 초기 변동성/유통주식수/락업 리스크 확인 필요")
+
     raw_score = technical_score + volume_score + flow_score + news_score + market_score
     if not liquidity_confirmed:
         risks.append(
@@ -4728,6 +4757,12 @@ def analyze_stock(name, ticker, market_context):
         "etf_holdings_top": etf_holdings["etf_holdings_top"],
         "etf_holdings_weighted_move_pct": etf_holdings["etf_holdings_weighted_move_pct"],
         "etf_holdings_summary": etf_holdings["etf_holdings_summary"],
+        "spacex_listing_status": SPACEX_WATCH_STATE.get("display_status", "") if name == "SpaceX" else "",
+        "spacex_market_cap_estimate": spacex_ipo_analysis.get("market_cap_estimate", 0) if name == "SpaceX" else 0,
+        "spacex_shares_outstanding_estimate": spacex_ipo_analysis.get("shares_outstanding_estimate", 0) if name == "SpaceX" else 0,
+        "spacex_float_shares_estimate": spacex_ipo_analysis.get("float_shares_estimate", 0) if name == "SpaceX" else 0,
+        "spacex_ipo_return_pct": spacex_ipo_analysis.get("ipo_return_pct", 0) if name == "SpaceX" else 0,
+        "spacex_ipo_risk": spacex_ipo_analysis.get("ai_risk", "") if name == "SpaceX" else "",
         "preopen_score": intraday["preopen_score"],
         "preopen_summary": intraday["preopen_summary"],
         "intraday_1m_score": intraday["intraday_1m_score"],

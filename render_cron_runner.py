@@ -33,7 +33,7 @@ def require_upload_token() -> bool:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Render cron entrypoint with Vancouver-time guard.")
-    parser.add_argument("--slot", type=int, choices=(16, 17), help="Vancouver hour to run.")
+    parser.add_argument("--slot", type=int, choices=(5, 16, 17), help="Vancouver hour to run.")
     parser.add_argument("--mode", choices=("auto", "scanner", "full"), default="auto", help="Program set to run.")
     parser.add_argument("--force", action="store_true", help="Run even if the current Vancouver hour does not match.")
     args = parser.parse_args()
@@ -51,10 +51,12 @@ def main() -> int:
             mode = "scanner"
         elif now.hour == 17:
             mode = "full"
+        elif now.hour == 5:
+            mode = "scanner"
         elif args.force:
             mode = "scanner"
         else:
-            print(f"skip: current hour {now.hour}:00 is not 16:00 or 17:00 Vancouver", flush=True)
+            print(f"skip: current hour {now.hour}:00 is not 05:00, 16:00 or 17:00 Vancouver", flush=True)
             return 0
     elif args.slot is not None and now.hour != args.slot and not args.force:
         print(f"skip: slot {args.slot}:00, current hour {now.hour}:00", flush=True)
