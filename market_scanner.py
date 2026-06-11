@@ -28,6 +28,12 @@ except Exception:
     def failure_adjustment_for(name, ticker, market, sector):
         return 0, ""
 
+try:
+    from spacex_listing_watch import load_spacex_public_listing
+except Exception:
+    def load_spacex_public_listing():
+        return {}, {}
+
 
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env.market_scanner"
@@ -49,6 +55,7 @@ ETF_HOLDINGS_SKIP_TICKERS = {"VFV.TO"}
 FULL_SERVICE_ETF_NAMES = {"TIGER 미국우주테크"}
 FULL_SERVICE_ETF_PROXY_HOLDINGS = {
     "TIGER 미국우주테크": [
+        {"symbol": "PRIVATE", "name": "SpaceX 비상장 노출", "weight": 12.0, "private": True},
         {"symbol": "RKLB", "name": "Rocket Lab", "weight": 15.0},
         {"symbol": "ASTS", "name": "AST SpaceMobile", "weight": 13.0},
         {"symbol": "PL", "name": "Planet Labs", "weight": 10.0},
@@ -1622,6 +1629,8 @@ US_SPACE_AEROSPACE_SECTOR_MAP = {
     "Textron": "미장/항공/방산",
 }
 
+SPACEX_PUBLIC_STOCKS, SPACEX_PUBLIC_SECTOR_MAP = load_spacex_public_listing()
+
 STRATEGIC_SECTOR_FILL_STOCKS = {
     "퍼스텍": "010820.KS",
     "빅텍": "065450.KQ",
@@ -1916,6 +1925,8 @@ DEFAULT_STOCKS.update(KOREA_SPACE_AEROSPACE_STOCKS)
 SECTOR_MAP.update(KOREA_SPACE_AEROSPACE_SECTOR_MAP)
 DEFAULT_STOCKS.update(US_SPACE_AEROSPACE_STOCKS)
 SECTOR_MAP.update(US_SPACE_AEROSPACE_SECTOR_MAP)
+DEFAULT_STOCKS.update(SPACEX_PUBLIC_STOCKS)
+SECTOR_MAP.update(SPACEX_PUBLIC_SECTOR_MAP)
 DEFAULT_STOCKS.update(STRATEGIC_SECTOR_FILL_STOCKS)
 SECTOR_MAP.update(STRATEGIC_SECTOR_FILL_MAP)
 DEFAULT_STOCKS.update(TIGER_ETF_STOCKS)
@@ -2033,9 +2044,14 @@ NEGATIVE_NEWS_KEYWORDS = {
     "launch failure": 12,
     "rocket explosion": 12,
     "explosion": 12,
+    "launch anomaly": 11,
+    "starship failure": 12,
+    "falcon 9 failure": 11,
     "delay": 6,
     "delays": 6,
     "launch delay": 8,
+    "starship delay": 8,
+    "falcon 9 delay": 8,
     "wrong orbit": 10,
     "downgrade": 8,
     "tumble": 8,
@@ -2094,11 +2110,11 @@ SECTOR_NEWS_RISK_KEYWORDS = {
     "통신": "과징금 규제 해킹 장애",
     "전선": "구리 가격 원가 상승 공급 지연",
     "알루미늄": "원가 상승 관세 수요 둔화",
-    "우주항공": "블루오리진 로켓 폭발 발사 실패 발사 지연 궤도 실패 급락 downgrade tumble launch failure rocket explosion wrong orbit",
+    "우주항공": "SpaceX Starlink Starship Falcon 9 Elon Musk Space Launch Launch Failure 발사 실패 발사 지연 궤도 실패 급락 downgrade tumble launch failure rocket explosion wrong orbit",
     "항공": "로켓 폭발 발사 실패 운항 차질 지연 리콜 안전사고 급락",
 }
 
-SECTOR_NEWS_POSITIVE_KEYWORDS = "수주 계약 공급 승인 실적 흑자 투자 확대 정책"
+SECTOR_NEWS_POSITIVE_KEYWORDS = "수주 계약 공급 승인 실적 흑자 투자 확대 정책 Government Contract NASA Contract Launch Success Starlink Starship Falcon 9"
 SECTOR_NEWS_CACHE = {}
 COMPANY_RISK_NEWS_CACHE = {}
 HIGH_RISK_COMPANY_NEWS_NAMES = {
@@ -3445,6 +3461,8 @@ def fetch_holding_daily_moves(holdings):
     yf_symbols = []
     symbol_map = {}
     for item in holdings[:10]:
+        if item.get("private"):
+            continue
         symbol = str(item.get("symbol", "")).strip().upper()
         if not symbol or symbol in {"N/A", "NAN"}:
             continue
@@ -3532,6 +3550,9 @@ def fetch_etf_holdings_context(name, ticker, sector=""):
                 symbol = str(item.get("symbol", "")).strip()
                 name_text = str(item.get("name", "")).strip()
                 weight = float(item.get("weight", 0.0) or 0.0)
+                if item.get("private"):
+                    lines.append(f"{name_text} {weight:.2f}% · 비상장 가치/IPO 이벤트 반영 · 실시간 등락 제외")
+                    continue
                 quote_symbol = item.get("quote_symbol") or symbol.upper()
                 change = changes.get(str(quote_symbol).upper()) or changes.get(symbol.upper())
                 if change is None:
@@ -3963,6 +3984,8 @@ def fetch_sector_news_headlines(name, sector):
     if base_sector == "우주항공":
         queries.extend(
             [
+                "SpaceX Starlink Starship Falcon 9 NASA contract government contract launch success launch failure",
+                "SpaceX IPO Starlink satellite NASA contract aerospace stocks",
                 "TIGER 미국우주테크 블루오리진 로켓 폭발 우주주 급락",
                 "space stocks Blue Origin rocket explosion AST SpaceMobile Rocket Lab",
                 "AST SpaceMobile Rocket Lab tumble Blue Origin rocket explosion",

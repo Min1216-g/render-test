@@ -134,6 +134,8 @@ def localize_news_text(value: str) -> str:
         signals.append("로켓 폭발 여파")
     if contains_any(lowered, ["launch delay", "launch failure", "setback", "wrong orbit"]):
         signals.append("발사 지연/실패 우려")
+    if contains_any(lowered, ["launch success", "successful launch", "nasa contract", "government contract", "starlink deal"]):
+        signals.append("우주 계약/발사 성공 모멘텀")
     if contains_any(lowered, ["plunge", "tumble", "falls", "stocks fall", "sinks", "drops", "lower"]):
         signals.append("주가 하락 압력")
     if contains_any(lowered, ["downgrade", "cuts", "analyst", "target"]):
@@ -463,11 +465,11 @@ def news_price_forecast(row: pd.Series, state: dict | None = None, generated_at:
 
     bad = (
         keyword_level == "sector_critical_bad"
-        or contains_any(news_text, ["중대 악재", "악재", "철근", "누락", "부실", "어닝쇼크", "실적 쇼크", "소송", "적자"])
+        or contains_any(news_text, ["중대 악재", "악재", "철근", "누락", "부실", "어닝쇼크", "실적 쇼크", "소송", "적자", "launch failure", "launch delay", "rocket explosion", "starship failure", "falcon 9 failure"])
     )
     good = (
         keyword_level == "sector_major_good"
-        or contains_any(news_text, ["강한 호재", "호재", "수주", "계약", "승인", "흑자", "실적 서프라이즈", "공급"])
+        or contains_any(news_text, ["강한 호재", "호재", "수주", "계약", "승인", "흑자", "실적 서프라이즈", "공급", "launch success", "successful launch", "nasa contract", "government contract", "starlink contract", "starlink deal"])
     )
 
     if not bad and not good:
@@ -665,6 +667,26 @@ def enrich() -> int:
         row["mobile_news_impact_summary"] = news_impact["summary"]
         row["mobile_news_learned_keywords"] = learned_keyword_summary(adaptive_news_state)
         row["mobile_news_focus"] = " · ".join(part for part in [news_text, row["mobile_sector_keywords"]] if part) or "주요 뉴스 대기"
+        row["mobile_news_v2_strength"] = news_impact.get("v2_strength", 0)
+        row["mobile_news_v2_duration"] = news_impact.get("v2_duration", "")
+        row["mobile_news_v2_market_reaction"] = news_impact.get("v2_market_reaction", "")
+        row["mobile_news_v2_positive_factors"] = news_impact.get("v2_positive_factors", "")
+        row["mobile_news_v2_negative_factors"] = news_impact.get("v2_negative_factors", "")
+        row["mobile_news_v2_short_effect"] = news_impact.get("v2_short_effect", 0)
+        row["mobile_news_v2_mid_effect"] = news_impact.get("v2_mid_effect", 0)
+        row["mobile_news_v2_long_effect"] = news_impact.get("v2_long_effect", 0)
+        row["mobile_news_v2_sector_impact"] = news_impact.get("v2_sector_impact", "")
+        row["mobile_news_v2_lead_status"] = news_impact.get("v2_lead_status", "")
+        row["mobile_news_v2_core_signal"] = news_impact.get("v2_core_signal", "")
+        row["mobile_news_v2_final_signal"] = news_impact.get("v2_final_signal", "")
+        row["mobile_news_v2_confidence_grade"] = news_impact.get("v2_confidence_grade", "")
+        row["mobile_news_v2_policy_flags"] = news_impact.get("v2_policy_flags", "")
+        row["mobile_news_grade"] = news_impact.get("news_grade", "")
+        row["mobile_news_type"] = news_impact.get("news_type", "")
+        row["mobile_news_good_score"] = news_impact.get("good_score", 0)
+        row["mobile_news_bad_score"] = news_impact.get("bad_score", 0)
+        row["mobile_news_impact_strength_label"] = news_impact.get("impact_strength_label", "")
+        row["mobile_news_leading_detection"] = news_impact.get("leading_detection", "")
         row["mobile_trendline_anchor_date"] = trendline["date"]
         row["mobile_trendline_anchor_price"] = round(float(trendline["anchor"]), 4)
         row["mobile_trendline_up"] = round(float(trendline["up"]), 4)

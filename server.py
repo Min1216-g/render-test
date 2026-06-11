@@ -75,6 +75,38 @@ _cache_file_mtime = 0.0
 _cache_file_path = ""
 _scanner_lock = threading.Lock()
 _scanner_running = False
+_scanner_last_seen_mtime = 0.0
+
+
+def _invalidate_results_cache() -> None:
+    global _cache_rows, _cache_loaded_at, _cache_file_mtime, _cache_file_path
+    _cache_rows = []
+    _cache_loaded_at = 0.0
+    _cache_file_mtime = 0.0
+    _cache_file_path = ""
+
+
+def _current_result_snapshot() -> Dict[str, object]:
+    path = _result_path()
+    if not path.exists():
+        return {"rows": 0, "ok_rows": 0, "file_updated_at": "", "data_generated_at": ""}
+    rows = _read_rows()
+    return {
+        "rows": len(rows),
+        "ok_rows": sum(1 for row in rows if row.get("status", "ok") == "ok"),
+        "file_updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+        "data_generated_at": max((row.get("mobile_intel_generated_at", "") for row in rows), default=""),
+    }
+
+
+def _clear_runtime_api_caches() -> None:
+    _invalidate_results_cache()
+    for pattern in ("context_cache.json.tmp", "news_pulse_state.tmp", "tmp*.csv", ".results-*.csv"):
+        for item in BASE_DIR.glob(pattern):
+            try:
+                item.unlink(missing_ok=True)
+            except OSError:
+                continue
 
 
 def _safe_cleanup_path(path: Path, max_age_hours: int = RUNTIME_CLEANUP_MAX_AGE_HOURS) -> int:
@@ -188,8 +220,6 @@ def _parse_csv_bytes(payload: bytes) -> List[Dict[str, str]]:
 
 
 def _replace_result_file(payload: bytes, rows: List[Dict[str, str]]) -> None:
-    global _cache_rows, _cache_loaded_at, _cache_file_mtime, _cache_file_path
-
     RESULT_FILE.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile("wb", delete=False, dir=str(RESULT_FILE.parent), prefix=".results-", suffix=".csv") as tmp:
         tmp.write(payload)
@@ -199,10 +229,8 @@ def _replace_result_file(payload: bytes, rows: List[Dict[str, str]]) -> None:
     if IOS_RESULT_FILE.parent.exists():
         IOS_RESULT_FILE.write_bytes(payload)
 
-    _cache_rows = rows
-    _cache_loaded_at = time.time()
-    _cache_file_mtime = RESULT_FILE.stat().st_mtime
-    _cache_file_path = str(RESULT_FILE)
+    _invalidate_results_cache()
+    _read_rows()
 
 
 def _read_scanner_status() -> Dict[str, object]:
@@ -255,14 +283,17 @@ def _write_scanner_status(**payload: object) -> None:
 
 
 def _run_scanner_background() -> None:
-    global _scanner_running, _cache_loaded_at
+    global _scanner_running, _scanner_last_seen_mtime
     try:
         _cleanup_runtime_storage()
+        _clear_runtime_api_caches()
         started_at = time.time()
+        current_path = _result_path()
+        _scanner_last_seen_mtime = current_path.stat().st_mtime if current_path.exists() else 0.0
         _write_scanner_status(
             running=True,
             state="running",
-            message="스캐너 실행중... 8%",
+            message="스캐너 실행 시작 · 캐시 초기화 완료... 8%",
             progress=8,
             started_at=started_at,
         )
@@ -287,21 +318,65 @@ def _run_scanner_background() -> None:
             progress=25,
             started_at=started_at,
         )
-        update = subprocess.run(
-            command,
-            cwd=BASE_DIR,
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=int(os.getenv("MARKET_SCANNER_REFRESH_TIMEOUT", "3600")),
-        )
+        stdout = ""
+        stderr = ""
+        stdout_log = tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False, dir=BASE_DIR, prefix=".scanner-stdout-", suffix=".log")
+        stderr_log = tempfile.NamedTemporaryFile("w+", encoding="utf-8", delete=False, dir=BASE_DIR, prefix=".scanner-stderr-", suffix=".log")
+        stdout_path = Path(stdout_log.name)
+        stderr_path = Path(stderr_log.name)
+        try:
+            update = subprocess.Popen(
+                command,
+                cwd=BASE_DIR,
+                stdout=stdout_log,
+                stderr=stderr_log,
+                text=True,
+            )
+            timeout_seconds = int(os.getenv("MARKET_SCANNER_REFRESH_TIMEOUT", "3600"))
+            timeout_at = time.time() + timeout_seconds
+            while update.poll() is None:
+                if time.time() > timeout_at:
+                    update.kill()
+                    update.wait(timeout=10)
+                    raise subprocess.TimeoutExpired(command, timeout_seconds)
+                path = _result_path()
+                if path.exists():
+                    mtime = path.stat().st_mtime
+                    if mtime > _scanner_last_seen_mtime:
+                        _scanner_last_seen_mtime = mtime
+                        _invalidate_results_cache()
+                        snapshot = _current_result_snapshot()
+                        _write_scanner_status(
+                            running=True,
+                            state="partial_data",
+                            message=f"부분 데이터 반영됨 · {snapshot['ok_rows']}/{snapshot['rows']} 정상 · 모바일 재조회 가능",
+                            progress=max(35, int(_read_scanner_status().get("progress") or 35)),
+                            started_at=started_at,
+                            **snapshot,
+                        )
+                time.sleep(5)
+
+            stdout_log.flush()
+            stderr_log.flush()
+            stdout_log.seek(0)
+            stderr_log.seek(0)
+            stdout = stdout_log.read()
+            stderr = stderr_log.read()
+        finally:
+            stdout_log.close()
+            stderr_log.close()
+            for log_path in (stdout_path, stderr_path):
+                try:
+                    log_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         if update.returncode != 0:
             _write_scanner_status(
                 running=False,
                 state="failed",
                 message="스캐너 실패",
                 return_code=update.returncode,
-                output=(update.stdout + "\n" + update.stderr)[-4000:],
+                output=(stdout + "\n" + stderr)[-4000:],
                 progress=0,
             )
             return
@@ -328,7 +403,7 @@ def _run_scanner_background() -> None:
                     state="partial",
                     message="스캐너 완료 · 모바일 보강 실패",
                     return_code=enrich.returncode,
-                    output=(update.stdout + "\n" + enrich.stdout + "\n" + enrich.stderr)[-4000:],
+                    output=(stdout + "\n" + stderr + "\n" + enrich.stdout + "\n" + enrich.stderr)[-4000:],
                     progress=90,
                 )
                 return
@@ -340,7 +415,7 @@ def _run_scanner_background() -> None:
             progress=95,
             started_at=started_at,
         )
-        _cache_loaded_at = 0
+        _invalidate_results_cache()
         rows = _read_rows()
         ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
         _write_scanner_status(
@@ -350,7 +425,7 @@ def _run_scanner_background() -> None:
             rows=len(rows),
             ok_rows=ok_rows,
             mode="full",
-            output=(update.stdout + "\n" + update.stderr)[-4000:],
+            output=(stdout + "\n" + stderr)[-4000:],
             progress=100,
         )
         _cleanup_runtime_storage()
@@ -528,10 +603,11 @@ async def scanner_run(request: Request) -> Dict[str, object]:
                 "updated_at": _now_iso(),
             }
         _scanner_running = True
+        _clear_runtime_api_caches()
         _write_scanner_status(
             running=True,
             state="queued",
-            message="스캐너 실행 요청됨... 0%",
+            message="스캐너 실행 요청됨 · 캐시 초기화... 0%",
             progress=0,
             started_at=time.time(),
         )
@@ -566,6 +642,29 @@ async def scanner_status(request: Request) -> Dict[str, object]:
         "status": status,
         "updated_at": _now_iso(),
     }
+
+
+@app.post("/api/cache/invalidate")
+async def invalidate_cache(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    _clear_runtime_api_caches()
+    snapshot = _current_result_snapshot()
+    _write_scanner_status(
+        running=False,
+        state="cache_invalidated",
+        message="모바일 API 캐시 강제 초기화 완료",
+        progress=100,
+        **snapshot,
+    )
+    return {"ok": True, "message": "cache invalidated", "snapshot": snapshot, "updated_at": _now_iso()}
+
+
+@app.post("/api/results/force-refresh")
+async def force_refresh_results(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    _invalidate_results_cache()
+    snapshot = _current_result_snapshot()
+    return {"ok": True, "message": "results cache refreshed", **snapshot, "updated_at": _now_iso()}
 
 
 @app.get("/api/results")
@@ -651,6 +750,15 @@ def root() -> Dict[str, object]:
     return {
         "ok": True,
         "service": "Market Scanner API",
-        "endpoints": ["/api/health", "/api/status", "/api/results", "/api/top-movers", "/api/scanner/run", "/api/scanner/status"],
+        "endpoints": [
+            "/api/health",
+            "/api/status",
+            "/api/results",
+            "/api/results/force-refresh",
+            "/api/top-movers",
+            "/api/scanner/run",
+            "/api/scanner/status",
+            "/api/cache/invalidate",
+        ],
         "auth": "Send X-Market-Token, X-API-Token, or Authorization: Bearer <token>",
     }
