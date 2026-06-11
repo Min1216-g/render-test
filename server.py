@@ -334,12 +334,15 @@ def _run_scanner_background() -> None:
             )
             timeout_seconds = int(os.getenv("MARKET_SCANNER_REFRESH_TIMEOUT", "3600"))
             timeout_at = time.time() + timeout_seconds
+            last_heartbeat = 0.0
             while update.poll() is None:
-                if time.time() > timeout_at:
+                now = time.time()
+                if now > timeout_at:
                     update.kill()
                     update.wait(timeout=10)
                     raise subprocess.TimeoutExpired(command, timeout_seconds)
                 path = _result_path()
+                current_status = _read_scanner_status()
                 if path.exists():
                     mtime = path.stat().st_mtime
                     if mtime > _scanner_last_seen_mtime:
@@ -350,10 +353,23 @@ def _run_scanner_background() -> None:
                             running=True,
                             state="partial_data",
                             message=f"부분 데이터 반영됨 · {snapshot['ok_rows']}/{snapshot['rows']} 정상 · 모바일 재조회 가능",
-                            progress=max(35, int(_read_scanner_status().get("progress") or 35)),
+                            progress=max(35, int(current_status.get("progress") or 35)),
                             started_at=started_at,
                             **snapshot,
                         )
+                        last_heartbeat = now
+                if now - last_heartbeat >= 15:
+                    snapshot = _current_result_snapshot()
+                    progress = min(80, max(25, int(current_status.get("progress") or 25) + 1))
+                    _write_scanner_status(
+                        running=True,
+                        state="running",
+                        message=f"AI 분석/뉴스 수집 실행중... {progress}%",
+                        progress=progress,
+                        started_at=started_at,
+                        **snapshot,
+                    )
+                    last_heartbeat = now
                 time.sleep(5)
 
             stdout_log.flush()
@@ -649,14 +665,23 @@ async def invalidate_cache(request: Request) -> Dict[str, object]:
     await guarded(request)
     _clear_runtime_api_caches()
     snapshot = _current_result_snapshot()
-    _write_scanner_status(
-        running=False,
-        state="cache_invalidated",
-        message="모바일 API 캐시 강제 초기화 완료",
-        progress=100,
-        **snapshot,
-    )
-    return {"ok": True, "message": "cache invalidated", "snapshot": snapshot, "updated_at": _now_iso()}
+    with _scanner_lock:
+        scanner_running = _scanner_running
+    if not scanner_running:
+        _write_scanner_status(
+            running=False,
+            state="cache_invalidated",
+            message="모바일 API 캐시 강제 초기화 완료",
+            progress=100,
+            **snapshot,
+        )
+    return {
+        "ok": True,
+        "message": "cache invalidated",
+        "scanner_running": scanner_running,
+        "snapshot": snapshot,
+        "updated_at": _now_iso(),
+    }
 
 
 @app.post("/api/results/force-refresh")
