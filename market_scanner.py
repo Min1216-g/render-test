@@ -1664,7 +1664,7 @@ def build_spacex_listing_fallback_row(ticker: str, dividend: Dict[str, object]) 
     return {
         "name": "SpaceX",
         "ticker": ticker,
-        "status": "ok" if price > 0 else "no_data",
+        "status": "ok",
         "market": "미장",
         "dividend_group": dividend["dividend_group"],
         "dividend_amount": dividend["dividend_amount"],
