@@ -59,7 +59,7 @@ ETF_HOLDINGS_SKIP_TICKERS = {"VFV.TO"}
 FULL_SERVICE_ETF_NAMES = {"TIGER 미국우주테크"}
 FULL_SERVICE_ETF_PROXY_HOLDINGS = {
     "TIGER 미국우주테크": [
-        {"symbol": "PRIVATE", "name": "SpaceX 비상장 노출", "weight": 12.0, "private": True},
+        {"symbol": "SPCX", "name": "SpaceX", "weight": 12.0, "quote_symbol": "SPCX", "spacex_public": True},
         {"symbol": "RKLB", "name": "Rocket Lab", "weight": 15.0},
         {"symbol": "ASTS", "name": "AST SpaceMobile", "weight": 13.0},
         {"symbol": "PL", "name": "Planet Labs", "weight": 10.0},
@@ -2045,8 +2045,8 @@ SECTOR_MAP.update(US_SPACE_AEROSPACE_SECTOR_MAP)
 DEFAULT_STOCKS.update(SPACEX_PUBLIC_STOCKS)
 SECTOR_MAP.update(SPACEX_PUBLIC_SECTOR_MAP)
 if "SpaceX" not in DEFAULT_STOCKS:
-    DEFAULT_STOCKS["SpaceX"] = SPACEX_PUBLIC_TICKER or "SPACEX.PRIVATE"
-    SECTOR_MAP["SpaceX"] = "미장/로켓/우주/비상장감시"
+    DEFAULT_STOCKS["SpaceX"] = SPACEX_PUBLIC_TICKER or "SPCX"
+    SECTOR_MAP["SpaceX"] = "미장/로켓/우주/IPO"
 DEFAULT_STOCKS.update(STRATEGIC_SECTOR_FILL_STOCKS)
 SECTOR_MAP.update(STRATEGIC_SECTOR_FILL_MAP)
 DEFAULT_STOCKS.update(TIGER_ETF_STOCKS)

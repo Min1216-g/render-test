@@ -22,6 +22,7 @@ YAHOO_SUMMARY_URL = "https://query2.finance.yahoo.com/v10/finance/quoteSummary/{
 NASDAQ_IPO_URL = "https://api.nasdaq.com/api/ipo/calendar"
 GOOGLE_NEWS_RSS_URL = "https://news.google.com/rss/search"
 HTTP_TIMEOUT = 8
+SPACEX_DEFAULT_PUBLIC_TICKER = os.getenv("SPACEX_PUBLIC_TICKER", "SPCX").strip().upper() or "SPCX"
 
 CORE_SPACE_COMPANIES = [
     {"name": "SpaceX", "aliases": ["Space Exploration Technologies Corp", "SpaceX"], "public": False},
@@ -91,7 +92,7 @@ def _candidate_tickers() -> List[str]:
         candidates.extend(item.strip().upper() for item in raw.split(",") if item.strip())
 
     # Probe only. Every candidate is validated against name and price data.
-    candidates.extend(["SPACEX", "SPACE", "SPCX", "SX", "X"])
+    candidates.extend([SPACEX_DEFAULT_PUBLIC_TICKER, "SPACEX", "SPACE", "SPCX", "SX", "X"])
     return [ticker for ticker in dict.fromkeys(candidates) if ticker and ticker not in EXCLUDED_TICKERS]
 
 
@@ -343,7 +344,7 @@ def load_space_industry_watch_state() -> Dict[str, object]:
 
 
 def detect_spacex_public_listing() -> Dict[str, object]:
-    manual_ticker = os.getenv("SPACEX_PUBLIC_TICKER", "").strip().upper()
+    manual_ticker = SPACEX_DEFAULT_PUBLIC_TICKER
     session = _session()
     yahoo_matches = _search_yahoo_for_spacex(session)
     ipo_rows = _nasdaq_ipo_candidates(session)
@@ -376,6 +377,21 @@ def detect_spacex_public_listing() -> Dict[str, object]:
             continue
         stats = _get_summary_stats(session, ticker)
         payload = _confirmed_payload(ticker, meta, stats, source, checked, news)
+        _save_state(payload)
+        return payload
+
+    if manual_ticker:
+        payload = _confirmed_payload(
+            manual_ticker,
+            {"regularMarketPrice": 0.0, "previousClose": 0.0, "currency": "USD", "regularMarketVolume": 0},
+            {"currency": "USD"},
+            "default_public_ticker",
+            checked or [manual_ticker],
+            news,
+        )
+        payload["status"] = "ticker_confirmed_quote_pending"
+        payload["display_status"] = "상장 티커 확인 · 시세 공급 대기"
+        payload["ipo_initial_analysis"]["ai_risk"] = "상장 직후 시세 공급 지연 가능 · 첫 실시간 가격 확인 필요"
         _save_state(payload)
         return payload
 
