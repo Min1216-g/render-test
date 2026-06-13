@@ -14,6 +14,7 @@ from datetime import datetime, timedelta
 from email.utils import parsedate_to_datetime
 from io import StringIO
 from pathlib import Path
+from typing import Dict
 from urllib.parse import quote
 
 import pandas as pd
@@ -1634,7 +1635,12 @@ US_SPACE_AEROSPACE_SECTOR_MAP = {
 
 SPACEX_PUBLIC_STOCKS, SPACEX_PUBLIC_SECTOR_MAP = load_spacex_public_listing()
 SPACEX_WATCH_STATE = load_space_industry_watch_state()
-SPACEX_PUBLIC_TICKER = str(SPACEX_PUBLIC_STOCKS.get("SpaceX", "") or "").strip().upper()
+SPACEX_PUBLIC_TICKER = str(
+    SPACEX_PUBLIC_STOCKS.get("SpaceX", "") or SPACEX_WATCH_STATE.get("ticker", "")
+).strip().upper()
+if SPACEX_PUBLIC_TICKER:
+    SPACEX_PUBLIC_STOCKS.setdefault("SpaceX", SPACEX_PUBLIC_TICKER)
+    SPACEX_PUBLIC_SECTOR_MAP.setdefault("SpaceX", "미장/로켓/우주/IPO")
 if SPACEX_PUBLIC_TICKER:
     FULL_SERVICE_ETF_PROXY_HOLDINGS["TIGER 미국우주테크"][0] = {
         "symbol": SPACEX_PUBLIC_TICKER,
@@ -1642,6 +1648,104 @@ if SPACEX_PUBLIC_TICKER:
         "weight": 12.0,
         "quote_symbol": SPACEX_PUBLIC_TICKER,
         "spacex_public": True,
+    }
+
+
+def build_spacex_listing_fallback_row(ticker: str, dividend: Dict[str, object]) -> Dict[str, object]:
+    """Keep SpaceX visible in mobile even while quote vendors lag the new ticker."""
+    ipo_analysis = SPACEX_WATCH_STATE.get("ipo_initial_analysis") or {}
+    price = float(ipo_analysis.get("price") or SPACEX_WATCH_STATE.get("price") or 0.0)
+    listing_status = SPACEX_WATCH_STATE.get("display_status") or "상장 감지 대기"
+    ai_risk = ipo_analysis.get("ai_risk") or "IPO 초기 변동성/락업/유통주식수 확인 필요"
+    news_line = f"{listing_status} · {ticker} · IPO 초기 분석 대상"
+    if price > 0:
+        news_line = f"{news_line} · 기준가 ${price:,.2f}"
+
+    return {
+        "name": "SpaceX",
+        "ticker": ticker,
+        "status": "ok" if price > 0 else "no_data",
+        "market": "미장",
+        "dividend_group": dividend["dividend_group"],
+        "dividend_amount": dividend["dividend_amount"],
+        "dividend_annual_amount": dividend["dividend_annual_amount"],
+        "dividend_yield_pct": dividend["dividend_yield_pct"],
+        "last_dividend_date": dividend["last_dividend_date"],
+        "next_dividend_estimate": dividend["next_dividend_estimate"],
+        "dividend_frequency_days": dividend["dividend_frequency_days"],
+        "dividend_summary": dividend["dividend_summary"],
+        "etf_nav": 0.0,
+        "etf_premium_pct": 0.0,
+        "etf_summary": "",
+        "etf_now_source_date": "",
+        "etf_now_signal": "",
+        "etf_now_return_pct": 0.0,
+        "etf_now_buy_price": 0.0,
+        "etf_now_buy_date": "",
+        "etf_now_summary": "",
+        "etf_holdings_source": "",
+        "etf_holdings_source_date": "",
+        "etf_holdings_count": 0,
+        "etf_holdings_top": "",
+        "etf_holdings_weighted_move_pct": 0.0,
+        "etf_holdings_summary": "",
+        "spacex_listing_status": listing_status,
+        "spacex_market_cap_estimate": ipo_analysis.get("market_cap_estimate", 0),
+        "spacex_shares_outstanding_estimate": ipo_analysis.get("shares_outstanding_estimate", 0),
+        "spacex_float_shares_estimate": ipo_analysis.get("float_shares_estimate", 0),
+        "spacex_ipo_return_pct": ipo_analysis.get("ipo_return_pct", 0),
+        "spacex_ipo_risk": ai_risk,
+        "preopen_score": 0.0,
+        "preopen_summary": "IPO 초기 프리마켓/본장 데이터 대기",
+        "intraday_1m_score": 0.0,
+        "intraday_1m_trend": "대기",
+        "intraday_1m_summary": "IPO 초기 1분봉 데이터 대기",
+        "ai_label": "AI 관찰",
+        "ai_score": 55 if price > 0 else 20,
+        "ai_reason": "SpaceX 상장 감지 · 가격/거래량 안정화 확인 필요",
+        "sector": SPACEX_PUBLIC_SECTOR_MAP.get("SpaceX", "미장/로켓/우주"),
+        "label": "👀 관찰" if price > 0 else "보류",
+        "action": "관찰",
+        "action_reason": "IPO 초기 변동성이 커서 첫 가격 안정화와 유통물량 확인 우선",
+        "score": 35 if price > 0 else 0,
+        "raw_score": 45 if price > 0 else 0,
+        "technical_score": 0,
+        "volume_score": 0,
+        "flow_score": 0,
+        "news_score": 20,
+        "market_score": 10,
+        "risk": 25,
+        "overheated": False,
+        "chase_risk": True,
+        "market_regime": "IPO 초기",
+        "market_risk": 25,
+        "price": round(price, 2),
+        "daily_close": round(price, 2),
+        "price_source": "spacex_listing_watch" if price > 0 else "",
+        "change_source": "spacex_listing_watch",
+        "price_drift_pct": 0.0,
+        "change_pct": 0.0,
+        "gap_pct": 0.0,
+        "volume_ratio": 0.0,
+        "trade_value_ratio": 0.0,
+        "liquidity_confirmed": False,
+        "trade_value": 0,
+        "rsi": 50.0,
+        "macd_bullish": False,
+        "atr_pct": 0.0,
+        "patterns": "IPO 초기 데이터 대기",
+        "reasons": news_line,
+        "risks": ai_risk,
+        "flow": ipo_analysis.get("institution_flow_status", "상장 초기 수급 추적 대기"),
+        "flow_status": "ipo_watch",
+        "foreign_net": 0.0,
+        "institution_net": 0.0,
+        "news": ipo_analysis.get("news_sentiment_status", "상장 뉴스 감성 분석 대상"),
+        "news_source": "spacex_listing_watch",
+        "news_one_line": news_line,
+        "news_strength": "medium",
+        "headlines": " | ".join(item.get("title", "") for item in (SPACEX_WATCH_STATE.get("news_candidates") or [])[:3] if item.get("title")) or "-",
+        "data_sources": "spacex_listing_watch, ipo_watch",
     }
 
 STRATEGIC_SECTOR_FILL_STOCKS = {
@@ -1940,6 +2044,9 @@ DEFAULT_STOCKS.update(US_SPACE_AEROSPACE_STOCKS)
 SECTOR_MAP.update(US_SPACE_AEROSPACE_SECTOR_MAP)
 DEFAULT_STOCKS.update(SPACEX_PUBLIC_STOCKS)
 SECTOR_MAP.update(SPACEX_PUBLIC_SECTOR_MAP)
+if "SpaceX" not in DEFAULT_STOCKS:
+    DEFAULT_STOCKS["SpaceX"] = SPACEX_PUBLIC_TICKER or "SPACEX.PRIVATE"
+    SECTOR_MAP["SpaceX"] = "미장/로켓/우주/비상장감시"
 DEFAULT_STOCKS.update(STRATEGIC_SECTOR_FILL_STOCKS)
 SECTOR_MAP.update(STRATEGIC_SECTOR_FILL_MAP)
 DEFAULT_STOCKS.update(TIGER_ETF_STOCKS)
@@ -4378,8 +4485,16 @@ def build_ai_recommendation(
 
 
 def analyze_stock(name, ticker, market_context):
-    df = download_price_data(ticker)
     dividend = fetch_dividend_context(ticker)
+    if name == "SpaceX" and not SPACEX_PUBLIC_TICKER:
+        return build_spacex_listing_fallback_row(ticker, dividend)
+    try:
+        df = download_price_data(ticker)
+    except Exception as exc:
+        if name == "SpaceX":
+            return build_spacex_listing_fallback_row(ticker, dividend)
+        print(f"{ticker} 가격 데이터 다운로드 실패: {sanitize_error(exc)}", flush=True)
+        df = None
     if df is None or df.empty or len(df) < 60:
         if is_tiger_etf(name, ticker):
             latest_price, latest_change = latest_naver_quote_price(ticker)
@@ -4484,6 +4599,8 @@ def analyze_stock(name, ticker, market_context):
                 "headlines": " | ".join(news["headlines"]) if news.get("headlines") else "-",
                 "data_sources": ", ".join(data_sources),
             }
+        if name == "SpaceX":
+            return build_spacex_listing_fallback_row(ticker, dividend)
         return {
             "name": name,
             "ticker": ticker,

@@ -33,6 +33,7 @@ API_TOKEN = os.getenv("MARKET_API_TOKEN", "")
 ALLOW_UNAUTH_HEALTH = os.getenv("MARKET_ALLOW_UNAUTH_HEALTH", "true").lower() == "true"
 RATE_LIMIT_PER_MINUTE = int(os.getenv("MARKET_RATE_LIMIT_PER_MINUTE", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("MARKET_RESULTS_CACHE_TTL", "20"))
+SCANNER_RUN_COOLDOWN_SECONDS = int(os.getenv("MARKET_SCANNER_RUN_COOLDOWN_SECONDS", "3600"))
 ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "true").lower() == "true"
 MAX_UPLOAD_BYTES = int(os.getenv("MARKET_RESULTS_UPLOAD_MAX_BYTES", "6000000"))
 MIN_UPLOAD_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_ROWS", "500"))
@@ -282,6 +283,60 @@ def _write_scanner_status(**payload: object) -> None:
     SCANNER_STATUS_FILE.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _scanner_completed_age_seconds(status: Optional[Dict[str, object]] = None) -> Optional[float]:
+    status = status or _read_scanner_status()
+    completed_at = status.get("completed_at") or status.get("finished_at")
+    if isinstance(completed_at, (int, float)):
+        return max(0.0, time.time() - float(completed_at))
+    if isinstance(completed_at, str) and completed_at:
+        try:
+            normalized = completed_at.replace("Z", "+00:00")
+            parsed = datetime.fromisoformat(normalized)
+            if parsed.tzinfo is None:
+                return max(0.0, time.time() - parsed.timestamp())
+            return max(0.0, time.time() - parsed.timestamp())
+        except ValueError:
+            pass
+    if status.get("state") == "completed":
+        updated_at = status.get("updated_at")
+        if isinstance(updated_at, str) and updated_at:
+            try:
+                parsed = datetime.fromisoformat(updated_at.replace("Z", "+00:00"))
+                return max(0.0, time.time() - parsed.timestamp())
+            except ValueError:
+                pass
+    return None
+
+
+def _scanner_cooldown_payload(status: Dict[str, object]) -> Optional[Dict[str, object]]:
+    age = _scanner_completed_age_seconds(status)
+    if age is None or age >= SCANNER_RUN_COOLDOWN_SECONDS:
+        return None
+    remaining = int(SCANNER_RUN_COOLDOWN_SECONDS - age)
+    minutes_ago = max(1, int(age // 60) + 1)
+    remaining_minutes = max(1, int(remaining // 60) + 1)
+    snapshot = _current_result_snapshot()
+    status = {
+        **status,
+        "running": False,
+        "state": "cooldown",
+        "message": f"최근 {minutes_ago}분 내 스캔 완료 · 새 실행 생략 · {remaining_minutes}분 후 가능",
+        "progress": 100,
+        "cooldown_remaining_seconds": remaining,
+        **snapshot,
+    }
+    return {
+        "ok": True,
+        "started": False,
+        "running": False,
+        "skipped": True,
+        "reason": "cooldown",
+        "message": status["message"],
+        "status": status,
+        "updated_at": _now_iso(),
+    }
+
+
 def _run_scanner_background() -> None:
     global _scanner_running, _scanner_last_seen_mtime
     try:
@@ -443,6 +498,8 @@ def _run_scanner_background() -> None:
             mode="full",
             output=(stdout + "\n" + stderr)[-4000:],
             progress=100,
+            completed_at=time.time(),
+            completed_at_iso=_now_iso(),
         )
         _cleanup_runtime_storage()
     except subprocess.TimeoutExpired:
@@ -618,6 +675,11 @@ async def scanner_run(request: Request) -> Dict[str, object]:
                 "status": _read_scanner_status(),
                 "updated_at": _now_iso(),
             }
+        current_status = _read_scanner_status()
+        cooldown_payload = _scanner_cooldown_payload(current_status)
+        if cooldown_payload:
+            _invalidate_results_cache()
+            return cooldown_payload
         _scanner_running = True
         _clear_runtime_api_caches()
         _write_scanner_status(
