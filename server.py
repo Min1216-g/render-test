@@ -252,6 +252,33 @@ def _read_scanner_status() -> Dict[str, object]:
         if status.get("running"):
             started_at = float(status.get("started_at") or time.time())
             elapsed = max(0.0, time.time() - started_at)
+            scanner_thread_active = _scanner_running
+            snapshot = _current_result_snapshot()
+            if not scanner_thread_active:
+                recovered = {
+                    **status,
+                    "running": False,
+                    "state": "recovered",
+                    "message": "스캐너 상태 복구 · 최신 데이터 표시",
+                    "progress": 100,
+                    "recovered_at": _now_iso(),
+                    **snapshot,
+                }
+                _write_scanner_status(**recovered)
+                return recovered
+            timeout_seconds = int(os.getenv("MARKET_SCANNER_REFRESH_TIMEOUT", "3600"))
+            if elapsed > timeout_seconds + 120:
+                recovered = {
+                    **status,
+                    "running": False,
+                    "state": "timeout_recovered",
+                    "message": "스캐너 시간 초과 복구 · 최신 저장 데이터 표시",
+                    "progress": 100,
+                    "recovered_at": _now_iso(),
+                    **snapshot,
+                }
+                _write_scanner_status(**recovered)
+                return recovered
             current_progress = int(status.get("progress") or 0)
             if status.get("state") == "queued":
                 estimated_progress = min(12, max(current_progress, int(elapsed / 8)))
