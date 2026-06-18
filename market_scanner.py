@@ -2,6 +2,7 @@
 
 import html
 import ast
+import json
 import os
 import re
 import shutil
@@ -42,6 +43,7 @@ except Exception:
 BASE_DIR = Path(__file__).resolve().parent
 ENV_FILE = BASE_DIR / ".env.market_scanner"
 RESULT_FILE = BASE_DIR / "market_scanner_results.csv"
+FEAR_GREED_CACHE_FILE = BASE_DIR / "fear_greed_cache.json"
 SEOUL_TZ = "Asia/Seoul"
 TELEGRAM_MAX_LENGTH = 3900
 MARKET_INDEXES = {
@@ -56,6 +58,10 @@ ETF_NOW_CACHE = None
 ETF_HOLDINGS_CACHE_LOCK = threading.Lock()
 ETF_HOLDINGS_CACHE = {}
 ETF_HOLDINGS_SKIP_TICKERS = {"VFV.TO"}
+WEEKLY_RSI_CACHE_LOCK = threading.Lock()
+WEEKLY_RSI_CACHE = {}
+FEAR_GREED_CACHE_LOCK = threading.Lock()
+FEAR_GREED_CACHE = None
 FULL_SERVICE_ETF_NAMES = {"TIGER 미국우주테크"}
 FULL_SERVICE_ETF_PROXY_HOLDINGS = {
     "TIGER 미국우주테크": [
@@ -2700,6 +2706,24 @@ def load_env_file(path):
             os.environ[key] = value
 
 
+def load_json_file(path, default=None):
+    default = {} if default is None else default
+    if not path.exists():
+        return default
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return default
+
+
+def save_json_file(path, data):
+    try:
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        secure_file_permissions(path)
+    except Exception:
+        pass
+
+
 secure_file_permissions(ENV_FILE)
 load_env_file(ENV_FILE)
 
@@ -2716,6 +2740,11 @@ NEWS_REQUIRE_DATED_SIGNAL = os.getenv("MARKET_SCANNER_NEWS_REQUIRE_DATED_SIGNAL"
 NEWS_ALLOW_STALE_FALLBACK = False
 NEWS_ALLOW_UNDATED_NAVER = False
 ENABLE_FLOW = os.getenv("MARKET_SCANNER_ENABLE_FLOW", "true").lower() == "true"
+ENABLE_CONTRARIAN = os.getenv("MARKET_SCANNER_ENABLE_CONTRARIAN", "true").lower() == "true"
+FEAR_GREED_URL = os.getenv(
+    "MARKET_SCANNER_FEAR_GREED_URL",
+    "https://production.dataviz.cnn.io/index/fearandgreed/graphdata",
+).strip()
 TELEGRAM_TOKEN = os.getenv("MARKET_SCANNER_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("MARKET_SCANNER_CHAT_ID", "").strip()
 MARKET_RISK_DOWNGRADE_THRESHOLD = int(os.getenv("MARKET_SCANNER_RISK_DOWNGRADE_THRESHOLD", "15"))
@@ -2883,6 +2912,240 @@ def rsi(series, period=14):
     loss = (-delta.clip(upper=0)).rolling(period).mean()
     rs = gain / loss
     return 100 - (100 / (1 + rs))
+
+
+def contrarian_rsi_points(rsi_value):
+    if rsi_value <= 20:
+        return 35, "주봉 RSI 20 이하 적극 매수 구간"
+    if rsi_value <= 25:
+        return 25, "주봉 RSI 25 이하 매우 강한 저평가"
+    if rsi_value <= 30:
+        return 15, "주봉 RSI 30 이하 강한 저평가"
+    return 0, ""
+
+
+def weekly_rsi_context(ticker):
+    if not ENABLE_CONTRARIAN:
+        return {"weekly_rsi": 0.0, "score": 0, "summary": "역발상 RSI 비활성", "status": "disabled"}
+    key = str(ticker or "").strip().upper()
+    if not key:
+        return {"weekly_rsi": 0.0, "score": 0, "summary": "주봉 RSI 확인 불가", "status": "no_ticker"}
+    with WEEKLY_RSI_CACHE_LOCK:
+        if key in WEEKLY_RSI_CACHE:
+            return WEEKLY_RSI_CACHE[key]
+    try:
+        with YFINANCE_DOWNLOAD_LOCK:
+            df = yf.download(key, period="2y", interval="1wk", progress=False, threads=False)
+        df = normalize_ohlcv_dataframe(df)
+        if df.empty or len(df) < 20:
+            context = {"weekly_rsi": 0.0, "score": 0, "summary": "주봉 RSI 데이터 부족", "status": "no_data"}
+        else:
+            weekly_rsi = float(rsi(df["Close"]).iloc[-1])
+            score, summary = contrarian_rsi_points(weekly_rsi)
+            context = {
+                "weekly_rsi": round(weekly_rsi, 1),
+                "score": score,
+                "summary": summary or f"주봉 RSI {weekly_rsi:.1f} · 역발상 신호 대기",
+                "status": "ok",
+            }
+    except Exception as exc:
+        context = {
+            "weekly_rsi": 0.0,
+            "score": 0,
+            "summary": f"주봉 RSI 수집 실패: {sanitize_error(exc)}",
+            "status": "unavailable",
+        }
+    with WEEKLY_RSI_CACHE_LOCK:
+        WEEKLY_RSI_CACHE[key] = context
+    return context
+
+
+def classify_fear_greed(value):
+    try:
+        value = float(value)
+    except Exception:
+        return "Neutral", 0, "CNN 공포탐욕 확인 대기"
+    if value <= 24:
+        return "Extreme Fear", 20, "CNN Extreme Fear · 공포 구간 역발상 기회"
+    if value <= 44:
+        return "Fear", 10, "CNN Fear · 우량주 역발상 가산"
+    if value <= 55:
+        return "Neutral", 0, "CNN Neutral"
+    if value <= 74:
+        return "Greed", -5, "CNN Greed · 추격 주의"
+    return "Extreme Greed", -15, "CNN Extreme Greed · 과열 경계"
+
+
+def extract_fear_greed_value(payload):
+    if isinstance(payload, dict):
+        candidates = [
+            payload.get("score"),
+            payload.get("value"),
+            payload.get("fear_and_greed", {}).get("score") if isinstance(payload.get("fear_and_greed"), dict) else None,
+            payload.get("fear_and_greed", {}).get("value") if isinstance(payload.get("fear_and_greed"), dict) else None,
+        ]
+        for candidate in candidates:
+            try:
+                if candidate is not None:
+                    return float(candidate)
+            except Exception:
+                pass
+        for value in payload.values():
+            found = extract_fear_greed_value(value)
+            if found is not None:
+                return found
+    elif isinstance(payload, list):
+        for value in payload[:10]:
+            found = extract_fear_greed_value(value)
+            if found is not None:
+                return found
+    return None
+
+
+def vix_fear_greed_proxy_value():
+    try:
+        with YFINANCE_DOWNLOAD_LOCK:
+            df = yf.download("^VIX", period="5d", interval="1d", progress=False, threads=False)
+        df = normalize_ohlcv_dataframe(df)
+        if df.empty:
+            return None
+        vix_value = float(df["Close"].iloc[-1])
+        if vix_value >= 35:
+            return 15.0
+        if vix_value >= 30:
+            return 22.0
+        if vix_value >= 25:
+            return 35.0
+        if vix_value >= 20:
+            return 45.0
+        if vix_value >= 15:
+            return 60.0
+        return 75.0
+    except Exception:
+        return None
+
+
+def fetch_fear_greed_context():
+    global FEAR_GREED_CACHE
+    if not ENABLE_CONTRARIAN:
+        return {"value": 50.0, "rating": "Neutral", "score": 0, "summary": "공포탐욕 비활성", "status": "disabled"}
+    with FEAR_GREED_CACHE_LOCK:
+        if FEAR_GREED_CACHE is not None:
+            return FEAR_GREED_CACHE
+
+    env_value = os.getenv("MARKET_SCANNER_FEAR_GREED_VALUE", "").strip()
+    value = None
+    source = "env"
+    if env_value:
+        try:
+            value = float(env_value)
+        except Exception:
+            value = None
+
+    cache = load_json_file(FEAR_GREED_CACHE_FILE, {})
+    if value is None and isinstance(cache, dict):
+        cached_date = str(cache.get("date", ""))
+        if cached_date == datetime.now().strftime("%Y-%m-%d"):
+            value = cache.get("value")
+            source = "cache"
+
+    if value is None and FEAR_GREED_URL:
+        try:
+            response = requests.get(FEAR_GREED_URL, headers={"User-Agent": "Mozilla/5.0"}, timeout=5)
+            response.raise_for_status()
+            value = extract_fear_greed_value(response.json())
+            source = "cnn"
+        except Exception:
+            value = None
+
+    if value is None:
+        value = vix_fear_greed_proxy_value()
+        if value is not None:
+            source = "vix_proxy"
+
+    if value is None:
+        value = 50.0
+        source = "neutral_fallback"
+
+    rating, score, summary = classify_fear_greed(value)
+    if source == "vix_proxy":
+        summary = summary.replace("CNN", "CNN 대체/VIX 기준")
+    context = {
+        "value": round(float(value), 1),
+        "rating": rating,
+        "score": score,
+        "summary": summary,
+        "status": source,
+    }
+    if source in {"cnn", "env", "vix_proxy"}:
+        save_json_file(FEAR_GREED_CACHE_FILE, {"date": datetime.now().strftime("%Y-%m-%d"), **context})
+    with FEAR_GREED_CACHE_LOCK:
+        FEAR_GREED_CACHE = context
+    return context
+
+
+def qqq_fear_context():
+    context = weekly_rsi_context("QQQ")
+    value = float(context.get("weekly_rsi") or 0)
+    if value <= 0:
+        return {**context, "market_score": 0, "market_summary": "QQQ 주봉 RSI 확인 대기"}
+    if value <= 25:
+        return {**context, "market_score": 20, "market_summary": f"QQQ 주봉 RSI {value:.1f} · 시장 극단 공포"}
+    if value <= 30:
+        return {**context, "market_score": 10, "market_summary": f"QQQ 주봉 RSI {value:.1f} · 시장 공포"}
+    return {**context, "market_score": 0, "market_summary": f"QQQ 주봉 RSI {value:.1f} · 시장 공포 신호 대기"}
+
+
+def build_contrarian_context(ticker, market_label, flow=None):
+    if not ENABLE_CONTRARIAN:
+        return {
+            "score": 0,
+            "weekly_rsi": 0.0,
+            "fear_greed_value": 50.0,
+            "fear_greed_rating": "Neutral",
+            "signal": "역발상 비활성",
+            "components": "",
+        }
+    flow = flow or {}
+    score = 0
+    parts = []
+    weekly_value = 0.0
+
+    is_us_or_etf = market_label in {"미장", "캐나다"} or str(ticker or "").upper() in {"QQQ", "SPY", "IWM"} or "ETF" in str(flow.get("summary", "")).upper()
+    if is_us_or_etf:
+        weekly = weekly_rsi_context(ticker)
+        weekly_value = float(weekly.get("weekly_rsi") or 0)
+        if weekly.get("score", 0):
+            score += int(weekly["score"])
+            parts.append(weekly["summary"])
+
+    qqq = qqq_fear_context()
+    if qqq.get("market_score", 0):
+        score += int(qqq["market_score"])
+        parts.append(qqq["market_summary"])
+
+    fear = fetch_fear_greed_context()
+    if fear.get("score", 0):
+        score += int(fear["score"])
+        parts.append(fear["summary"])
+
+    reversal_score = int(flow.get("reversal_score") or 0)
+    if reversal_score:
+        score += reversal_score
+        parts.append(flow.get("reversal_summary", "수급 반전 시작"))
+
+    if weekly_value and weekly_value <= 30 and fear.get("rating") == "Extreme Fear" and reversal_score:
+        score += 20
+        parts.append("최상위 역발상: 공포 구간에서 스마트머니 재진입")
+
+    return {
+        "score": int(score),
+        "weekly_rsi": round(weekly_value, 1),
+        "fear_greed_value": fear["value"],
+        "fear_greed_rating": fear["rating"],
+        "signal": " · ".join(dict.fromkeys(parts)) if parts else "역발상 신호 대기",
+        "components": f"QQQ {qqq.get('weekly_rsi', 0)} / CNN {fear['value']} {fear['rating']}",
+    }
 
 
 def macd(series):
@@ -3319,6 +3582,8 @@ def empty_flow_context(summary="수급 생략"):
         "summary": summary,
         "foreign_net": 0.0,
         "institution_net": 0.0,
+        "reversal_score": 0,
+        "reversal_summary": "",
         "status": "skipped",
     }
 
@@ -3961,10 +4226,31 @@ def fetch_flow_context(ticker, lookback=5):
     sample = target.head(lookback).copy()
     foreign_net = sample[foreign_col].map(extract_number).fillna(0).sum()
     institution_net = sample[institution_col].map(extract_number).fillna(0).sum()
+    extended_sample = target.head(20).copy()
+    foreign_series = extended_sample[foreign_col].map(extract_number).fillna(0).tolist()
+    institution_series = extended_sample[institution_col].map(extract_number).fillna(0).tolist()
+
+    def reversal_signal(values, label):
+        if len(values) < 8:
+            return 0, ""
+        recent = values[:3]
+        previous = values[3:20]
+        recent_buy = len(recent) >= 3 and all(value > 0 for value in recent)
+        sell_streak = 0
+        for value in previous:
+            if value < 0:
+                sell_streak += 1
+            else:
+                break
+        if recent_buy and sell_streak >= 5:
+            return 10, f"{label} {sell_streak}일 순매도 후 3일 순매수 전환"
+        return 0, ""
 
     score = 0
     risk = 0
     reasons = []
+    reversal_score = 0
+    reversal_reasons = []
     if foreign_net > 0:
         score += 15
         reasons.append("외국인 순매수")
@@ -3981,12 +4267,29 @@ def fetch_flow_context(ticker, lookback=5):
         score += 8
         reasons.append("외국인+기관 동반 매수")
 
+    foreign_reversal_score, foreign_reversal = reversal_signal(foreign_series, "외국인")
+    institution_reversal_score, institution_reversal = reversal_signal(institution_series, "기관")
+    if foreign_reversal_score:
+        reversal_score += foreign_reversal_score
+        reversal_reasons.append(foreign_reversal)
+    if institution_reversal_score:
+        reversal_score += institution_reversal_score
+        reversal_reasons.append(institution_reversal)
+    if foreign_reversal_score and institution_reversal_score:
+        reversal_score = 25
+        reversal_reasons.append("외국인+기관 동시 수급 반전 시작")
+    if reversal_score:
+        score += reversal_score
+        reasons.append("수급 반전 시작")
+
     return {
         "score": score,
         "risk": risk,
         "summary": ", ".join(reasons) if reasons else "수급 중립",
         "foreign_net": float(foreign_net),
         "institution_net": float(institution_net),
+        "reversal_score": int(reversal_score),
+        "reversal_summary": ", ".join(dict.fromkeys(reversal_reasons)) if reversal_reasons else "",
         "status": "ok",
     }
 
@@ -4526,6 +4829,7 @@ def analyze_stock(name, ticker, market_context):
             lightweight_etf = is_lightweight_etf(name, ticker, SECTOR_MAP.get(name, "국장/TIGER ETF"))
             intraday = empty_intraday_context(lightweight_etf_summary(name)) if lightweight_etf else build_intraday_1m_context(ticker, change_pct)
             news = fetch_news_context(name, SECTOR_MAP.get(name, "국장/TIGER ETF")) if is_full_service_etf(name, ticker) else empty_news_context(lightweight_etf_summary(name))
+            contrarian = build_contrarian_context(ticker, market_label_for_ticker(ticker), empty_flow_context("ETF 수급 별도 확인"))
             data_sources = ["naver_realtime", "naver_etf_nav"]
             if is_full_service_etf(name, ticker):
                 data_sources.extend([f"news:{news.get('source', 'unknown')}", "etf_now", "etf_holdings"])
@@ -4576,6 +4880,11 @@ def analyze_stock(name, ticker, market_context):
                 "flow_score": 0,
                 "news_score": news["score"],
                 "market_score": market_context["score_adjust"],
+                "contrarian_score": contrarian["score"],
+                "contrarian_signal": contrarian["signal"],
+                "weekly_rsi": contrarian["weekly_rsi"],
+                "fear_greed_value": contrarian["fear_greed_value"],
+                "fear_greed_rating": contrarian["fear_greed_rating"],
                 "risk": (6 + int(news["risk"])) if price > 0 else 0,
                 "overheated": False,
                 "chase_risk": False,
@@ -4599,6 +4908,7 @@ def analyze_stock(name, ticker, market_context):
                 "reasons": " · ".join(
                     item
                     for item in [
+                        contrarian["signal"] if contrarian["score"] else "",
                         etf["etf_summary"],
                         etf_now["etf_now_summary"],
                         etf_holdings["etf_holdings_summary"],
@@ -4659,6 +4969,7 @@ def analyze_stock(name, ticker, market_context):
     price, price_source, price_drift_pct = apply_latest_price(ticker, price, prev_close, open_price)
     change_pct, change_source = latest_change_pct(ticker, price, prev_close, price_source)
     sector = SECTOR_MAP.get(name, "기타")
+    market_label = market_label_for_ticker(ticker)
     lightweight_etf = is_lightweight_etf(name, ticker, sector)
     etf = fetch_etf_nav_context(name, ticker, price)
     etf_now = fetch_etf_now_context(name, ticker)
@@ -4686,6 +4997,7 @@ def analyze_stock(name, ticker, market_context):
 
     flow = empty_flow_context(lightweight_etf_summary(name)) if lightweight_etf else fetch_flow_context(ticker)
     news = empty_news_context(lightweight_etf_summary(name)) if lightweight_etf else fetch_news_context(name, sector)
+    contrarian = build_contrarian_context(ticker, market_label, flow)
 
     technical_score = 0
     volume_score = 0
@@ -4774,6 +5086,12 @@ def analyze_stock(name, ticker, market_context):
     market_mode = market_context["mode"]
     market_score += market_context["score_adjust"]
     risk += market_context["risk"]
+    if contrarian["score"]:
+        market_score += contrarian["score"]
+        if contrarian["score"] > 0:
+            reasons.append(f"역발상 매수: {contrarian['signal']}")
+        else:
+            risks.append(f"역발상 경고: {contrarian['signal']}")
 
     if market_mode == "bull" and volume_burst and trend_up:
         market_score += 12
@@ -4847,7 +5165,6 @@ def analyze_stock(name, ticker, market_context):
         label = "👀 관찰"
         risks.append("시장 Risk-Off로 매수 등급 제한")
 
-    market_label = market_label_for_ticker(ticker)
     ai_label, ai_score, ai_reason = build_ai_recommendation(
         final_score,
         risk,
@@ -4919,6 +5236,11 @@ def analyze_stock(name, ticker, market_context):
         "flow_score": int(flow_score),
         "news_score": int(news_score),
         "market_score": int(market_score),
+        "contrarian_score": contrarian["score"],
+        "contrarian_signal": contrarian["signal"],
+        "weekly_rsi": contrarian["weekly_rsi"],
+        "fear_greed_value": contrarian["fear_greed_value"],
+        "fear_greed_rating": contrarian["fear_greed_rating"],
         "risk": int(risk),
         "overheated": overheated,
         "chase_risk": chase_risk,
@@ -4958,6 +5280,7 @@ def analyze_stock(name, ticker, market_context):
                     price_source,
                     f"news:{news.get('source', 'unknown')}",
                     f"flow:{flow.get('status', 'unknown')}",
+                    f"contrarian:{contrarian.get('fear_greed_rating', 'unknown')}",
                     "intraday_1m" if should_fetch_intraday_1m(ticker) and not lightweight_etf else "",
                     "etf_now" if is_full_service_etf(name, ticker) else "",
                     "etf_holdings" if is_full_service_etf(name, ticker) else "",

@@ -342,6 +342,7 @@ def today_score(row: pd.Series, sector_context: dict[str, dict[str, object]]) ->
     volume = number(row.get("volume_ratio"), 1)
     change = number(row.get("change_pct"))
     risk = number(row.get("risk"))
+    contrarian = number(row.get("contrarian_score"))
     news_text = f"{text(row, 'news')} {text(row, 'news_one_line')} {text(row, 'headlines')}"
     sector = sector_context.get(f"{market_text(row)}|{sector_key(text(row, 'sector'))}", {})
     sector_strength = float(sector.get("strength", 0))
@@ -362,8 +363,38 @@ def today_score(row: pd.Series, sector_context: dict[str, dict[str, object]]) ->
         score += 8
     if change >= 6:
         score -= 18
+    if contrarian > 0:
+        score += min(30, contrarian * 0.55)
+    elif contrarian < 0:
+        score += max(-15, contrarian * 0.7)
     score -= min(risk, 55) * 0.22
     return int(max(0, min(99, round(score))))
+
+
+def contrarian_signal_text(row: pd.Series) -> str:
+    score = number(row.get("contrarian_score"))
+    signal = text(row, "contrarian_signal")
+    weekly = number(row.get("weekly_rsi"))
+    fear_value = number(row.get("fear_greed_value"))
+    fear_rating = text(row, "fear_greed_rating")
+    if score >= 60:
+        prefix = "최상위 역발상 매수 신호"
+    elif score >= 35:
+        prefix = "강한 역발상 매수 신호"
+    elif score >= 15:
+        prefix = "역발상 관심 신호"
+    elif score < 0:
+        prefix = "탐욕 과열 경고"
+    else:
+        prefix = "역발상 신호 대기"
+    detail = []
+    if weekly > 0:
+        detail.append(f"주봉 RSI {weekly:.1f}")
+    if fear_value > 0:
+        detail.append(f"CNN {fear_value:.0f} {fear_rating}".strip())
+    if signal and signal != "역발상 신호 대기":
+        detail.append(signal[:90])
+    return f"{prefix} · 점수 {score:.0f}" + (f" · {' · '.join(detail)}" if detail else "")
 
 
 def lead_signal(row: pd.Series, score: int, quiet_text: str) -> str:
@@ -723,7 +754,16 @@ def enrich() -> int:
 
         row["mobile_intel_generated_at"] = generated_at
         row["mobile_today_score"] = score
-        row["mobile_ai_explain"] = explain_signal(row, score, sector_signal, news_text)
+        contrarian_text = contrarian_signal_text(row)
+        row["mobile_contrarian_signal"] = contrarian_text
+        row["mobile_ai_explain"] = " · ".join(
+            part
+            for part in [
+                explain_signal(row, score, sector_signal, news_text),
+                contrarian_text if number(row.get("contrarian_score")) else "",
+            ]
+            if part
+        )
         row["mobile_lead_signal"] = lead_signal(row, score, quiet_text)
         row["mobile_missed_signal"] = "놓칠 가능성 높음" if number(row.get("volume_ratio"), 1) >= 1.8 and number(row.get("change_pct")) < 3 else "놓침 위험 낮음"
         row["mobile_risk_signal"] = risk_signal(row, market_risk)
