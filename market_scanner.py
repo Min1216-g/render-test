@@ -2649,9 +2649,23 @@ def is_fresh_signal_news_title(title, max_age_days=None):
     max_age_days = NEWS_SIGNAL_MAX_AGE_DAYS if max_age_days is None else max_age_days
     published_at = extract_news_date_from_title(title)
     if published_at is None:
-        return not NEWS_REQUIRE_DATED_SIGNAL
+        return False
     cutoff = pd.Timestamp.now(tz=SEOUL_TZ).to_pydatetime() - timedelta(days=max_age_days)
     return published_at >= cutoff
+
+
+def filter_news_titles_by_age(titles, primary_days=None, fallback_days=None):
+    primary_days = NEWS_PRIMARY_AGE_DAYS if primary_days is None else primary_days
+    fallback_days = NEWS_MAX_AGE_DAYS if fallback_days is None else fallback_days
+    dated_titles = []
+    for title in titles:
+        published_at = extract_news_date_from_title(title)
+        if published_at is None:
+            continue
+        if is_recent_news_datetime(published_at, fallback_days):
+            dated_titles.append(title)
+    primary_titles = [title for title in dated_titles if is_fresh_signal_news_title(title, primary_days)]
+    return primary_titles or dated_titles
 
 
 def format_news_title_with_date(title, published_at=None):
@@ -2695,11 +2709,12 @@ TOP_N = int(os.getenv("MARKET_SCANNER_TOP_N", "10"))
 MAX_STOCKS = int(os.getenv("MARKET_SCANNER_MAX_STOCKS", "0"))
 MIN_TRADE_VALUE = float(os.getenv("MARKET_SCANNER_MIN_TRADE_VALUE", "1000000000"))
 ENABLE_NEWS = os.getenv("MARKET_SCANNER_ENABLE_NEWS", "true").lower() == "true"
-NEWS_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_MAX_AGE_DAYS", "14"))
-NEWS_SIGNAL_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_SIGNAL_MAX_AGE_DAYS", "14"))
+NEWS_PRIMARY_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_PRIMARY_AGE_DAYS", "7"))
+NEWS_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_MAX_AGE_DAYS", "30"))
+NEWS_SIGNAL_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_SIGNAL_MAX_AGE_DAYS", str(NEWS_MAX_AGE_DAYS)))
 NEWS_REQUIRE_DATED_SIGNAL = os.getenv("MARKET_SCANNER_NEWS_REQUIRE_DATED_SIGNAL", "true").lower() == "true"
-NEWS_ALLOW_STALE_FALLBACK = os.getenv("MARKET_SCANNER_NEWS_ALLOW_STALE_FALLBACK", "false").lower() == "true"
-NEWS_ALLOW_UNDATED_NAVER = os.getenv("MARKET_SCANNER_NEWS_ALLOW_UNDATED_NAVER", "false").lower() == "true"
+NEWS_ALLOW_STALE_FALLBACK = False
+NEWS_ALLOW_UNDATED_NAVER = False
 ENABLE_FLOW = os.getenv("MARKET_SCANNER_ENABLE_FLOW", "true").lower() == "true"
 TELEGRAM_TOKEN = os.getenv("MARKET_SCANNER_BOT_TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("MARKET_SCANNER_CHAT_ID", "").strip()
@@ -4052,11 +4067,16 @@ def score_news_headlines(headlines):
 def fetch_google_news_headlines_for_query(query, limit=5):
     items = []
     searches = [
+        (f"{query} when:{NEWS_PRIMARY_AGE_DAYS}d", "ko", "KR", "KR:ko"),
         (f"{query} when:{NEWS_MAX_AGE_DAYS}d", "ko", "KR", "KR:ko"),
-        (query, "ko", "KR", "KR:ko"),
     ]
     if re.search(r"[A-Za-z]", query):
-        searches.append((query, "en-US", "US", "US:en"))
+        searches.extend(
+            [
+                (f"{query} when:{NEWS_PRIMARY_AGE_DAYS}d", "en-US", "US", "US:en"),
+                (f"{query} when:{NEWS_MAX_AGE_DAYS}d", "en-US", "US", "US:en"),
+            ]
+        )
 
     for search_query, hl, gl, ceid in searches:
         url = f"https://news.google.com/rss/search?q={quote(search_query)}&hl={hl}&gl={gl}&ceid={ceid}"
@@ -4068,12 +4088,10 @@ def fetch_google_news_headlines_for_query(query, limit=5):
             published_at = parse_google_news_pub_date(item.findtext("pubDate", default="").strip())
             if not title:
                 continue
-            if published_at and is_recent_news_datetime(published_at):
+            if published_at and is_recent_news_datetime(published_at, NEWS_MAX_AGE_DAYS):
                 items.append((published_at, format_news_title_with_date(title, published_at)))
-            elif NEWS_ALLOW_STALE_FALLBACK:
-                items.append((published_at or datetime.min.replace(tzinfo=pd.Timestamp.now(tz="UTC").tzinfo), title))
     items.sort(key=lambda pair: pair[0], reverse=True)
-    headlines = [title for _, title in items]
+    headlines = filter_news_titles_by_age([title for _, title in items])
     headlines = list(dict.fromkeys(headlines))[:limit]
     return headlines
 
@@ -4195,10 +4213,8 @@ def fetch_naver_news_headlines_for_query(query, limit=5):
             continue
         date_area = clean_news_title(chunk[:1800])
         published_at = parse_naver_news_pub_date(date_area)
-        if published_at and is_recent_news_datetime(published_at):
+        if published_at and is_recent_news_datetime(published_at, NEWS_MAX_AGE_DAYS):
             candidates.append((published_at, format_news_title_with_date(title, published_at)))
-        elif NEWS_ALLOW_STALE_FALLBACK or NEWS_ALLOW_UNDATED_NAVER:
-            candidates.append((published_at or datetime.min.replace(tzinfo=pd.Timestamp.now(tz="UTC").tzinfo), title))
 
     if not candidates:
         fallback_titles = re.findall(
@@ -4213,7 +4229,7 @@ def fetch_naver_news_headlines_for_query(query, limit=5):
             ]
 
     candidates.sort(key=lambda pair: pair[0], reverse=True)
-    return [title for _, title in candidates[:limit] if title]
+    return filter_news_titles_by_age([title for _, title in candidates])[:limit]
 
 
 def fetch_naver_news_headlines(name, sector=None):
@@ -4266,8 +4282,12 @@ def fetch_news_context(name, sector=None):
     except Exception as exc:
         errors.append(f"sector_news:{sanitize_error(exc)}")
 
-    company_headlines = [title for title in dict.fromkeys(company_headlines) if not is_noise_news_title(title)][:6]
-    sector_headlines = [title for title in dict.fromkeys(sector_headlines) if not is_noise_news_title(title)][:4]
+    company_headlines = filter_news_titles_by_age(
+        [title for title in dict.fromkeys(company_headlines) if not is_noise_news_title(title)]
+    )[:6]
+    sector_headlines = filter_news_titles_by_age(
+        [title for title in dict.fromkeys(sector_headlines) if not is_noise_news_title(title)]
+    )[:4]
     company_signal_headlines = [title for title in company_headlines if is_fresh_signal_news_title(title)]
     sector_signal_headlines = [title for title in sector_headlines if is_fresh_signal_news_title(title)]
     if company_signal_headlines:

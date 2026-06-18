@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 import math
 import hashlib
-from datetime import datetime
+import re
+from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -31,6 +32,8 @@ TRENDLINE_STATE_FILE = BASE_DIR / "mobile_trendline_state.json"
 NEWS_IMPACT_STATE_FILE = BASE_DIR / "mobile_news_impact_state.json"
 ADAPTIVE_NEWS_STATE_FILE = BASE_DIR / "adaptive_news_impact_state.json"
 VANCOUVER_TZ = ZoneInfo("America/Vancouver")
+NEWS_PRIMARY_AGE_DAYS = 7
+NEWS_MAX_AGE_DAYS = 30
 MIN_TOTAL_ROWS_FOR_APP_SYNC = 500
 MIN_OK_ROWS_FOR_APP_SYNC = 50
 
@@ -74,6 +77,25 @@ def number(value, default: float = 0.0) -> float:
 
 def text(row: pd.Series, key: str) -> str:
     return str(row.get(key, "") or "").strip()
+
+
+def parse_news_datetime(value: str) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except Exception:
+        try:
+            parsed_ts = pd.to_datetime(raw, errors="coerce")
+            if pd.isna(parsed_ts):
+                return None
+            parsed = parsed_ts.to_pydatetime()
+        except Exception:
+            return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=VANCOUVER_TZ)
+    return parsed.astimezone(VANCOUVER_TZ)
 
 
 def market_text(row: pd.Series) -> str:
@@ -228,17 +250,59 @@ def news_lookup(news: pd.DataFrame) -> dict[str, str]:
     if news.empty:
         return {}
     mapping: dict[str, str] = {}
+    now = datetime.now(VANCOUVER_TZ)
+    primary_cutoff = now - timedelta(days=NEWS_PRIMARY_AGE_DAYS)
+    fallback_cutoff = now - timedelta(days=NEWS_MAX_AGE_DAYS)
+    grouped: dict[str, list[tuple[datetime, str]]] = {}
     for _, row in news.iterrows():
         name = text(row, "name")
         if not name:
             continue
+        published_raw = text(row, "published_at")
+        published_at = parse_news_datetime(published_raw)
+        if published_at is None or published_at < fallback_cutoff:
+            continue
         sentiment = text(row, "headline_sentiment") or text(row, "sentiment_summary")
         headline = localize_news_text(text(row, "headline"))
-        published = text(row, "published_at")
+        published = published_at.strftime("%Y-%m-%d")
         summary = " · ".join(part for part in [sentiment, headline, published] if part)
         if summary:
-            mapping[name] = summary[:180]
+            grouped.setdefault(name, []).append((published_at, summary[:180]))
+    for name, items in grouped.items():
+        recent_items = [item for item in items if item[0] >= primary_cutoff]
+        selected = sorted(recent_items or items, key=lambda item: item[0], reverse=True)
+        if selected:
+            mapping[name] = selected[0][1]
     return mapping
+
+
+def strip_stale_news_text(value: str, generated_at: datetime, fallback: str = "최신 호재/악재 없음 · 30일 초과 뉴스 제외") -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return fallback
+    matches = list(re.finditer(r"\((20\d{2}-\d{2}-\d{2})\)", raw))
+    if not matches:
+        return raw
+    cutoff = generated_at - timedelta(days=NEWS_MAX_AGE_DAYS)
+    primary_cutoff = generated_at - timedelta(days=NEWS_PRIMARY_AGE_DAYS)
+    parts = [part.strip() for part in raw.split("|") if part.strip()]
+    valid_parts = []
+    primary_parts = []
+    for part in parts or [raw]:
+        part_dates = [
+            parse_news_datetime(match.group(1))
+            for match in re.finditer(r"\((20\d{2}-\d{2}-\d{2})\)", part)
+        ]
+        part_dates = [date for date in part_dates if date is not None]
+        if not part_dates:
+            continue
+        latest = max(part_dates)
+        if latest >= cutoff:
+            valid_parts.append(part)
+        if latest >= primary_cutoff:
+            primary_parts.append(part)
+    selected = primary_parts or valid_parts
+    return " | ".join(selected) if selected else fallback
 
 
 def quiet_lookup(quiet: pd.DataFrame) -> dict[str, str]:
@@ -447,13 +511,17 @@ def news_impact_key(row: pd.Series, news_text: str) -> str:
     return stable_hash(f"{ticker}|{primary}")
 
 
-def news_price_forecast(row: pd.Series, state: dict | None = None, generated_at: datetime | None = None) -> str:
+def news_price_forecast(row: pd.Series, state: dict | None = None, generated_at: datetime | None = None, news_text_override: str = "") -> str:
     price = number(row.get("price"))
     if price <= 0:
         return "뉴스 영향 예상가: 현재가 확인 대기"
 
     market = market_text(row)
-    news_text = f"{text(row, 'news')} {text(row, 'news_one_line')} {text(row, 'headlines')} {text(row, 'risks')}"
+    news_text = news_text_override or strip_stale_news_text(
+        f"{text(row, 'news')} {text(row, 'news_one_line')} {text(row, 'headlines')}",
+        generated_at or datetime.now(VANCOUVER_TZ),
+    )
+    news_text = f"{news_text} {text(row, 'risks')}"
     if contains_any(news_text, ["최신 호재/악재 없음", "과거 뉴스 판단 제외", "과거 뉴스 · 판단 제외"]):
         return "뉴스 영향 예상: 최신 재료 없음 · 과거 뉴스는 판단 제외"
 
@@ -546,7 +614,7 @@ def adaptive_news_impact(row: pd.Series, news_text: str, state: dict, generated_
         ticker=text(row, "ticker"),
         market=market_text(row),
         sector=text(row, "sector"),
-        news_text=f"{news_text} {text(row, 'news')} {text(row, 'news_one_line')} {text(row, 'headlines')} {text(row, 'risks')}",
+        news_text=f"{news_text} {text(row, 'risks')}",
         price=number(row.get("price")),
         change_pct=number(row.get("change_pct")),
         volume_ratio=number(row.get("volume_ratio"), 1.0),
@@ -639,7 +707,16 @@ def enrich() -> int:
 
         market_risk = market_risks.get(market, "시장 위험도 계산 대기")
         quiet_text = quiet_map.get(text(row, "ticker"), "")
-        news_text = news_map.get(text(row, "name"), text(row, "news_one_line"))
+        row_news_text = " ".join(
+            part
+            for part in [
+                text(row, "news"),
+                text(row, "news_one_line"),
+                text(row, "headlines"),
+            ]
+            if part
+        )
+        news_text = news_map.get(text(row, "name")) or strip_stale_news_text(row_news_text, generated_dt)
         news_impact = adaptive_news_impact(row, news_text, adaptive_news_state, generated_dt.replace(tzinfo=None))
         score = today_score(row, sectors)
         trendline = fixed_trendline_levels(row, trendline_state, generated_dt)
@@ -657,7 +734,7 @@ def enrich() -> int:
         row["mobile_theme_link"] = theme_chain(row)
         row["mobile_position_ai"] = position_signal(row)
         row["mobile_sector_keywords"] = sector_keyword_signal(row)
-        row["mobile_news_price_forecast"] = news_price_forecast(row, news_impact_state, generated_dt)
+        row["mobile_news_price_forecast"] = news_price_forecast(row, news_impact_state, generated_dt, news_text)
         row["mobile_news_impact_label"] = news_impact["label"]
         row["mobile_news_impact_score"] = news_impact["impact_score"]
         row["mobile_news_confidence"] = news_impact["confidence"]

@@ -49,7 +49,8 @@ load_env_file(ENV_FILE)
 
 BOT_TOKEN = os.getenv("NEWS_PULSE_BOT_TOKEN", "").strip()
 CHAT_ID = os.getenv("NEWS_PULSE_CHAT_ID", "").strip()
-NEWS_WINDOW_HOURS = int(os.getenv("NEWS_PULSE_WINDOW_HOURS", str(14 * 24)))
+NEWS_PRIMARY_WINDOW_HOURS = int(os.getenv("NEWS_PULSE_PRIMARY_WINDOW_HOURS", str(7 * 24)))
+NEWS_WINDOW_HOURS = int(os.getenv("NEWS_PULSE_WINDOW_HOURS", str(30 * 24)))
 NEWS_FETCH_LIMIT = int(os.getenv("NEWS_PULSE_FETCH_LIMIT", "8"))
 NEWS_QUERY_LIMIT = int(os.getenv("NEWS_PULSE_QUERY_LIMIT", "25"))
 NEWS_ALERT_TOP_N = int(os.getenv("NEWS_PULSE_ALERT_TOP_N", "7"))
@@ -517,6 +518,13 @@ def is_recent_news(item: dict, current_time: datetime) -> bool:
     return published_at >= current_time - timedelta(hours=NEWS_WINDOW_HOURS)
 
 
+def is_primary_recent_news(item: dict, current_time: datetime) -> bool:
+    published_at = item.get("published_at")
+    if not isinstance(published_at, datetime):
+        return False
+    return published_at >= current_time - timedelta(hours=NEWS_PRIMARY_WINDOW_HOURS)
+
+
 def extract_keyword_hits(text: str) -> list[str]:
     lowered = safe_text(text, "").lower()
     hits = []
@@ -690,6 +698,9 @@ def analyze_news_target(target: dict, current_time: datetime) -> Optional[dict]:
         for item in items
         if is_recent_news(item, current_time) and not is_noise_news_title(item.get("title"))
     ]
+    primary_recent_items = [item for item in recent_items if is_primary_recent_news(item, current_time)]
+    if primary_recent_items:
+        recent_items = primary_recent_items
     if len(recent_items) < NEWS_REQUIRED_MENTIONS:
         return None
 
