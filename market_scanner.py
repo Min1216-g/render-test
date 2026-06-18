@@ -3047,7 +3047,7 @@ def fetch_fear_greed_context():
         cached_date = str(cache.get("date", ""))
         if cached_date == datetime.now().strftime("%Y-%m-%d"):
             value = cache.get("value")
-            source = "cache"
+            source = str(cache.get("status") or "cache")
 
     if value is None and FEAR_GREED_URL:
         try:

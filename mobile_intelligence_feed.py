@@ -391,7 +391,7 @@ def contrarian_signal_text(row: pd.Series) -> str:
     if weekly > 0:
         detail.append(f"주봉 RSI {weekly:.1f}")
     if fear_value > 0:
-        detail.append(f"CNN {fear_value:.0f} {fear_rating}".strip())
+        detail.append(f"공포탐욕 {fear_value:.0f} {fear_rating}".strip())
     if signal and signal != "역발상 신호 대기":
         detail.append(signal[:90])
     return f"{prefix} · 점수 {score:.0f}" + (f" · {' · '.join(detail)}" if detail else "")
