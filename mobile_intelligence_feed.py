@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import hashlib
 import re
 from datetime import datetime, timedelta
@@ -36,6 +37,9 @@ NEWS_PRIMARY_AGE_DAYS = 7
 NEWS_MAX_AGE_DAYS = 30
 MIN_TOTAL_ROWS_FOR_APP_SYNC = 500
 MIN_OK_ROWS_FOR_APP_SYNC = 50
+MAX_NEWS_OBSERVATIONS = max(200, int(os.getenv("MOBILE_INTEL_MAX_NEWS_OBSERVATIONS", "1200")))
+MAX_NEWS_PATTERNS = max(20, int(os.getenv("MOBILE_INTEL_MAX_NEWS_PATTERNS", "80")))
+MAX_KEYWORDS = max(20, int(os.getenv("MOBILE_INTEL_MAX_KEYWORDS", "80")))
 
 
 def read_csv(path: Path) -> pd.DataFrame:
@@ -57,7 +61,39 @@ def load_json(path: Path) -> dict:
 
 
 def save_json(path: Path, data: dict) -> None:
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    path.write_text(json.dumps(data, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
+
+
+def compact_adaptive_news_state(state: dict) -> dict:
+    observations = state.get("observations")
+    if isinstance(observations, dict) and len(observations) > MAX_NEWS_OBSERVATIONS:
+        def created_key(item):
+            value = item[1]
+            if isinstance(value, dict):
+                return str(value.get("created_at") or "")
+            return ""
+
+        state["observations"] = dict(
+            sorted(observations.items(), key=created_key, reverse=True)[:MAX_NEWS_OBSERVATIONS]
+        )
+
+    patterns = state.get("patterns")
+    if isinstance(patterns, dict) and len(patterns) > MAX_NEWS_PATTERNS:
+        state["patterns"] = dict(
+            sorted(
+                patterns.items(),
+                key=lambda item: float(item[1].get("samples", 0)) if isinstance(item[1], dict) else 0,
+                reverse=True,
+            )[:MAX_NEWS_PATTERNS]
+        )
+
+    keyword_counts = state.get("keyword_counts")
+    if isinstance(keyword_counts, dict) and len(keyword_counts) > MAX_KEYWORDS:
+        state["keyword_counts"] = dict(
+            sorted(keyword_counts.items(), key=lambda item: int(item[1] or 0), reverse=True)[:MAX_KEYWORDS]
+        )
+
+    return state
 
 
 def stable_hash(value: str) -> str:
@@ -817,6 +853,7 @@ def enrich() -> int:
     enriched.to_csv(IOS_RESULTS, index=False, encoding="utf-8-sig")
     save_json(TRENDLINE_STATE_FILE, trendline_state)
     save_json(NEWS_IMPACT_STATE_FILE, news_impact_state)
+    adaptive_news_state = compact_adaptive_news_state(adaptive_news_state)
     save_json(ADAPTIVE_NEWS_STATE_FILE, adaptive_news_state)
     enforce_runtime_security(BASE_DIR, output_files=[MARKET_RESULTS, IOS_RESULTS])
     print(f"[mobile-intel] enriched {len(enriched)} rows -> {MARKET_RESULTS.name}, iOS csv")

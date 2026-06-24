@@ -19,6 +19,14 @@ services:
         value: "true"
       - key: MARKET_ENABLE_FULL_SCANNER
         value: "true"
+      - key: MARKET_RENDER_SCANNER_MAX_WORKERS
+        value: "4"
+      - key: MARKET_RENDER_SCANNER_MAX_STOCKS
+        value: "550"
+      - key: MARKET_RENDER_ENABLE_INTRADAY_1M
+        value: "false"
+      - key: MOBILE_INTEL_MAX_NEWS_OBSERVATIONS
+        value: "1200"
       - key: MARKET_SCANNER_REFRESH_SCRIPT
         value: render_mobile_refresh.py
       - key: MARKET_SCANNER_REFRESH_TIMEOUT
@@ -46,6 +54,14 @@ services:
         value: https://market-scanner-api-fo2m.onrender.com/api/results/upload
       - key: MARKET_RESULTS_FILE
         value: market_scanner_results.csv
+      - key: MARKET_SCANNER_MAX_WORKERS
+        value: "4"
+      - key: MARKET_SCANNER_MAX_STOCKS
+        value: "550"
+      - key: MARKET_SCANNER_ENABLE_INTRADAY_1M
+        value: "false"
+      - key: MOBILE_INTEL_MAX_NEWS_OBSERVATIONS
+        value: "1200"
       - key: PYTHONDONTWRITEBYTECODE
         value: "1"
       - key: PYTHONPYCACHEPREFIX

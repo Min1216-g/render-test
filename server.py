@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import csv
+import gc
 import json
 import os
+import resource
 import shutil
 import secrets
 import subprocess
@@ -35,6 +37,9 @@ RATE_LIMIT_PER_MINUTE = int(os.getenv("MARKET_RATE_LIMIT_PER_MINUTE", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("MARKET_RESULTS_CACHE_TTL", "20"))
 SCANNER_RUN_COOLDOWN_SECONDS = int(os.getenv("MARKET_SCANNER_RUN_COOLDOWN_SECONDS", "3600"))
 ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "true").lower() == "true"
+SCANNER_DEFAULT_MAX_WORKERS = os.getenv("MARKET_RENDER_SCANNER_MAX_WORKERS", "4")
+SCANNER_DEFAULT_MAX_STOCKS = os.getenv("MARKET_RENDER_SCANNER_MAX_STOCKS", "550")
+SCANNER_ENABLE_INTRADAY_1M = os.getenv("MARKET_RENDER_ENABLE_INTRADAY_1M", "false")
 MAX_UPLOAD_BYTES = int(os.getenv("MARKET_RESULTS_UPLOAD_MAX_BYTES", "6000000"))
 MIN_UPLOAD_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_ROWS", "500"))
 MIN_UPLOAD_OK_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_OK_ROWS", "50"))
@@ -62,11 +67,19 @@ def startup_cleanup() -> None:
 
 @app.middleware("http")
 async def no_store_api_cache(request: Request, call_next):
+    started = time.time()
     response = await call_next(request)
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
         response.headers["Expires"] = "0"
+        response.headers["X-Process-RSS-MB"] = str(_memory_rss_mb())
+        duration_ms = int((time.time() - started) * 1000)
+        if duration_ms >= 1000 or request.url.path in {"/api/scanner/run", "/api/refresh/quick", "/api/results"}:
+            print(
+                f"[API] {request.method} {request.url.path} status={response.status_code} duration_ms={duration_ms} rss_mb={_memory_rss_mb()}",
+                flush=True,
+            )
     return response
 
 _request_log: Dict[str, Deque[float]] = defaultdict(deque)
@@ -79,12 +92,28 @@ _scanner_running = False
 _scanner_last_seen_mtime = 0.0
 
 
+def _memory_rss_mb() -> float:
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    rss = float(usage.ru_maxrss)
+    if sys.platform == "darwin":
+        rss = rss / 1024 / 1024
+    else:
+        rss = rss / 1024
+    return round(rss, 2)
+
+
+def _log_memory(stage: str, **extra: object) -> None:
+    details = " ".join(f"{key}={value}" for key, value in extra.items() if value is not None)
+    print(f"[MEM] {stage} rss_mb={_memory_rss_mb()} {details}".strip(), flush=True)
+
+
 def _invalidate_results_cache() -> None:
     global _cache_rows, _cache_loaded_at, _cache_file_mtime, _cache_file_path
     _cache_rows = []
     _cache_loaded_at = 0.0
     _cache_file_mtime = 0.0
     _cache_file_path = ""
+    gc.collect()
 
 
 def _current_result_snapshot() -> Dict[str, object]:
@@ -367,6 +396,7 @@ def _scanner_cooldown_payload(status: Dict[str, object]) -> Optional[Dict[str, o
 def _run_scanner_background() -> None:
     global _scanner_running, _scanner_last_seen_mtime
     try:
+        _log_memory("scanner-start")
         _cleanup_runtime_storage()
         _clear_runtime_api_caches()
         started_at = time.time()
@@ -392,6 +422,12 @@ def _run_scanner_background() -> None:
         command = [sys.executable, str(REFRESH_SCRIPT)]
         if REFRESH_SCRIPT.name == "run_market_scanner_update.py":
             command.append("--force")
+        scanner_env = os.environ.copy()
+        scanner_env.setdefault("MARKET_SCANNER_MAX_WORKERS", SCANNER_DEFAULT_MAX_WORKERS)
+        scanner_env.setdefault("MARKET_SCANNER_MAX_STOCKS", SCANNER_DEFAULT_MAX_STOCKS)
+        scanner_env.setdefault("MARKET_SCANNER_ENABLE_INTRADAY_1M", SCANNER_ENABLE_INTRADAY_1M)
+        scanner_env.setdefault("MARKET_SCANNER_CACHE_RETENTION_DAYS", "1")
+        scanner_env.setdefault("MOBILE_INTEL_MAX_NEWS_OBSERVATIONS", "1200")
 
         _write_scanner_status(
             running=True,
@@ -410,6 +446,7 @@ def _run_scanner_background() -> None:
             update = subprocess.Popen(
                 command,
                 cwd=BASE_DIR,
+                env=scanner_env,
                 stdout=stdout_log,
                 stderr=stderr_log,
                 text=True,
@@ -431,6 +468,7 @@ def _run_scanner_background() -> None:
                         _scanner_last_seen_mtime = mtime
                         _invalidate_results_cache()
                         snapshot = _current_result_snapshot()
+                        _log_memory("scanner-partial-data", rows=snapshot.get("rows"), ok_rows=snapshot.get("ok_rows"))
                         _write_scanner_status(
                             running=True,
                             state="partial_data",
@@ -490,6 +528,7 @@ def _run_scanner_background() -> None:
             enrich = subprocess.run(
                 [sys.executable, str(MOBILE_INTEL_SCRIPT)],
                 cwd=BASE_DIR,
+                env=scanner_env,
                 check=False,
                 capture_output=True,
                 text=True,
@@ -516,6 +555,7 @@ def _run_scanner_background() -> None:
         _invalidate_results_cache()
         rows = _read_rows()
         ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
+        _log_memory("scanner-completed", rows=len(rows), ok_rows=ok_rows)
         _write_scanner_status(
             running=False,
             state="completed",
@@ -529,6 +569,7 @@ def _run_scanner_background() -> None:
             completed_at_iso=_now_iso(),
         )
         _cleanup_runtime_storage()
+        _log_memory("scanner-cleanup")
     except subprocess.TimeoutExpired:
         _write_scanner_status(running=False, state="timeout", message="스캐너 시간 초과", progress=0)
     except Exception as exc:
@@ -688,6 +729,32 @@ async def status(request: Request) -> Dict[str, object]:
     }
 
 
+@app.post("/api/refresh/quick")
+async def quick_refresh(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    started = time.time()
+    _invalidate_results_cache()
+    rows = _read_rows()
+    snapshot = _current_result_snapshot()
+    _write_scanner_status(
+        running=False,
+        state="quick_refreshed",
+        message=f"빠른 갱신 완료 · 기존 최신 데이터 즉시 반영 · {snapshot.get('ok_rows', 0)}/{snapshot.get('rows', 0)} 정상",
+        progress=100,
+        mode="quick",
+        **snapshot,
+    )
+    _log_memory("quick-refresh", rows=len(rows), duration_ms=int((time.time() - started) * 1000))
+    return {
+        "ok": True,
+        "message": "quick refresh completed",
+        "count": len(rows),
+        "status": _read_scanner_status(),
+        **snapshot,
+        "updated_at": _now_iso(),
+    }
+
+
 @app.post("/api/scanner/run")
 async def scanner_run(request: Request) -> Dict[str, object]:
     global _scanner_running
@@ -709,12 +776,14 @@ async def scanner_run(request: Request) -> Dict[str, object]:
             return cooldown_payload
         _scanner_running = True
         _clear_runtime_api_caches()
+        quick_snapshot = _current_result_snapshot()
         _write_scanner_status(
             running=True,
             state="queued",
-            message="스캐너 실행 요청됨 · 캐시 초기화... 0%",
-            progress=0,
+            message="빠른 데이터 반영 완료 · 백그라운드 스캐너 대기... 5%",
+            progress=5,
             started_at=time.time(),
+            **quick_snapshot,
         )
         thread = threading.Thread(target=_run_scanner_background, daemon=True)
         thread.start()
@@ -869,6 +938,7 @@ def root() -> Dict[str, object]:
             "/api/status",
             "/api/results",
             "/api/results/force-refresh",
+            "/api/refresh/quick",
             "/api/top-movers",
             "/api/scanner/run",
             "/api/scanner/status",
