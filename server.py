@@ -124,7 +124,7 @@ def _current_result_snapshot() -> Dict[str, object]:
     return {
         "rows": len(rows),
         "ok_rows": sum(1 for row in rows if row.get("status", "ok") == "ok"),
-        "file_updated_at": datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds"),
+        "file_updated_at": _file_mtime_iso(path),
         "data_generated_at": max((row.get("mobile_intel_generated_at", "") for row in rows), default=""),
     }
 
@@ -173,6 +173,12 @@ def _cleanup_runtime_storage() -> None:
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _file_mtime_iso(path: Path) -> str:
+    if not path.exists():
+        return ""
+    return datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat(timespec="seconds")
 
 
 def _csv_row_count(path: Path) -> int:
@@ -267,7 +273,7 @@ def _read_scanner_status() -> Dict[str, object]:
     if not SCANNER_STATUS_FILE.exists():
         path = _result_path()
         if path.exists():
-            file_updated_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds")
+            file_updated_at = _file_mtime_iso(path)
             return {
                 "running": False,
                 "state": "ready",
@@ -712,7 +718,7 @@ async def status(request: Request) -> Dict[str, object]:
     await guarded(request)
     rows = _read_rows()
     path = _result_path()
-    mtime = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if path.exists() else ""
+    mtime = _file_mtime_iso(path)
     ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
     generated_at = max((row.get("mobile_intel_generated_at", "") for row in rows), default="")
     scanner_status = _read_scanner_status()
@@ -859,7 +865,7 @@ async def results(
 ) -> Dict[str, object]:
     await guarded(request)
     path = _result_path()
-    file_updated_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat(timespec="seconds") if path.exists() else ""
+    file_updated_at = _file_mtime_iso(path)
     rows = _filter_rows(_read_rows(), market=market, q=q, limit=limit)
     generated_at = max((row.get("mobile_intel_generated_at", "") for row in rows), default="")
     return {
@@ -902,7 +908,7 @@ async def upload_results(request: Request) -> Dict[str, object]:
         "ok": True,
         "rows": len(rows),
         "ok_rows": ok_rows,
-        "file_updated_at": datetime.fromtimestamp(RESULT_FILE.stat().st_mtime).isoformat(timespec="seconds"),
+        "file_updated_at": _file_mtime_iso(RESULT_FILE),
         "updated_at": _now_iso(),
     }
 
