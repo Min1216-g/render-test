@@ -934,6 +934,120 @@ async def top_movers(
     }
 
 
+@app.get("/api/ai-screening/profile")
+async def ai_screening_profile(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    from korean_ai_screening_simulator import SAFETY_NOTICE, load_profile
+
+    return {
+        "ok": True,
+        "profile": load_profile(),
+        "safety_notice": SAFETY_NOTICE,
+        "updated_at": _now_iso(),
+    }
+
+
+@app.post("/api/ai-screening/profile")
+async def save_ai_screening_profile(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    from korean_ai_screening_simulator import SAFETY_NOTICE, save_profile
+
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="profile payload must be an object")
+    profile = save_profile(payload)
+    return {
+        "ok": True,
+        "profile": profile,
+        "safety_notice": SAFETY_NOTICE,
+        "updated_at": _now_iso(),
+    }
+
+
+@app.post("/api/ai-screening/run")
+async def run_ai_screening(request: Request, limit: int = Query(default=50, ge=1, le=200)) -> Dict[str, object]:
+    await guarded(request)
+    from korean_ai_screening_simulator import run_screening
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    profile = payload if isinstance(payload, dict) and payload else None
+    result = run_screening(profile=profile, limit=limit)
+    result["updated_at"] = _now_iso()
+    return result
+
+
+@app.post("/api/ai-screening/backtest")
+async def run_ai_screening_backtest(
+    request: Request,
+    period: str = Query(default="6mo"),
+    max_symbols: int = Query(default=30, ge=1, le=80),
+) -> Dict[str, object]:
+    await guarded(request)
+    from korean_ai_screening_simulator import backtest_screening
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    profile = payload if isinstance(payload, dict) and payload else None
+    result = backtest_screening(profile=profile, period=period, max_symbols=max_symbols)
+    result["updated_at"] = _now_iso()
+    return result
+
+
+@app.get("/api/paper-trading/account")
+async def paper_trading_account(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    from korean_ai_screening_simulator import paper_account_summary
+
+    return paper_account_summary()
+
+
+@app.post("/api/paper-trading/deposit")
+async def paper_trading_deposit(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    from korean_ai_screening_simulator import deposit_paper_cash, paper_account_summary
+
+    payload = await request.json()
+    amount = float(payload.get("amount", 0)) if isinstance(payload, dict) else 0.0
+    try:
+        deposit_paper_cash(amount)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return paper_account_summary()
+
+
+@app.post("/api/paper-trading/simulate")
+async def paper_trading_simulate(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    from korean_ai_screening_simulator import paper_account_summary, simulate_paper_trade
+
+    payload = await request.json()
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="paper trade payload must be an object")
+    try:
+        simulate_paper_trade(
+            ticker=str(payload.get("ticker", "")).strip(),
+            quantity=float(payload.get("quantity", 0)),
+            price=float(payload.get("price", 0)),
+            side=str(payload.get("side", "")).strip().lower(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return paper_account_summary()
+
+
+@app.get("/api/watchdog")
+async def api_watchdog(request: Request, max_stale_seconds: int = Query(default=60, ge=10, le=86400)) -> Dict[str, object]:
+    await guarded(request)
+    from korean_ai_screening_simulator import watchdog_status
+
+    return watchdog_status(max_stale_seconds=max_stale_seconds)
+
+
 @app.get("/")
 def root() -> Dict[str, object]:
     return {
