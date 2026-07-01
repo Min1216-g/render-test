@@ -32,6 +32,7 @@ IOS_RESULTS = BASE_DIR / "MarketScannerIOS" / "MarketScannerIOS" / "market_scann
 TRENDLINE_STATE_FILE = BASE_DIR / "mobile_trendline_state.json"
 NEWS_IMPACT_STATE_FILE = BASE_DIR / "mobile_news_impact_state.json"
 ADAPTIVE_NEWS_STATE_FILE = BASE_DIR / "adaptive_news_impact_state.json"
+MOBILE_INTEL_SIGNATURE_FILE = BASE_DIR / "mobile_intel_signature_state.json"
 VANCOUVER_TZ = ZoneInfo("America/Vancouver")
 NEWS_PRIMARY_AGE_DAYS = 7
 NEWS_MAX_AGE_DAYS = 30
@@ -40,6 +41,58 @@ MIN_OK_ROWS_FOR_APP_SYNC = 50
 MAX_NEWS_OBSERVATIONS = max(200, int(os.getenv("MOBILE_INTEL_MAX_NEWS_OBSERVATIONS", "1200")))
 MAX_NEWS_PATTERNS = max(20, int(os.getenv("MOBILE_INTEL_MAX_NEWS_PATTERNS", "80")))
 MAX_KEYWORDS = max(20, int(os.getenv("MOBILE_INTEL_MAX_KEYWORDS", "80")))
+ENABLE_INCREMENTAL = os.getenv("MOBILE_INTEL_INCREMENTAL", "true").lower() not in {"0", "false", "no"}
+MOBILE_FIELDS = [
+    "mobile_intel_generated_at",
+    "mobile_today_score",
+    "mobile_contrarian_signal",
+    "mobile_ai_explain",
+    "mobile_lead_signal",
+    "mobile_missed_signal",
+    "mobile_risk_signal",
+    "mobile_breaking_signal",
+    "mobile_sector_rotation",
+    "mobile_market_risk",
+    "mobile_capital_flow",
+    "mobile_theme_link",
+    "mobile_position_ai",
+    "mobile_sector_keywords",
+    "mobile_news_price_forecast",
+    "mobile_news_impact_label",
+    "mobile_news_impact_score",
+    "mobile_news_confidence",
+    "mobile_news_basis",
+    "mobile_news_similar",
+    "mobile_news_expectation",
+    "mobile_news_impact_summary",
+    "mobile_news_learned_keywords",
+    "mobile_news_focus",
+    "mobile_news_v2_strength",
+    "mobile_news_v2_duration",
+    "mobile_news_v2_market_reaction",
+    "mobile_news_v2_positive_factors",
+    "mobile_news_v2_negative_factors",
+    "mobile_news_v2_short_effect",
+    "mobile_news_v2_mid_effect",
+    "mobile_news_v2_long_effect",
+    "mobile_news_v2_sector_impact",
+    "mobile_news_v2_lead_status",
+    "mobile_news_v2_core_signal",
+    "mobile_news_v2_final_signal",
+    "mobile_news_v2_confidence_grade",
+    "mobile_news_v2_policy_flags",
+    "mobile_news_grade",
+    "mobile_news_type",
+    "mobile_news_good_score",
+    "mobile_news_bad_score",
+    "mobile_news_impact_strength_label",
+    "mobile_news_leading_detection",
+    "mobile_trendline_anchor_date",
+    "mobile_trendline_anchor_price",
+    "mobile_trendline_up",
+    "mobile_trendline_down",
+    "mobile_trendline_status",
+]
 
 
 def read_csv(path: Path) -> pd.DataFrame:
@@ -98,6 +151,31 @@ def compact_adaptive_news_state(state: dict) -> dict:
 
 def stable_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", errors="ignore")).hexdigest()[:16]
+
+
+def mobile_signature(row: pd.Series) -> str:
+    keys = [
+        "ticker",
+        "price",
+        "change_pct",
+        "volume_ratio",
+        "trade_value_ratio",
+        "score",
+        "risk",
+        "news",
+        "news_one_line",
+        "headlines",
+        "flow",
+        "flow_status",
+        "sector",
+        "mobile_trendline_anchor_date",
+    ]
+    corpus = "|".join(str(row.get(key, "") or "") for key in keys)
+    return stable_hash(corpus)
+
+
+def has_mobile_fields(row: pd.Series) -> bool:
+    return all(field in row.index for field in MOBILE_FIELDS[:15]) and bool(text(row, "mobile_ai_explain"))
 
 
 def number(value, default: float = 0.0) -> float:
@@ -757,11 +835,23 @@ def enrich() -> int:
     trendline_state = load_json(TRENDLINE_STATE_FILE)
     news_impact_state = load_json(NEWS_IMPACT_STATE_FILE)
     adaptive_news_state = load_json(ADAPTIVE_NEWS_STATE_FILE)
+    signature_state = load_json(MOBILE_INTEL_SIGNATURE_FILE)
     update_news_outcomes(results.to_dict("records"), adaptive_news_state, generated_dt.replace(tzinfo=None))
 
     enriched_rows = []
+    reused_count = 0
+    updated_count = 0
     for _, row in results.iterrows():
         row = row.copy()
+        ticker = text(row, "ticker")
+        signature = mobile_signature(row)
+        cached_signature = signature_state.get(ticker)
+        if ENABLE_INCREMENTAL and cached_signature == signature and has_mobile_fields(row):
+            row["mobile_intel_generated_at"] = generated_at
+            enriched_rows.append(row)
+            reused_count += 1
+            continue
+
         market = market_text(row)
         sector = sector_key(text(row, "sector"))
         sector_info = sectors.get(f"{market}|{sector}", {})
@@ -845,7 +935,9 @@ def enrich() -> int:
         row["mobile_trendline_up"] = round(float(trendline["up"]), 4)
         row["mobile_trendline_down"] = round(float(trendline["down"]), 4)
         row["mobile_trendline_status"] = trendline["reason"]
+        signature_state[ticker] = signature
         enriched_rows.append(row)
+        updated_count += 1
 
     enriched = pd.DataFrame(enriched_rows)
     enriched.to_csv(MARKET_RESULTS, index=False, encoding="utf-8-sig")
@@ -855,8 +947,12 @@ def enrich() -> int:
     save_json(NEWS_IMPACT_STATE_FILE, news_impact_state)
     adaptive_news_state = compact_adaptive_news_state(adaptive_news_state)
     save_json(ADAPTIVE_NEWS_STATE_FILE, adaptive_news_state)
+    save_json(MOBILE_INTEL_SIGNATURE_FILE, signature_state)
     enforce_runtime_security(BASE_DIR, output_files=[MARKET_RESULTS, IOS_RESULTS])
-    print(f"[mobile-intel] enriched {len(enriched)} rows -> {MARKET_RESULTS.name}, iOS csv")
+    print(
+        f"[mobile-intel] enriched {len(enriched)} rows -> {MARKET_RESULTS.name}, iOS csv "
+        f"(updated={updated_count}, reused={reused_count}, incremental={ENABLE_INCREMENTAL})"
+    )
     return 0
 
 

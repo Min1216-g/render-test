@@ -2733,6 +2733,12 @@ TOP_N = int(os.getenv("MARKET_SCANNER_TOP_N", "10"))
 MAX_STOCKS = int(os.getenv("MARKET_SCANNER_MAX_STOCKS", "0"))
 MIN_TRADE_VALUE = float(os.getenv("MARKET_SCANNER_MIN_TRADE_VALUE", "1000000000"))
 ENABLE_NEWS = os.getenv("MARKET_SCANNER_ENABLE_NEWS", "true").lower() == "true"
+NEWS_SOURCES = {
+    source.strip()
+    for source in os.getenv("MARKET_SCANNER_NEWS_SOURCES", "company_risk_news,google_news,naver_news").split(",")
+    if source.strip()
+}
+ENABLE_SECTOR_NEWS = os.getenv("MARKET_SCANNER_ENABLE_SECTOR_NEWS", "true").lower() == "true"
 NEWS_PRIMARY_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_PRIMARY_AGE_DAYS", "7"))
 NEWS_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_MAX_AGE_DAYS", "30"))
 NEWS_SIGNAL_MAX_AGE_DAYS = int(os.getenv("MARKET_SCANNER_NEWS_SIGNAL_MAX_AGE_DAYS", str(NEWS_MAX_AGE_DAYS)))
@@ -2796,8 +2802,15 @@ def normalize_ohlcv_dataframe(df):
     return normalized[keep_cols].dropna()
 
 
-def korean_stock_code(ticker):
+def normalize_market_ticker(ticker):
     clean_ticker = str(ticker or "").strip().upper()
+    clean_ticker = clean_ticker.replace("\u200b", "").replace("\ufeff", "")
+    clean_ticker = clean_ticker.lstrip("$#")
+    return clean_ticker
+
+
+def korean_stock_code(ticker):
+    clean_ticker = normalize_market_ticker(ticker)
     if clean_ticker.endswith((".KS", ".KQ")):
         return clean_ticker.split(".", 1)[0]
     if re.fullmatch(r"[0-9A-Z]{6}", clean_ticker) and any(char.isdigit() for char in clean_ticker):
@@ -3171,17 +3184,19 @@ def atr(df, period=14):
 
 
 def download_price_data(ticker):
-    if korean_stock_code(ticker):
+    clean_ticker = normalize_market_ticker(ticker)
+    korean_code = korean_stock_code(clean_ticker)
+    if korean_code and SCAN_INTERVAL == "1d":
         try:
-            naver_df = download_naver_price_data(ticker)
-            if not naver_df.empty:
-                return naver_df
+            naver_df = download_naver_price_data(clean_ticker)
+            return naver_df
         except Exception as exc:
             print(f"{ticker} 네이버 가격 확인 실패: {sanitize_error(exc)}", flush=True)
+            return pd.DataFrame()
 
     with YFINANCE_DOWNLOAD_LOCK:
         df = yf.download(
-            ticker,
+            clean_ticker,
             period=SCAN_PERIOD,
             interval=SCAN_INTERVAL,
             progress=False,
@@ -3191,9 +3206,10 @@ def download_price_data(ticker):
 
 
 def download_market_data(ticker):
+    clean_ticker = normalize_market_ticker(ticker)
     with YFINANCE_DOWNLOAD_LOCK:
         df = yf.download(
-            ticker,
+            clean_ticker,
             period="6mo",
             interval="1d",
             progress=False,
@@ -3222,8 +3238,10 @@ def should_fetch_intraday_1m(ticker):
 
 
 def download_intraday_1m_data(ticker):
-    clean_ticker = str(ticker or "").strip().upper()
+    clean_ticker = normalize_market_ticker(ticker)
     if not clean_ticker:
+        return pd.DataFrame()
+    if korean_stock_code(clean_ticker):
         return pd.DataFrame()
 
     with INTRADAY_CACHE_LOCK:
@@ -3371,10 +3389,30 @@ def cleanup_old_caches():
         print(f"오래된 캐시 {removed}개 자동 삭제", flush=True)
 
 
+def should_block_result_overwrite(rows, expected_count):
+    if not RESULT_FILE.exists():
+        return False, ""
+    total = len(rows)
+    ok_count = sum(1 for row in rows if str(row.get("status", "")).lower() == "ok")
+    try:
+        existing_count = len(pd.read_csv(RESULT_FILE, encoding="utf-8-sig"))
+    except Exception:
+        existing_count = 0
+    if MAX_STOCKS > 0 and existing_count > total:
+        return True, f"샘플 실행 {total}개가 기존 전체 결과 {existing_count}개보다 적음"
+    if expected_count < 20:
+        min_ok_count = 1
+    else:
+        min_ok_count = max(3, int(expected_count * 0.10))
+    if total == 0 or ok_count < min_ok_count:
+        return True, f"정상 {ok_count}/{expected_count}개로 기준({min_ok_count}개) 미달"
+    return False, ""
+
+
 def market_label_for_ticker(ticker):
-    if ticker.endswith((".TO", ".V")):
+    clean_ticker = normalize_market_ticker(ticker)
+    if clean_ticker.endswith((".TO", ".V")):
         return "캐나다"
-    clean_ticker = str(ticker or "").strip().upper()
     if re.match(r"^\d{6}(\.KS|\.KQ)?$", clean_ticker):
         return "국장"
     if re.fullmatch(r"[0-9A-Z]{6}", clean_ticker) and any(char.isdigit() for char in clean_ticker):
@@ -4569,6 +4607,8 @@ def fetch_news_context(name, sector=None):
         ("google_news", fetch_google_news_headlines),
         ("naver_news", fetch_naver_news_headlines),
     ):
+        if NEWS_SOURCES and source not in NEWS_SOURCES:
+            continue
         try:
             source_headlines = fetcher(name, sector)
         except Exception as exc:
@@ -4578,12 +4618,13 @@ def fetch_news_context(name, sector=None):
             company_sources.append(source)
             company_headlines.extend(source_headlines)
 
-    try:
-        sector_headlines = fetch_sector_news_headlines(name, sector)
-        if sector_headlines:
-            sector_sources.append("sector_news")
-    except Exception as exc:
-        errors.append(f"sector_news:{sanitize_error(exc)}")
+    if ENABLE_SECTOR_NEWS:
+        try:
+            sector_headlines = fetch_sector_news_headlines(name, sector)
+            if sector_headlines:
+                sector_sources.append("sector_news")
+        except Exception as exc:
+            errors.append(f"sector_news:{sanitize_error(exc)}")
 
     company_headlines = filter_news_titles_by_age(
         [title for title in dict.fromkeys(company_headlines) if not is_noise_news_title(title)]
@@ -4667,14 +4708,18 @@ def determine_trade_action(
     supply_concentration,
     market_mode,
     liquidity_confirmed,
+    additional_upside_score=0,
+    additional_upside_candidate=False,
 ):
     overheated = rsi_value >= OVERHEAT_RSI
     extreme_overheated = rsi_value >= EXTREME_OVERHEAT_RSI
     chase_risk = (
         range_pos >= CHASE_RANGE_POS
         or change_pct >= 7
+        or rsi_value >= 72
         or gap_pct >= 4
-        or (overheated and change_pct >= 4)
+        or (rsi_value >= 70 and change_pct >= 4)
+        or (volume_burst and change_pct >= 5)
     )
 
     if risk >= MARKET_RISK_BLOCK_THRESHOLD:
@@ -4687,6 +4732,13 @@ def determine_trade_action(
         return "✅ 매수 후보", "점수·리스크·타이밍 통과", chase_risk, overheated
     if final_score >= 75 and risk < 20 and supply_concentration and not extreme_overheated:
         return "🟡 분할 관심", "수급 집중 기반 분할 접근", chase_risk, overheated
+    if (
+        additional_upside_candidate
+        and additional_upside_score >= 72
+        and risk < MARKET_RISK_BLOCK_THRESHOLD
+        and liquidity_confirmed
+    ):
+        return "🚀 강한 추세 지속 후보", "이미 올랐지만 재료·수급·추세 지속성 확인", chase_risk, overheated
     if final_score >= 65 and chase_risk:
         return "⏳ 눌림 대기", "이미 오른 구간이라 추격 금지", chase_risk, overheated
     if final_score >= 55 and overheated:
@@ -4712,6 +4764,11 @@ def build_ai_recommendation(
     name="",
     ticker="",
     sector="",
+    return_5d=0,
+    return_20d=0,
+    ma20_gap_pct=0,
+    additional_upside_score=0,
+    additional_upside_candidate=False,
 ):
     dividend_yield = float(dividend.get("dividend_yield_pct") or 0)
     news_score = int(news.get("score") or 0)
@@ -4748,6 +4805,18 @@ def build_ai_recommendation(
         chase_penalty += 10
     if change_pct >= 8:
         chase_penalty += 12
+    if return_5d >= 15:
+        chase_penalty += 14
+    elif return_5d >= 10:
+        chase_penalty += 8
+    if return_20d >= 30:
+        chase_penalty += 16
+    elif return_20d >= 20:
+        chase_penalty += 10
+    if ma20_gap_pct >= 18:
+        chase_penalty += 14
+    elif ma20_gap_pct >= 12:
+        chase_penalty += 8
     if volume_ratio >= 3 and change_pct >= 4:
         chase_penalty += 8
     if chase_risk:
@@ -4756,6 +4825,10 @@ def build_ai_recommendation(
         chase_penalty += 10
     if rsi_value >= EXTREME_OVERHEAT_RSI:
         chase_penalty += 12
+    if additional_upside_candidate and additional_upside_score >= 72:
+        chase_penalty = max(0, chase_penalty - 4)
+    elif additional_upside_candidate and additional_upside_score >= 60:
+        chase_penalty = max(0, chase_penalty - 2)
     ai_score -= chase_penalty
 
     failure_adjustment, failure_reason = failure_adjustment_for(name, ticker, market_label, sector)
@@ -4764,7 +4837,7 @@ def build_ai_recommendation(
         if failure_adjustment < 0:
             ai_score = min(ai_score, 69)
 
-    if chase_penalty >= 18:
+    if chase_penalty >= 18 and not (additional_upside_candidate and additional_upside_score >= 72):
         ai_score = min(ai_score, 71)
     elif chase_penalty >= 10:
         ai_score = min(ai_score, 83)
@@ -4783,7 +4856,10 @@ def build_ai_recommendation(
         label = "AI 관망"
         reason = "지금은 확실한 우위가 부족합니다."
 
-    if chase_penalty >= 18:
+    if additional_upside_candidate and additional_upside_score >= 72 and label != "AI 관망":
+        label = "AI 관심"
+        reason = "이미 오른 구간이지만 수급·재료·추세 지속성이 살아 있어 추세 지속 후보로 분류합니다."
+    elif chase_penalty >= 18:
         label = "AI 관망"
         reason = "이미 많이 오른 구간이라 신규 매수보다 눌림 확인이 우선입니다."
     elif chase_penalty >= 10 and label == "AI 추천":
@@ -4805,6 +4881,332 @@ def build_ai_recommendation(
             reason = f"{reason} 이전에 놓친 상승 패턴도 일부 반영했습니다."
 
     return label, max(0, int(ai_score)), reason
+
+
+def build_historical_continuation_context(close, volume):
+    if close is None or volume is None or len(close) < 120:
+        return {
+            "score": 0,
+            "sample_count": 0,
+            "continuation_rate": 0.0,
+            "failure_rate": 0.0,
+            "summary": "과거 유사 패턴 부족",
+        }
+
+    try:
+        close = close.astype(float).dropna()
+        volume = volume.astype(float).reindex(close.index).fillna(0)
+        rsi_series = rsi(close).fillna(50)
+    except Exception:
+        return {
+            "score": 0,
+            "sample_count": 0,
+            "continuation_rate": 0.0,
+            "failure_rate": 0.0,
+            "summary": "과거 패턴 계산 실패",
+        }
+
+    samples = []
+    last_index = len(close) - 22
+    for idx in range(60, max(60, last_index)):
+        base = float(close.iloc[idx])
+        if base <= 0:
+            continue
+        prev_5 = float(close.iloc[idx - 5])
+        prev_20 = float(close.iloc[idx - 20])
+        avg_vol = float(volume.iloc[idx - 20:idx].mean())
+        r5 = ((base / prev_5) - 1) * 100 if prev_5 else 0
+        r20 = ((base / prev_20) - 1) * 100 if prev_20 else 0
+        vr = float(volume.iloc[idx] / avg_vol) if avg_vol else 0
+        rsi_value = float(rsi_series.iloc[idx])
+        already_risen = r5 >= 8 or r20 >= 18 or rsi_value >= 68 or (vr >= 2.0 and r5 >= 4)
+        if not already_risen:
+            continue
+
+        future = close.iloc[idx + 1:idx + 21]
+        if future.empty:
+            continue
+        future_max = ((float(future.max()) / base) - 1) * 100
+        future_min = ((float(future.min()) / base) - 1) * 100
+        continued = future_max >= 8 and future_min > -14
+        failed = future_min <= -10 and future_max < 5
+        samples.append(
+            {
+                "r5": r5,
+                "r20": r20,
+                "vr": vr,
+                "rsi": rsi_value,
+                "continued": continued,
+                "failed": failed,
+            }
+        )
+
+    sample_count = len(samples)
+    if sample_count < 3:
+        return {
+            "score": 0,
+            "sample_count": sample_count,
+            "continuation_rate": 0.0,
+            "failure_rate": 0.0,
+            "summary": "과거 유사 패턴 표본 부족",
+        }
+
+    continuation_count = sum(1 for item in samples if item["continued"])
+    failure_count = sum(1 for item in samples if item["failed"])
+    continuation_rate = continuation_count / sample_count
+    failure_rate = failure_count / sample_count
+
+    score = 0
+    if sample_count >= 8 and continuation_rate >= 0.58:
+        score = 14
+    elif continuation_rate >= 0.45:
+        score = 8
+    elif failure_rate >= 0.42:
+        score = -12
+    elif failure_rate >= 0.30:
+        score = -6
+
+    summary = (
+        f"과거 유사 급등 {sample_count}건 · "
+        f"추가상승 {continuation_rate * 100:.0f}% · "
+        f"고점실패 {failure_rate * 100:.0f}%"
+    )
+    return {
+        "score": score,
+        "sample_count": sample_count,
+        "continuation_rate": round(continuation_rate * 100, 1),
+        "failure_rate": round(failure_rate * 100, 1),
+        "summary": summary,
+    }
+
+
+def build_additional_upside_context(
+    return_5d,
+    return_20d,
+    rsi_value,
+    change_pct,
+    gap_pct,
+    range_pos,
+    ma20_gap_pct,
+    trend_up,
+    pullback_rebound,
+    volume_ratio,
+    trade_value_ratio,
+    volume_burst,
+    liquidity_confirmed,
+    supply_concentration,
+    macd_bullish,
+    price,
+    ma5,
+    ma20,
+    ma20_prev,
+    news,
+    flow,
+    sector,
+    risk,
+    historical_pattern,
+):
+    already_risen = (
+        return_5d >= 8
+        or return_20d >= 18
+        or rsi_value >= 68
+        or range_pos >= CHASE_RANGE_POS
+        or ma20_gap_pct >= 10
+        or (volume_burst and change_pct >= 3.5)
+    )
+    if not already_risen:
+        return {
+            "candidate": False,
+            "score": 0,
+            "label": "일반",
+            "summary": "추가 상승 잠재력 평가 대상 아님",
+            "fail_fast": False,
+            "fail_fast_reason": "",
+            "quality_score": 0,
+            "material_score": 0,
+            "flow_score": 0,
+            "resilience_score": 0,
+            "pattern_score": historical_pattern.get("score", 0),
+            "pattern_summary": historical_pattern.get("summary", ""),
+        }
+
+    fail_fast_reasons = []
+    news_score = int(news.get("score") or 0)
+    news_risk = int(news.get("risk") or 0)
+    news_strength = str(news.get("strength") or "")
+    news_text = str(news.get("summary") or "")
+    flow_score_value = int(flow.get("score") or 0)
+    if not liquidity_confirmed:
+        fail_fast_reasons.append("유동성/거래대금 확인 부족")
+    if return_5d >= 18 and volume_ratio < 0.9 and trade_value_ratio < 0.9:
+        fail_fast_reasons.append("5일 급등 후 거래대금 급감")
+    if gap_pct >= 5 and change_pct < 1:
+        fail_fast_reasons.append("갭상승 후 종가 밀림")
+    if return_20d >= 35 and ma20_gap_pct >= 18 and not pullback_rebound:
+        fail_fast_reasons.append("20일 급등 후 지지 확인 부족")
+    if rsi_value >= 86 and range_pos >= 96:
+        fail_fast_reasons.append("RSI/가격 위치 극단 과열")
+    if news_score <= 2 and news_strength in {"none", "weak"} and flow_score_value < 10:
+        fail_fast_reasons.append("후속 재료/수급 약함")
+    if news_risk >= 10:
+        fail_fast_reasons.append("뉴스 리스크 우세")
+    if risk >= MARKET_RISK_BLOCK_THRESHOLD:
+        fail_fast_reasons.append("기존 리스크 차단 기준 초과")
+
+    if fail_fast_reasons:
+        return {
+            "candidate": True,
+            "score": 0,
+            "label": "소멸형 급등 경계",
+            "summary": " · ".join(fail_fast_reasons[:3]),
+            "fail_fast": True,
+            "fail_fast_reason": " · ".join(fail_fast_reasons[:3]),
+            "quality_score": 0,
+            "material_score": 0,
+            "flow_score": 0,
+            "resilience_score": 0,
+            "pattern_score": historical_pattern.get("score", 0),
+            "pattern_summary": historical_pattern.get("summary", ""),
+        }
+
+    quality_score = 0
+    material_score = 0
+    flow_persistence_score = 0
+    resilience_score = 0
+    reasons = []
+    risk_flags = []
+
+    if trend_up:
+        quality_score += 14
+        reasons.append("정배열 추세 유지")
+    if pullback_rebound:
+        resilience_score += 18
+        reasons.append("눌림 후 재상승 구조")
+    if macd_bullish:
+        quality_score += 6
+        reasons.append("MACD 재상승 확인")
+    if price > ma5 > ma20 and ma20 >= ma20_prev:
+        resilience_score += 12
+        reasons.append("단기 지지선 위에서 버팀")
+    if 45 <= rsi_value <= 74:
+        quality_score += 8
+        reasons.append("과열 전 추세 구간")
+    elif rsi_value > 82:
+        quality_score -= 8
+        risk_flags.append("RSI 극단 과열")
+    if 0.9 <= volume_ratio <= 3.8 and trade_value_ratio >= 0.8:
+        flow_persistence_score += 16
+        reasons.append("거래대금 유지")
+    elif volume_ratio >= 4.5 and change_pct >= 5:
+        flow_persistence_score -= 8
+        risk_flags.append("단기 폭발형 거래량")
+    if liquidity_confirmed:
+        flow_persistence_score += 8
+        reasons.append("유동성 확인")
+    if supply_concentration or flow_score_value >= 18:
+        flow_persistence_score += 12
+        reasons.append("수급 지속성 감지")
+    if news_score >= 10:
+        material_score += 16
+        reasons.append("재료 지속 가능성 높음")
+    elif news_score >= 4:
+        material_score += 8
+        reasons.append("재료 모멘텀 유지")
+    if news_strength == "weak":
+        material_score -= 5
+        risk_flags.append("뉴스 강도 약함")
+    if news_risk >= 8:
+        material_score -= 12
+        risk_flags.append("뉴스 리스크 큼")
+    durable_keywords = ["수주", "계약", "정책", "공급", "실적", "투자", "인프라", "원전", "전력", "우주", "방산", "ai", "반도체"]
+    if any(keyword in news_text.lower() for keyword in durable_keywords):
+        material_score += 8
+        reasons.append("지속형 재료 포함")
+    if return_5d >= 18 and not pullback_rebound:
+        resilience_score -= 9
+        risk_flags.append("5일 급등 후 눌림 확인 부족")
+    if return_20d >= 40 and ma20_gap_pct >= 18:
+        quality_score -= 10
+        risk_flags.append("20일 상승/괴리 과다")
+    if gap_pct >= 5:
+        quality_score -= 8
+        risk_flags.append("갭상승 과열")
+    if range_pos >= 97 and not pullback_rebound:
+        resilience_score -= 6
+        risk_flags.append("단기 범위 최상단")
+    if risk >= MARKET_RISK_DOWNGRADE_THRESHOLD:
+        flow_persistence_score -= 8
+        risk_flags.append("기존 리스크 높음")
+
+    pattern_score = int(historical_pattern.get("score") or 0)
+    if pattern_score > 0:
+        reasons.append(historical_pattern.get("summary", "과거 유사 패턴 우호적"))
+    elif pattern_score < 0:
+        risk_flags.append(historical_pattern.get("summary", "과거 유사 패턴 고점형"))
+
+    quality_score = max(0, min(25, quality_score))
+    material_score = max(0, min(25, material_score))
+    flow_persistence_score = max(0, min(25, flow_persistence_score))
+    resilience_score = max(0, min(25, resilience_score))
+    historical_similarity_score = max(-15, min(15, pattern_score))
+    score = quality_score + material_score + flow_persistence_score + resilience_score + historical_similarity_score
+    score = max(0, min(100, int(score)))
+    has_balanced_strength = (
+        quality_score >= 10
+        and material_score >= 8
+        and flow_persistence_score >= 12
+        and resilience_score >= 10
+    )
+    if score >= 72 and has_balanced_strength:
+        label = "강한 추세 지속 가능"
+    elif score >= 58:
+        label = "추세 지속 관찰"
+    else:
+        label = "단기 과열 우선"
+
+    summary_parts = reasons[:3] if reasons else ["추가 상승 근거 약함"]
+    if risk_flags:
+        summary_parts.append("주의: " + ", ".join(risk_flags[:2]))
+    summary = " · ".join(summary_parts)
+    return {
+        "candidate": True,
+        "score": score,
+        "label": label,
+        "summary": summary,
+        "fail_fast": False,
+        "fail_fast_reason": "",
+        "quality_score": quality_score,
+        "material_score": material_score,
+        "flow_score": flow_persistence_score,
+        "resilience_score": resilience_score,
+        "pattern_score": pattern_score,
+        "pattern_summary": historical_pattern.get("summary", ""),
+    }
+
+
+def classify_entry_setup(change_pct, rsi_value, volume_ratio, return_5d, return_20d, ma20_gap_pct, reasons_text="", risks_text=""):
+    text = f"{reasons_text} {risks_text}".lower()
+    chase = (
+        change_pct >= 5
+        or return_5d >= 15
+        or return_20d >= 30
+        or rsi_value >= 72
+        or ma20_gap_pct >= 12
+        or (volume_ratio >= 3 and change_pct >= 3.5)
+        or "추격" in text
+        or "과열" in text
+    )
+    if chase:
+        return "추격위험/눌림대기", "이미 많이 올라 손익비가 나빠진 구간입니다."
+    if -5 <= change_pct <= 0.8 and rsi_value <= 62:
+        return "눌림목형", "조정 후 지지 확인 시 손익비가 개선되는 자리입니다."
+    if -2.5 <= change_pct <= 2.8 and 0.9 <= volume_ratio <= 2.4 and 38 <= rsi_value <= 66:
+        return "상승 초입형", "거래량이 붙기 시작했지만 아직 과열은 아닌 자리입니다."
+    if any(keyword in text for keyword in ["수주", "계약", "공급", "정책", "실적", "상장", "ipo"]):
+        return "이벤트 모멘텀형", "이벤트 재료가 가격에 반영되기 시작하는 구간입니다."
+    if any(keyword in text for keyword in ["수급", "조용", "후행", "저평가", "역발상"]):
+        return "저평가 모멘텀형", "아직 대중 관심은 낮지만 선행 신호를 확인하는 구간입니다."
+    return "관찰형", "추가 거래량과 가격 위치 확인이 필요합니다."
 
 
 def analyze_stock(name, ticker, market_context):
@@ -4981,6 +5383,9 @@ def analyze_stock(name, ticker, market_context):
     ma20 = float(close.rolling(20).mean().iloc[-1])
     ma60 = float(close.rolling(60).mean().iloc[-1])
     ma20_prev = float(close.rolling(20).mean().iloc[-2])
+    return_5d = ((price / float(close.iloc[-6])) - 1) * 100 if len(close) >= 6 and float(close.iloc[-6]) else 0
+    return_20d = ((price / float(close.iloc[-21])) - 1) * 100 if len(close) >= 21 and float(close.iloc[-21]) else 0
+    ma20_gap_pct = ((price / ma20) - 1) * 100 if ma20 else 0
     avg_volume = float(volume.rolling(20).mean().iloc[-1])
     volume_ratio = float(volume.iloc[-1] / avg_volume) if avg_volume else 0
     trade_value = float(price * volume.iloc[-1])
@@ -5041,6 +5446,27 @@ def analyze_stock(name, ticker, market_context):
     if rsi_value >= EXTREME_OVERHEAT_RSI:
         risk += 10
         risks.append("RSI 극단 과열")
+    elif rsi_value >= 72:
+        risk += 8
+        risks.append("RSI 70 이상 과열권")
+    if return_5d >= 15:
+        risk += 16
+        risks.append(f"최근 5일 급등({return_5d:.1f}%)")
+    elif return_5d >= 10:
+        risk += 9
+        risks.append(f"최근 5일 상승 과다({return_5d:.1f}%)")
+    if return_20d >= 30:
+        risk += 16
+        risks.append(f"최근 20일 급등({return_20d:.1f}%)")
+    elif return_20d >= 20:
+        risk += 9
+        risks.append(f"최근 20일 상승 과다({return_20d:.1f}%)")
+    if ma20_gap_pct >= 18:
+        risk += 14
+        risks.append(f"20일선 괴리 과다({ma20_gap_pct:.1f}%)")
+    elif ma20_gap_pct >= 12:
+        risk += 8
+        risks.append(f"20일선 괴리 확대({ma20_gap_pct:.1f}%)")
     if macd_bullish:
         technical_score += 10
         reasons.append("MACD 상승")
@@ -5128,6 +5554,47 @@ def analyze_stock(name, ticker, market_context):
         reasons.append("SpaceX 상장 감지 · IPO 초기 분석 대상")
         risks.append("IPO 초기 변동성/유통주식수/락업 리스크 확인 필요")
 
+    historical_pattern = build_historical_continuation_context(close, volume)
+    additional_upside = build_additional_upside_context(
+        return_5d,
+        return_20d,
+        rsi_value,
+        change_pct,
+        gap_pct,
+        range_pos,
+        ma20_gap_pct,
+        trend_up,
+        pullback_rebound,
+        volume_ratio,
+        trade_value_ratio,
+        volume_burst,
+        liquidity_confirmed,
+        supply_concentration,
+        macd_bullish,
+        price,
+        ma5,
+        ma20,
+        ma20_prev,
+        news,
+        flow,
+        sector,
+        risk,
+        historical_pattern,
+    )
+    additional_upside_strong = (
+        additional_upside["candidate"]
+        and not additional_upside.get("fail_fast")
+        and additional_upside["score"] >= 72
+        and additional_upside.get("quality_score", 0) >= 10
+        and additional_upside.get("material_score", 0) >= 8
+        and additional_upside.get("flow_score", 0) >= 12
+        and additional_upside.get("resilience_score", 0) >= 10
+    )
+    if additional_upside_strong:
+        reasons.append(f"추가 상승 잠재력: {additional_upside['summary']}")
+    elif additional_upside["candidate"] and additional_upside["score"] >= 58:
+        reasons.append(f"추세 지속 관찰: {additional_upside['summary']}")
+
     raw_score = technical_score + volume_score + flow_score + news_score + market_score
     if not liquidity_confirmed:
         risks.append(
@@ -5145,6 +5612,8 @@ def analyze_stock(name, ticker, market_context):
         supply_concentration,
         market_mode,
         liquidity_confirmed,
+        additional_upside["score"],
+        additional_upside_strong,
     )
 
     label = "보류"
@@ -5181,7 +5650,25 @@ def analyze_stock(name, ticker, market_context):
         name=name,
         ticker=ticker,
         sector=sector,
+        return_5d=return_5d,
+        return_20d=return_20d,
+        ma20_gap_pct=ma20_gap_pct,
+        additional_upside_score=additional_upside["score"],
+        additional_upside_candidate=additional_upside_strong,
     )
+    recommendation_type, entry_quality_note = classify_entry_setup(
+        change_pct,
+        rsi_value,
+        volume_ratio,
+        return_5d,
+        return_20d,
+        ma20_gap_pct,
+        ", ".join(reasons),
+        ", ".join(risks),
+    )
+    if additional_upside_strong and risk < MARKET_RISK_BLOCK_THRESHOLD:
+        recommendation_type = "강한 추세 지속 후보"
+        entry_quality_note = f"이미 오른 구간이지만 {additional_upside['summary']}"
 
     return {
         "name": name,
@@ -5225,6 +5712,22 @@ def analyze_stock(name, ticker, market_context):
         "ai_label": ai_label,
         "ai_score": ai_score,
         "ai_reason": ai_reason,
+        "recommendation_type": recommendation_type,
+        "entry_quality_note": entry_quality_note,
+        "additional_upside_candidate": additional_upside["candidate"],
+        "additional_upside_score": additional_upside["score"],
+        "additional_upside_label": additional_upside["label"],
+        "additional_upside_summary": additional_upside["summary"],
+        "additional_upside_fail_fast": additional_upside.get("fail_fast", False),
+        "additional_upside_fail_fast_reason": additional_upside.get("fail_fast_reason", ""),
+        "additional_upside_quality_score": additional_upside.get("quality_score", 0),
+        "additional_upside_material_score": additional_upside.get("material_score", 0),
+        "additional_upside_flow_score": additional_upside.get("flow_score", 0),
+        "additional_upside_resilience_score": additional_upside.get("resilience_score", 0),
+        "additional_upside_pattern_score": additional_upside["pattern_score"],
+        "additional_upside_pattern_summary": additional_upside["pattern_summary"],
+        "chase_risk_note": "있음" if chase_risk else "낮음",
+        "watch_point": "20일선 지지, 전고점 돌파, 거래량 유지 여부 확인",
         "sector": sector,
         "label": label,
         "action": action,
@@ -5255,6 +5758,9 @@ def analyze_stock(name, ticker, market_context):
         "gap_pct": round(gap_pct, 2),
         "volume_ratio": round(volume_ratio, 2),
         "trade_value_ratio": round(trade_value_ratio, 2),
+        "return_5d_pct": round(return_5d, 2),
+        "return_20d_pct": round(return_20d, 2),
+        "ma20_gap_pct": round(ma20_gap_pct, 2),
         "liquidity_confirmed": liquidity_confirmed,
         "trade_value": int(trade_value),
         "rsi": round(rsi_value, 1),
@@ -5766,6 +6272,10 @@ def main():
 
     results, sector_context = apply_sector_context(results)
     rows = sorted(results, key=lambda item: item.get("score", 0), reverse=True)
+    block_write, block_reason = should_block_result_overwrite(rows, len(stock_items))
+    if block_write:
+        print(f"결과 저장 차단: {block_reason}. 기존 결과 파일 유지.", flush=True)
+        return
     pd.DataFrame(rows).to_csv(RESULT_FILE, index=False, encoding="utf-8-sig")
     secure_file_permissions(RESULT_FILE)
 

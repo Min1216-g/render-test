@@ -399,8 +399,9 @@ def _scanner_cooldown_payload(status: Dict[str, object]) -> Optional[Dict[str, o
     }
 
 
-def _run_scanner_background() -> None:
+def _run_scanner_background(mode: str = "quick") -> None:
     global _scanner_running, _scanner_last_seen_mtime
+    scan_mode = "full" if mode == "full" else "quick"
     try:
         _log_memory("scanner-start")
         _cleanup_runtime_storage()
@@ -411,9 +412,10 @@ def _run_scanner_background() -> None:
         _write_scanner_status(
             running=True,
             state="running",
-            message="스캐너 실행 시작 · 캐시 초기화 완료... 8%",
+            message=f"{'전체' if scan_mode == 'full' else '빠른'} 스캐너 실행 시작 · 캐시 초기화 완료... 8%",
             progress=8,
             started_at=started_at,
+            mode=scan_mode,
         )
         if not ENABLE_FULL_SCANNER:
             _write_scanner_status(
@@ -434,13 +436,25 @@ def _run_scanner_background() -> None:
         scanner_env.setdefault("MARKET_SCANNER_ENABLE_INTRADAY_1M", SCANNER_ENABLE_INTRADAY_1M)
         scanner_env.setdefault("MARKET_SCANNER_CACHE_RETENTION_DAYS", "1")
         scanner_env.setdefault("MOBILE_INTEL_MAX_NEWS_OBSERVATIONS", "1200")
+        scanner_env["MOBILE_SCAN_FAST_MODE"] = "false" if scan_mode == "full" else "true"
+        if scan_mode == "quick":
+            scanner_env["MARKET_SCANNER_ENABLE_INTRADAY_1M"] = "false"
+            scanner_env["MARKET_SCANNER_NEWS_SOURCES"] = "google_news"
+            scanner_env["MARKET_SCANNER_ENABLE_SECTOR_NEWS"] = "false"
+            scanner_env["MOBILE_INTEL_INCREMENTAL"] = "true"
+            scanner_env["MOBILE_INTEL_MAX_NEWS_OBSERVATIONS"] = "500"
+        else:
+            scanner_env["MARKET_SCANNER_NEWS_SOURCES"] = "company_risk_news,google_news,naver_news"
+            scanner_env["MARKET_SCANNER_ENABLE_SECTOR_NEWS"] = "true"
+            scanner_env["MOBILE_INTEL_INCREMENTAL"] = "false"
 
         _write_scanner_status(
             running=True,
             state="running",
-            message="AI 분석/뉴스 수집 실행중... 25%",
+            message=f"{'전체' if scan_mode == 'full' else '빠른'} 스캔 · AI 분석/뉴스 수집 실행중... 25%",
             progress=25,
             started_at=started_at,
+            mode=scan_mode,
         )
         stdout = ""
         stderr = ""
@@ -481,6 +495,7 @@ def _run_scanner_background() -> None:
                             message=f"부분 데이터 반영됨 · {snapshot['ok_rows']}/{snapshot['rows']} 정상 · 모바일 재조회 가능",
                             progress=max(35, int(current_status.get("progress") or 35)),
                             started_at=started_at,
+                            mode=scan_mode,
                             **snapshot,
                         )
                         last_heartbeat = now
@@ -490,9 +505,10 @@ def _run_scanner_background() -> None:
                     _write_scanner_status(
                         running=True,
                         state="running",
-                        message=f"AI 분석/뉴스 수집 실행중... {progress}%",
+                        message=f"{'전체' if scan_mode == 'full' else '빠른'} 스캔 실행중... {progress}%",
                         progress=progress,
                         started_at=started_at,
+                        mode=scan_mode,
                         **snapshot,
                     )
                     last_heartbeat = now
@@ -530,6 +546,7 @@ def _run_scanner_background() -> None:
                 message="모바일 데이터 보강중... 82%",
                 progress=82,
                 started_at=started_at,
+                mode=scan_mode,
             )
             enrich = subprocess.run(
                 [sys.executable, str(MOBILE_INTEL_SCRIPT)],
@@ -557,18 +574,22 @@ def _run_scanner_background() -> None:
             message="최신 CSV 반영중... 95%",
             progress=95,
             started_at=started_at,
+            mode=scan_mode,
         )
         _invalidate_results_cache()
         rows = _read_rows()
         ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
+        duration_seconds = round(time.time() - started_at, 2)
         _log_memory("scanner-completed", rows=len(rows), ok_rows=ok_rows)
         _write_scanner_status(
             running=False,
             state="completed",
-            message=f"스캐너 완료 · {ok_rows}/{len(rows)} 정상",
+            message=f"스캐너 완료 · {ok_rows}/{len(rows)} 정상 · {duration_seconds}s",
             rows=len(rows),
             ok_rows=ok_rows,
-            mode="full",
+            mode=scan_mode,
+            duration_seconds=duration_seconds,
+            performance_report="mobile_scan_performance_report.json",
             output=(stdout + "\n" + stderr)[-4000:],
             progress=100,
             completed_at=time.time(),
@@ -762,9 +783,10 @@ async def quick_refresh(request: Request) -> Dict[str, object]:
 
 
 @app.post("/api/scanner/run")
-async def scanner_run(request: Request) -> Dict[str, object]:
+async def scanner_run(request: Request, mode: str = Query(default="quick")) -> Dict[str, object]:
     global _scanner_running
     await guarded(request)
+    scan_mode = "full" if mode.lower().strip() == "full" else "quick"
     with _scanner_lock:
         if _scanner_running:
             return {
@@ -776,7 +798,7 @@ async def scanner_run(request: Request) -> Dict[str, object]:
                 "updated_at": _now_iso(),
             }
         current_status = _read_scanner_status()
-        cooldown_payload = _scanner_cooldown_payload(current_status)
+        cooldown_payload = None if scan_mode == "full" else _scanner_cooldown_payload(current_status)
         if cooldown_payload:
             _invalidate_results_cache()
             return cooldown_payload
@@ -786,18 +808,20 @@ async def scanner_run(request: Request) -> Dict[str, object]:
         _write_scanner_status(
             running=True,
             state="queued",
-            message="빠른 데이터 반영 완료 · 백그라운드 스캐너 대기... 5%",
+            message=f"{'전체' if scan_mode == 'full' else '빠른'} 스캔 대기... 5%",
             progress=5,
             started_at=time.time(),
+            mode=scan_mode,
             **quick_snapshot,
         )
-        thread = threading.Thread(target=_run_scanner_background, daemon=True)
+        thread = threading.Thread(target=_run_scanner_background, args=(scan_mode,), daemon=True)
         thread.start()
     return {
         "ok": True,
         "started": True,
         "running": True,
-        "message": "스캐너 백그라운드 실행 시작",
+        "message": f"{'전체' if scan_mode == 'full' else '빠른'} 스캐너 백그라운드 실행 시작",
+        "mode": scan_mode,
         "status": _read_scanner_status(),
         "updated_at": _now_iso(),
     }
