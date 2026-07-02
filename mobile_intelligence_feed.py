@@ -45,6 +45,9 @@ ENABLE_INCREMENTAL = os.getenv("MOBILE_INTEL_INCREMENTAL", "true").lower() not i
 MOBILE_FIELDS = [
     "mobile_intel_generated_at",
     "mobile_today_score",
+    "mobile_home_pick_eligible",
+    "mobile_home_pick_rank_score",
+    "mobile_home_pick_reason",
     "mobile_contrarian_signal",
     "mobile_ai_explain",
     "mobile_lead_signal",
@@ -197,6 +200,41 @@ def number(value, default: float = 0.0) -> float:
 
 def text(row: pd.Series, key: str) -> str:
     return str(row.get(key, "") or "").strip()
+
+
+def is_recommendation_blocked(row: pd.Series) -> bool:
+    """Authoritative mobile gate for rows that must not appear as top AI picks."""
+    action = text(row, "action")
+    label = text(row, "label")
+    ai_label = text(row, "ai_label")
+    rec_type = text(row, "recommendation_type")
+    risks = text(row, "risks")
+    news_blob = " ".join(
+        part
+        for part in [
+            text(row, "news"),
+            text(row, "news_one_line"),
+            text(row, "headlines"),
+            risks,
+        ]
+        if part
+    )
+    score = number(row.get("score"))
+    ai_score = number(row.get("ai_score"))
+    risk = number(row.get("risk"))
+    impact = number(row.get("mobile_news_impact_score"))
+    blocked_words = ["제외", "보류", "관망", "추격위험", "중대 악재", "상장폐지", "횡령", "배임"]
+    if contains_any(" ".join([action, label, ai_label, rec_type, risks]), blocked_words):
+        return True
+    if contains_any(news_blob, ["중대 악재", "상장폐지", "횡령", "배임", "감자", "거래정지"]):
+        return True
+    if risk >= 50:
+        return True
+    if score < 45 and ai_score < 65:
+        return True
+    if impact < 0 and contains_any(news_blob, ["악재", "쇼크", "소송", "적자", "누락"]):
+        return True
+    return False
 
 
 def parse_news_datetime(value: str) -> datetime | None:
@@ -488,7 +526,59 @@ def today_score(row: pd.Series, sector_context: dict[str, dict[str, object]]) ->
     elif contrarian < 0:
         score += max(-15, contrarian * 0.7)
     score -= min(risk, 55) * 0.22
-    return int(max(0, min(99, round(score))))
+    final_score = int(max(0, min(99, round(score))))
+    if is_recommendation_blocked(row):
+        if contains_any(" ".join([text(row, "action"), text(row, "label"), text(row, "ai_label")]), ["제외", "보류", "관망"]):
+            return min(final_score, 39)
+        return min(final_score, 49)
+    return final_score
+
+
+def home_pick_profile(row: pd.Series, mobile_score: int, sector_signal: str, news_text: str) -> dict[str, object]:
+    blocked = is_recommendation_blocked(row)
+    ai_score = max(number(row.get("ai_score")), number(row.get("score")))
+    volume = number(row.get("volume_ratio"), 1)
+    risk = number(row.get("risk"))
+    additional = number(row.get("additional_upside_score"))
+    rank_score = mobile_score + min(volume, 6) * 2 + additional * 0.12
+    if text(row, "action").find("매수") >= 0:
+        rank_score += 8
+    if text(row, "ai_label").find("추천") >= 0:
+        rank_score += 8
+    if text(row, "ai_label").find("관심") >= 0:
+        rank_score += 4
+    rank_score -= min(risk, 60) * 0.18
+
+    eligible = (not blocked) and (
+        text(row, "action").find("매수") >= 0
+        or text(row, "ai_label").find("추천") >= 0 and ai_score >= 72
+        or text(row, "ai_label").find("관심") >= 0 and ai_score >= 65
+        or additional >= 72 and contains_any(text(row, "additional_upside_label"), ["강한", "추세"])
+        or mobile_score >= 72 and ai_score >= 58
+    )
+
+    reasons: list[str] = []
+    if blocked:
+        reasons.append("제외/보류/관망/추격위험 조건으로 홈 추천 차단")
+    else:
+        if text(row, "action").find("매수") >= 0:
+            reasons.append("매수 후보")
+        if text(row, "ai_label").find("추천") >= 0 or text(row, "ai_label").find("관심") >= 0:
+            reasons.append(text(row, "ai_label"))
+        if volume >= 1.8:
+            reasons.append(f"거래량 {volume:.1f}배")
+        if additional >= 72:
+            reasons.append(f"추가상승 {additional:.0f}")
+        if news_text:
+            reasons.append(news_text[:70])
+        if not reasons:
+            reasons.append(sector_signal[:70] or "추천 근거 약함")
+
+    return {
+        "eligible": "true" if eligible else "false",
+        "rank_score": int(max(0, min(99, round(rank_score)))),
+        "reason": " · ".join(reasons[:4]),
+    }
 
 
 def contrarian_signal_text(row: pd.Series) -> str:
@@ -886,6 +976,10 @@ def enrich() -> int:
 
         row["mobile_intel_generated_at"] = generated_at
         row["mobile_today_score"] = score
+        home_pick = home_pick_profile(row, score, sector_signal, news_text)
+        row["mobile_home_pick_eligible"] = home_pick["eligible"]
+        row["mobile_home_pick_rank_score"] = home_pick["rank_score"]
+        row["mobile_home_pick_reason"] = home_pick["reason"]
         contrarian_text = contrarian_signal_text(row)
         row["mobile_contrarian_signal"] = contrarian_text
         row["mobile_ai_explain"] = " · ".join(
