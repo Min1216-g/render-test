@@ -337,6 +337,13 @@ def _merge_bug_reports(
     return reports, changed
 
 
+def _paper_device_id(request: Request) -> str:
+    raw = str(request.headers.get("X-Paper-Device-ID") or request.query_params.get("device_id") or "").strip()
+    if not raw:
+        return ""
+    return "".join(ch for ch in raw if ch.isalnum() or ch in {"-", "_"})[:80]
+
+
 def _file_mtime_iso(path: Path) -> str:
     if not path.exists():
         return ""
@@ -1381,7 +1388,7 @@ async def paper_trading_account(request: Request) -> Dict[str, object]:
     await guarded(request)
     from korean_ai_screening_simulator import paper_account_summary
 
-    return paper_account_summary()
+    return paper_account_summary(account_id=_paper_device_id(request))
 
 
 @app.post("/api/paper-trading/deposit")
@@ -1391,11 +1398,12 @@ async def paper_trading_deposit(request: Request) -> Dict[str, object]:
 
     payload = await _read_json_payload(request)
     amount = float(payload.get("amount", 0)) if isinstance(payload, dict) else 0.0
+    account_id = _paper_device_id(request)
     try:
-        deposit_paper_cash(amount)
+        deposit_paper_cash(amount, account_id=account_id)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return paper_account_summary()
+    return paper_account_summary(account_id=account_id)
 
 
 @app.post("/api/paper-trading/simulate")
@@ -1404,6 +1412,7 @@ async def paper_trading_simulate(request: Request) -> Dict[str, object]:
     from korean_ai_screening_simulator import paper_account_summary, simulate_paper_trade
 
     payload = await _read_json_payload(request)
+    account_id = _paper_device_id(request)
     ticker = str(payload.get("ticker", "")).strip()
     try:
         validate_ticker(ticker)
@@ -1419,10 +1428,11 @@ async def paper_trading_simulate(request: Request) -> Dict[str, object]:
             price=float(payload.get("price", 0)),
             side=side,
             cash_amount=float(payload.get("cash_amount", 0) or 0),
+            account_id=account_id,
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    return paper_account_summary()
+    return paper_account_summary(account_id=account_id)
 
 
 @app.get("/api/watchdog")

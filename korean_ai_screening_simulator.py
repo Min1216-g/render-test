@@ -478,59 +478,69 @@ def summarize_trades(trades: List[Dict[str, object]]) -> Dict[str, object]:
     }
 
 
-def load_paper_account() -> Dict[str, object]:
-    if not PAPER_ACCOUNT_FILE.exists():
+def paper_account_file(account_id: str = "") -> Path:
+    clean = "".join(ch for ch in str(account_id or "") if ch.isalnum() or ch in {"-", "_"}).strip("-_")
+    if not clean:
+        return PAPER_ACCOUNT_FILE
+    return BASE_DIR / f"paper_trading_account.{clean[:80]}.json"
+
+
+def load_paper_account(account_id: str = "") -> Dict[str, object]:
+    account_file = paper_account_file(account_id)
+    if not account_file.exists():
         account = {"cash": 0.0, "positions": {}, "trades": [], "created_at": utc_now_iso(), "safety_notice": SAFETY_NOTICE}
-        save_paper_account(account)
+        save_paper_account(account, account_id=account_id)
         return account
     try:
-        return json.loads(PAPER_ACCOUNT_FILE.read_text(encoding="utf-8"))
+        return json.loads(account_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return {"cash": 0.0, "positions": {}, "trades": [], "created_at": utc_now_iso(), "safety_notice": SAFETY_NOTICE}
 
 
-def save_paper_account(account: Dict[str, object]) -> Dict[str, object]:
+def save_paper_account(account: Dict[str, object], account_id: str = "") -> Dict[str, object]:
     account["updated_at"] = utc_now_iso()
     account["safety_notice"] = SAFETY_NOTICE
-    PAPER_ACCOUNT_FILE.write_text(json.dumps(account, ensure_ascii=False, indent=2), encoding="utf-8")
+    paper_account_file(account_id).write_text(json.dumps(account, ensure_ascii=False, indent=2), encoding="utf-8")
     return account
 
 
-def deposit_paper_cash(amount: float) -> Dict[str, object]:
-    account = load_paper_account()
+def deposit_paper_cash(amount: float, account_id: str = "") -> Dict[str, object]:
+    account = load_paper_account(account_id=account_id)
     if amount <= 0:
         raise ValueError("입금액은 0보다 커야 합니다.")
     account["cash"] = as_float(account.get("cash")) + amount
     account.setdefault("trades", []).append({"at": utc_now_iso(), "type": "deposit", "amount": amount})
-    log_event("paper_deposit", amount=amount)
-    return save_paper_account(account)
+    log_event("paper_deposit", amount=amount, account_id=account_id or "default")
+    return save_paper_account(account, account_id=account_id)
 
 
-def simulate_paper_trade(ticker: str, quantity: float, price: float, side: str) -> Dict[str, object]:
+def simulate_paper_trade(ticker: str, quantity: float, price: float, side: str, cash_amount: float = 0.0, account_id: str = "") -> Dict[str, object]:
     if side not in {"buy", "sell"}:
         raise ValueError("side는 buy 또는 sell 이어야 합니다.")
     if quantity <= 0 or price <= 0:
         raise ValueError("수량과 가격은 0보다 커야 합니다.")
-    account = load_paper_account()
+    account = load_paper_account(account_id=account_id)
     positions = account.setdefault("positions", {})
     trades = account.setdefault("trades", [])
     cash = as_float(account.get("cash"))
     position = positions.get(ticker, {"quantity": 0.0, "avg_price": 0.0})
     current_qty = as_float(position.get("quantity"))
     avg_price = as_float(position.get("avg_price"))
+    trade_value = quantity * price
+    cash_value = cash_amount if cash_amount > 0 else trade_value
 
     if side == "buy":
-        cost = quantity * price
+        cost = cash_value
         if cash < cost:
             raise ValueError("모의 현금이 부족합니다.")
         new_qty = current_qty + quantity
-        new_avg = ((current_qty * avg_price) + cost) / new_qty
+        new_avg = ((current_qty * avg_price) + trade_value) / new_qty
         account["cash"] = cash - cost
         positions[ticker] = {"quantity": new_qty, "avg_price": new_avg}
     else:
         if current_qty < quantity:
             raise ValueError("모의 보유 수량이 부족합니다.")
-        proceeds = quantity * price
+        proceeds = cash_value
         remain_qty = current_qty - quantity
         account["cash"] = cash + proceeds
         if remain_qty <= 0:
@@ -538,15 +548,24 @@ def simulate_paper_trade(ticker: str, quantity: float, price: float, side: str) 
         else:
             positions[ticker] = {"quantity": remain_qty, "avg_price": avg_price}
 
-    trades.append({"at": utc_now_iso(), "type": f"paper_{side}", "ticker": ticker, "quantity": quantity, "price": price})
-    log_event("paper_trade", side=side, ticker=ticker, quantity=quantity)
-    return save_paper_account(account)
+    trades.append({
+        "at": utc_now_iso(),
+        "type": f"paper_{side}",
+        "ticker": ticker,
+        "quantity": quantity,
+        "price": price,
+        "amount": trade_value,
+        "cash_amount": cash_value,
+    })
+    log_event("paper_trade", side=side, ticker=ticker, quantity=quantity, account_id=account_id or "default")
+    return save_paper_account(account, account_id=account_id)
 
 
-def paper_account_summary() -> Dict[str, object]:
-    account = load_paper_account()
+def paper_account_summary(account_id: str = "") -> Dict[str, object]:
+    account = load_paper_account(account_id=account_id)
     rows = {row.get("ticker"): row for row in read_market_rows()}
     positions = account.get("positions") or {}
+    trades = account.get("trades") or []
     details = []
     total_value = as_float(account.get("cash"))
     for ticker, position in positions.items():
@@ -567,12 +586,29 @@ def paper_account_summary() -> Dict[str, object]:
             "profit_loss": round(pnl, 2),
             "profit_loss_pct": round((current / avg - 1) * 100, 2) if avg else 0,
         })
+    enriched_trades = []
+    for trade in trades[-100:]:
+        ticker = str(trade.get("ticker", "") or "")
+        row = rows.get(ticker, {})
+        quantity = as_float(trade.get("quantity"))
+        price = as_float(trade.get("price"))
+        amount = as_float(trade.get("amount"), quantity * price)
+        enriched_trades.append({
+            "at": trade.get("at", ""),
+            "type": trade.get("type", ""),
+            "ticker": ticker,
+            "name": row.get("name", ticker) if ticker else "현금",
+            "quantity": quantity,
+            "price": price,
+            "amount": round(amount, 2),
+        })
     return {
         "ok": True,
         "cash": round(as_float(account.get("cash")), 2),
         "total_value": round(total_value, 2),
         "positions": details,
-        "trade_count": len(account.get("trades") or []),
+        "trades": enriched_trades,
+        "trade_count": len(trades),
         "updated_at": account.get("updated_at"),
         "safety_notice": SAFETY_NOTICE,
     }
