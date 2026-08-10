@@ -1,7 +1,9 @@
 import os
+import re
 import stat
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 
 import pandas as pd
 
@@ -23,6 +25,15 @@ DATE_COLUMNS = [
 ]
 TOKEN_PATTERN = r"^\d{8,12}:[A-Za-z0-9_-]{25,}$"
 CHAT_ID_PATTERN = r"^\d{6,20}$"
+SECRET_VALUE_PATTERNS = [
+    re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{25,}\b"),
+    re.compile(r"\bsk-[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"\bAIza[A-Za-z0-9_-]{20,}\b"),
+    re.compile(r"(?i)(bearer\s+)([A-Za-z0-9._~+/=-]{16,})"),
+    re.compile(r"(?i)\b([A-Za-z0-9_]*(?:token|secret|api[_-]?key|password|passwd)[A-Za-z0-9_]*\s*[=:]\s*)([^\s\"']{8,})"),
+]
+SAFE_TICKER_PATTERN = re.compile(r"^[A-Za-z0-9._-]{1,24}$")
+SAFE_SEARCH_PATTERN = re.compile(r"^[0-9A-Za-z가-힣ㄱ-ㅎㅏ-ㅣ .,_+:/()%&-]{0,80}$")
 
 
 def load_env_file(path):
@@ -55,7 +66,50 @@ def sanitize_secret(text, *secrets):
     for secret in secrets:
         if secret:
             sanitized = sanitized.replace(str(secret), mask_secret(secret))
+    for pattern in SECRET_VALUE_PATTERNS:
+        def repl(match):
+            if pattern.pattern.startswith("(?i)(bearer"):
+                return match.group(1) + mask_secret(match.group(2))
+            if "(?:token|secret|api" in pattern.pattern:
+                return match.group(1) + mask_secret(match.group(2))
+            return mask_secret(match.group(0))
+
+        sanitized = pattern.sub(repl, sanitized)
     return sanitized
+
+
+def enforce_https_url(url, *, allow_localhost=True):
+    parsed = urlparse(str(url))
+    if parsed.scheme != "https":
+        host = (parsed.hostname or "").lower()
+        if allow_localhost and host in {"localhost", "127.0.0.1", "::1"}:
+            return str(url)
+        raise ValueError("HTTPS URL만 허용됩니다.")
+    return str(url)
+
+
+def validate_ticker(value):
+    value = str(value or "").strip().upper()
+    if not SAFE_TICKER_PATTERN.match(value):
+        raise ValueError("허용되지 않는 티커 형식입니다.")
+    return value
+
+
+def validate_search_text(value, *, max_length=80):
+    value = str(value or "").strip()
+    if len(value) > max_length:
+        raise ValueError("검색어가 너무 깁니다.")
+    if not SAFE_SEARCH_PATTERN.match(value):
+        raise ValueError("검색어에 허용되지 않는 문자가 포함되어 있습니다.")
+    return value
+
+
+def safe_child_path(base_dir, candidate):
+    base = Path(base_dir).resolve()
+    path = (base / str(candidate)).resolve()
+    if base != path and base not in path.parents:
+        raise ValueError("허용된 폴더 밖의 경로 접근은 차단됩니다.")
+    return path
 
 
 def secure_file_permissions(path, mode=SECURE_FILE_MODE):

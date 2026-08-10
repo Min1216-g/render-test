@@ -7,6 +7,7 @@ import csv
 import gc
 import json
 import os
+import re
 import resource
 import shutil
 import secrets
@@ -24,6 +25,19 @@ from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
+from ops_guard import sanitize_secret, validate_search_text, validate_ticker
+from canada_market_guard import (
+    CANADA_MARKET_LABEL,
+    MIN_CANADA_ROWS_FOR_APP_SYNC,
+    canada_count,
+    is_canada_row,
+    market_counts,
+    merge_existing_canada_rows,
+    normalized_market,
+    serialize_csv_rows,
+)
+from stock_universe_guard import validate_no_stock_loss
+
 
 BASE_DIR = Path(__file__).resolve().parent
 RESULT_FILE = Path(os.getenv("MARKET_RESULTS_FILE", BASE_DIR / "market_scanner_results.csv"))
@@ -31,16 +45,21 @@ IOS_RESULT_FILE = BASE_DIR / "MarketScannerIOS" / "MarketScannerIOS" / "market_s
 REFRESH_SCRIPT = BASE_DIR / os.getenv("MARKET_SCANNER_REFRESH_SCRIPT", "render_mobile_refresh.py")
 MOBILE_INTEL_SCRIPT = BASE_DIR / "mobile_intelligence_feed.py"
 SCANNER_STATUS_FILE = BASE_DIR / "scanner_run_status.json"
+BUG_REPORTS_FILE = BASE_DIR / os.getenv("MARKET_BUG_REPORTS_FILE", "bug_reports.json")
 API_TOKEN = os.getenv("MARKET_API_TOKEN", "")
+ADMIN_TOKEN = os.getenv("MARKET_ADMIN_TOKEN", "")
 ALLOW_UNAUTH_HEALTH = os.getenv("MARKET_ALLOW_UNAUTH_HEALTH", "true").lower() == "true"
+FORCE_HTTPS = os.getenv("MARKET_FORCE_HTTPS", "true" if os.getenv("RENDER") else "false").lower() == "true"
 RATE_LIMIT_PER_MINUTE = int(os.getenv("MARKET_RATE_LIMIT_PER_MINUTE", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("MARKET_RESULTS_CACHE_TTL", "20"))
+RESULTS_CACHE_MAX_ROWS = int(os.getenv("MARKET_RESULTS_CACHE_MAX_ROWS", "1200"))
 SCANNER_RUN_COOLDOWN_SECONDS = int(os.getenv("MARKET_SCANNER_RUN_COOLDOWN_SECONDS", "3600"))
 ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "true").lower() == "true"
-SCANNER_DEFAULT_MAX_WORKERS = os.getenv("MARKET_RENDER_SCANNER_MAX_WORKERS", "4")
-SCANNER_DEFAULT_MAX_STOCKS = os.getenv("MARKET_RENDER_SCANNER_MAX_STOCKS", "550")
+SCANNER_DEFAULT_MAX_WORKERS = os.getenv("MARKET_RENDER_SCANNER_MAX_WORKERS", "2" if os.getenv("RENDER") else "4")
+SCANNER_DEFAULT_MAX_STOCKS = os.getenv("MARKET_RENDER_SCANNER_MAX_STOCKS", "420" if os.getenv("RENDER") else "550")
 SCANNER_ENABLE_INTRADAY_1M = os.getenv("MARKET_RENDER_ENABLE_INTRADAY_1M", "false")
 MAX_UPLOAD_BYTES = int(os.getenv("MARKET_RESULTS_UPLOAD_MAX_BYTES", "6000000"))
+MAX_JSON_BYTES = int(os.getenv("MARKET_JSON_MAX_BYTES", "200000"))
 MIN_UPLOAD_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_ROWS", "500"))
 MIN_UPLOAD_OK_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_OK_ROWS", "50"))
 RUNTIME_CLEANUP_MAX_AGE_HOURS = int(os.getenv("MARKET_RUNTIME_CLEANUP_MAX_AGE_HOURS", "24"))
@@ -59,6 +78,9 @@ app.add_middleware(
     allow_headers=["X-Market-Token", "X-API-Token", "Authorization", "Content-Type"],
 )
 
+SAFE_MODE_PATTERN = re.compile(r"^(quick|full)$", re.IGNORECASE)
+SAFE_PERIOD_PATTERN = re.compile(r"^(3mo|6mo|1y|3y|5y)$", re.IGNORECASE)
+
 
 @app.on_event("startup")
 def startup_cleanup() -> None:
@@ -66,9 +88,41 @@ def startup_cleanup() -> None:
 
 
 @app.middleware("http")
-async def no_store_api_cache(request: Request, call_next):
+async def security_and_no_store_headers(request: Request, call_next):
     started = time.time()
+    if FORCE_HTTPS:
+        proto = request.headers.get("x-forwarded-proto", request.url.scheme).split(",", 1)[0].strip().lower()
+        host = (request.url.hostname or "").lower()
+        if proto != "https" and host not in {"localhost", "127.0.0.1", "::1"}:
+            return JSONResponse(
+                status_code=403,
+                content={"ok": False, "error": "HTTPS required", "updated_at": _now_iso()},
+                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+            )
+
+    content_length = request.headers.get("content-length")
+    if content_length:
+        try:
+            if int(content_length) > max(MAX_UPLOAD_BYTES, MAX_JSON_BYTES):
+                return JSONResponse(
+                    status_code=413,
+                    content={"ok": False, "error": "request too large", "updated_at": _now_iso()},
+                    headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+                )
+        except ValueError:
+            return JSONResponse(
+                status_code=400,
+                content={"ok": False, "error": "invalid content length", "updated_at": _now_iso()},
+                headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+            )
+
     response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "no-referrer"
+    response.headers["Permissions-Policy"] = "geolocation=(), microphone=(), camera=()"
+    if FORCE_HTTPS:
+        response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
     if request.url.path.startswith("/api/"):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
@@ -90,9 +144,17 @@ _cache_file_path = ""
 _scanner_lock = threading.Lock()
 _scanner_running = False
 _scanner_last_seen_mtime = 0.0
+_bug_reports_lock = threading.Lock()
 
 
 def _memory_rss_mb() -> float:
+    statm = Path("/proc/self/statm")
+    if statm.exists():
+        try:
+            pages = int(statm.read_text(encoding="utf-8").split()[1])
+            return round(pages * os.sysconf("SC_PAGE_SIZE") / 1024 / 1024, 2)
+        except Exception:
+            pass
     usage = resource.getrusage(resource.RUSAGE_SELF)
     rss = float(usage.ru_maxrss)
     if sys.platform == "darwin":
@@ -116,16 +178,46 @@ def _invalidate_results_cache() -> None:
     gc.collect()
 
 
+def _iter_public_rows(path: Optional[Path] = None) -> Iterable[Dict[str, str]]:
+    path = path or _result_path()
+    if not path.exists():
+        return
+    with path.open("r", encoding="utf-8-sig", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            yield _public_row(row)
+
+
 def _current_result_snapshot() -> Dict[str, object]:
     path = _result_path()
     if not path.exists():
-        return {"rows": 0, "ok_rows": 0, "file_updated_at": "", "data_generated_at": ""}
-    rows = _read_rows()
+        return {
+            "rows": 0,
+            "ok_rows": 0,
+            "market_counts": {},
+            "canada_rows": 0,
+            "file_updated_at": "",
+            "data_generated_at": "",
+        }
+    row_count = 0
+    ok_rows = 0
+    generated_at = ""
+    counts: Dict[str, int] = {}
+    for row in _iter_public_rows(path):
+        row_count += 1
+        if row.get("status", "ok") == "ok":
+            ok_rows += 1
+        market = normalized_market(row)
+        if market:
+            counts[market] = counts.get(market, 0) + 1
+        generated_at = max(generated_at, row.get("mobile_intel_generated_at", ""))
     return {
-        "rows": len(rows),
-        "ok_rows": sum(1 for row in rows if row.get("status", "ok") == "ok"),
+        "rows": row_count,
+        "ok_rows": ok_rows,
+        "market_counts": counts,
+        "canada_rows": counts.get(CANADA_MARKET_LABEL, 0),
         "file_updated_at": _file_mtime_iso(path),
-        "data_generated_at": max((row.get("mobile_intel_generated_at", "") for row in rows), default=""),
+        "data_generated_at": generated_at,
     }
 
 
@@ -171,8 +263,78 @@ def _cleanup_runtime_storage() -> None:
                 continue
 
 
+def _read_text_tail(path: Path, max_chars: int = 4000) -> str:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            handle.seek(max(0, size - max_chars * 4))
+            data = handle.read()
+        return data.decode("utf-8", errors="replace")[-max_chars:]
+    except OSError:
+        return ""
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _read_bug_reports_store() -> Dict[str, object]:
+    if not BUG_REPORTS_FILE.exists():
+        return {"reports": [], "updated_at": None}
+    try:
+        payload = json.loads(BUG_REPORTS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {"reports": [], "updated_at": None}
+    if not isinstance(payload, dict):
+        return {"reports": [], "updated_at": None}
+    reports = payload.get("reports")
+    if not isinstance(reports, list):
+        reports = []
+    return {
+        "reports": [report for report in reports if isinstance(report, dict)],
+        "updated_at": payload.get("updated_at"),
+    }
+
+
+def _write_bug_reports_store(reports: List[Dict[str, object]]) -> Dict[str, object]:
+    payload = {
+        "reports": reports,
+        "count": len(reports),
+        "updated_at": _now_iso(),
+    }
+    BUG_REPORTS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return payload
+
+
+def _bug_report_sort_value(report: Dict[str, object]) -> float:
+    for key in ("updatedAt", "createdAt"):
+        value = report.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return 0.0
+
+
+def _merge_bug_reports(
+    existing: List[Dict[str, object]],
+    incoming: List[Dict[str, object]],
+) -> tuple[List[Dict[str, object]], int]:
+    merged: Dict[str, Dict[str, object]] = {}
+    changed = 0
+    for report in existing:
+        report_id = str(report.get("id") or "").strip()
+        if report_id:
+            merged[report_id] = report
+    for report in incoming:
+        report_id = str(report.get("id") or "").strip()
+        if not report_id:
+            continue
+        current = merged.get(report_id)
+        if current is None or _bug_report_sort_value(report) >= _bug_report_sort_value(current):
+            if current != report:
+                changed += 1
+            merged[report_id] = report
+    reports = sorted(merged.values(), key=_bug_report_sort_value, reverse=True)
+    return reports, changed
 
 
 def _file_mtime_iso(path: Path) -> str:
@@ -210,6 +372,40 @@ def _public_row(row: Dict[str, str]) -> Dict[str, str]:
     }
 
 
+def _safe_query(value: Optional[str], *, max_length: int = 80) -> Optional[str]:
+    if value is None:
+        return None
+    try:
+        return validate_search_text(value, max_length=max_length)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _safe_market(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    cleaned = _safe_query(value, max_length=20)
+    allowed = {"", "국장", "미장", "캐나다", "한국", "미국", "전체", "KOREA", "US", "CANADA", "CA", "TSX", "TSXV"}
+    if cleaned not in allowed:
+        raise HTTPException(status_code=400, detail="허용되지 않는 시장 필터입니다.")
+    return cleaned
+
+
+async def _read_json_payload(request: Request, *, max_bytes: int = MAX_JSON_BYTES) -> Dict[str, object]:
+    raw = await request.body()
+    if len(raw) > max_bytes:
+        raise HTTPException(status_code=413, detail="JSON payload too large")
+    if not raw:
+        return {}
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="invalid JSON payload") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="payload must be an object")
+    return payload
+
+
 def _read_rows() -> List[Dict[str, str]]:
     global _cache_rows, _cache_loaded_at, _cache_file_mtime, _cache_file_path
 
@@ -228,13 +424,24 @@ def _read_rows() -> List[Dict[str, str]]:
     ):
         return _cache_rows
 
-    with path.open("r", encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle)
-        _cache_rows = [_public_row(row) for row in reader]
+    rows: List[Dict[str, str]] = []
+    for row in _iter_public_rows(path):
+        rows.append(row)
+        if len(rows) >= RESULTS_CACHE_MAX_ROWS:
+            break
+    _cache_rows = rows
     _cache_loaded_at = now
     _cache_file_mtime = file_mtime
     _cache_file_path = file_path
     return _cache_rows
+
+
+def _filter_result_rows_streaming(
+    market: Optional[str] = None,
+    q: Optional[str] = None,
+    limit: int = 800,
+) -> List[Dict[str, str]]:
+    return _filter_rows(_iter_public_rows(), market=market, q=q, limit=limit)
 
 
 def _parse_csv_bytes(payload: bytes) -> List[Dict[str, str]]:
@@ -252,7 +459,51 @@ def _parse_csv_bytes(payload: bytes) -> List[Dict[str, str]]:
     ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
     if ok_rows < MIN_UPLOAD_OK_ROWS:
         raise HTTPException(status_code=400, detail=f"CSV ok row count too low: {ok_rows}")
+    ca_rows = canada_count(rows)
+    if ca_rows < MIN_CANADA_ROWS_FOR_APP_SYNC:
+        raise HTTPException(
+            status_code=400,
+            detail=f"CSV Canada row count too low: {ca_rows}, need at least {MIN_CANADA_ROWS_FOR_APP_SYNC}",
+        )
     return rows
+
+
+def _normalize_uploaded_rows(rows: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    normalized: List[Dict[str, str]] = []
+    for row in rows:
+        item = dict(row)
+        if is_canada_row(item):
+            item["market"] = CANADA_MARKET_LABEL
+        normalized.append(item)
+    return normalized
+
+
+def _prepare_upload_rows(payload: bytes) -> tuple[bytes, List[Dict[str, str]], Dict[str, int]]:
+    try:
+        text = payload.decode("utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"CSV decode failed: {exc}") from exc
+    rows = [_public_row(row) for row in csv.DictReader(text.splitlines())]
+    if not rows:
+        raise HTTPException(status_code=400, detail="CSV has no rows")
+
+    existing_rows = list(_iter_public_rows(_result_path()))
+    rows = _normalize_uploaded_rows(rows)
+    if existing_rows:
+        ok, reason = validate_no_stock_loss(rows, existing_rows, "api results upload")
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
+        print(f"[API] {reason}", flush=True)
+    if canada_count(rows) < MIN_CANADA_ROWS_FOR_APP_SYNC and canada_count(existing_rows) >= MIN_CANADA_ROWS_FOR_APP_SYNC:
+        before = canada_count(rows)
+        rows = _normalize_uploaded_rows(merge_existing_canada_rows(rows, existing_rows))
+        print(
+            f"[API] Canada guard restored previous Canada rows upload_canada={before} restored_canada={canada_count(rows)}",
+            flush=True,
+        )
+    serialized = serialize_csv_rows(rows)
+    validated_rows = _parse_csv_bytes(serialized)
+    return serialized, validated_rows, market_counts(validated_rows)
 
 
 def _replace_result_file(payload: bytes, rows: List[Dict[str, str]]) -> None:
@@ -266,7 +517,7 @@ def _replace_result_file(payload: bytes, rows: List[Dict[str, str]]) -> None:
         IOS_RESULT_FILE.write_bytes(payload)
 
     _invalidate_results_cache()
-    _read_rows()
+    gc.collect()
 
 
 def _read_scanner_status() -> Dict[str, object]:
@@ -435,14 +686,16 @@ def _run_scanner_background(mode: str = "quick") -> None:
         scanner_env.setdefault("MARKET_SCANNER_MAX_STOCKS", SCANNER_DEFAULT_MAX_STOCKS)
         scanner_env.setdefault("MARKET_SCANNER_ENABLE_INTRADAY_1M", SCANNER_ENABLE_INTRADAY_1M)
         scanner_env.setdefault("MARKET_SCANNER_CACHE_RETENTION_DAYS", "1")
-        scanner_env.setdefault("MOBILE_INTEL_MAX_NEWS_OBSERVATIONS", "1200")
+        scanner_env.setdefault("MOBILE_INTEL_MAX_NEWS_OBSERVATIONS", "700" if os.getenv("RENDER") else "1200")
+        scanner_env.setdefault("MARKET_SCANNER_CACHE_MAX_ITEMS", "128" if os.getenv("RENDER") else "512")
+        scanner_env.setdefault("MARKET_SCANNER_MEMORY_PROFILE", "true")
         scanner_env["MOBILE_SCAN_FAST_MODE"] = "false" if scan_mode == "full" else "true"
         if scan_mode == "quick":
             scanner_env["MARKET_SCANNER_ENABLE_INTRADAY_1M"] = "false"
             scanner_env["MARKET_SCANNER_NEWS_SOURCES"] = "google_news"
             scanner_env["MARKET_SCANNER_ENABLE_SECTOR_NEWS"] = "false"
             scanner_env["MOBILE_INTEL_INCREMENTAL"] = "true"
-            scanner_env["MOBILE_INTEL_MAX_NEWS_OBSERVATIONS"] = "500"
+            scanner_env["MOBILE_INTEL_MAX_NEWS_OBSERVATIONS"] = "300" if os.getenv("RENDER") else "500"
         else:
             scanner_env["MARKET_SCANNER_NEWS_SOURCES"] = "company_risk_news,google_news,naver_news"
             scanner_env["MARKET_SCANNER_ENABLE_SECTOR_NEWS"] = "true"
@@ -488,11 +741,19 @@ def _run_scanner_background(mode: str = "quick") -> None:
                         _scanner_last_seen_mtime = mtime
                         _invalidate_results_cache()
                         snapshot = _current_result_snapshot()
-                        _log_memory("scanner-partial-data", rows=snapshot.get("rows"), ok_rows=snapshot.get("ok_rows"))
+                        _log_memory(
+                            "scanner-partial-data",
+                            rows=snapshot.get("rows"),
+                            ok_rows=snapshot.get("ok_rows"),
+                            canada_rows=snapshot.get("canada_rows"),
+                        )
                         _write_scanner_status(
                             running=True,
                             state="partial_data",
-                            message=f"부분 데이터 반영됨 · {snapshot['ok_rows']}/{snapshot['rows']} 정상 · 모바일 재조회 가능",
+                            message=(
+                                f"부분 데이터 반영됨 · {snapshot['ok_rows']}/{snapshot['rows']} 정상 · "
+                                f"캐나다 {snapshot.get('canada_rows', 0)}개 · 모바일 재조회 가능"
+                            ),
                             progress=max(35, int(current_status.get("progress") or 35)),
                             started_at=started_at,
                             mode=scan_mode,
@@ -516,10 +777,8 @@ def _run_scanner_background(mode: str = "quick") -> None:
 
             stdout_log.flush()
             stderr_log.flush()
-            stdout_log.seek(0)
-            stderr_log.seek(0)
-            stdout = stdout_log.read()
-            stderr = stderr_log.read()
+            stdout = _read_text_tail(stdout_path)
+            stderr = _read_text_tail(stderr_path)
         finally:
             stdout_log.close()
             stderr_log.close()
@@ -577,16 +836,20 @@ def _run_scanner_background(mode: str = "quick") -> None:
             mode=scan_mode,
         )
         _invalidate_results_cache()
-        rows = _read_rows()
-        ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
+        snapshot = _current_result_snapshot()
+        row_count = int(snapshot.get("rows", 0) or 0)
+        ok_rows = int(snapshot.get("ok_rows", 0) or 0)
         duration_seconds = round(time.time() - started_at, 2)
-        _log_memory("scanner-completed", rows=len(rows), ok_rows=ok_rows)
+        canada_rows = int(snapshot.get("canada_rows", 0) or 0)
+        _log_memory("scanner-completed", rows=row_count, ok_rows=ok_rows, canada_rows=canada_rows)
         _write_scanner_status(
             running=False,
             state="completed",
-            message=f"스캐너 완료 · {ok_rows}/{len(rows)} 정상 · {duration_seconds}s",
-            rows=len(rows),
+            message=f"스캐너 완료 · {ok_rows}/{row_count} 정상 · 캐나다 {canada_rows}개 · {duration_seconds}s",
+            rows=row_count,
             ok_rows=ok_rows,
+            canada_rows=canada_rows,
+            market_counts=snapshot.get("market_counts", {}),
             mode=scan_mode,
             duration_seconds=duration_seconds,
             performance_report="mobile_scan_performance_report.json",
@@ -624,9 +887,17 @@ def _filter_rows(
 ) -> List[Dict[str, str]]:
     query = (q or "").strip().lower()
     market_filter = (market or "").strip()
+    if market_filter in {"한국", "KOREA"}:
+        market_filter = "국장"
+    elif market_filter in {"미국", "US"}:
+        market_filter = "미장"
+    elif market_filter in {"CANADA", "CA", "TSX", "TSXV"}:
+        market_filter = CANADA_MARKET_LABEL
+    elif market_filter in {"전체"}:
+        market_filter = ""
     filtered = []
     for row in rows:
-        if market_filter and row.get("market", "") != market_filter:
+        if market_filter and normalized_market(row) != market_filter:
             continue
         if query:
             haystack = " ".join(
@@ -713,9 +984,23 @@ async def guarded(
 
 @app.exception_handler(HTTPException)
 async def http_exception_handler(_: Request, exc: HTTPException) -> JSONResponse:
+    detail = sanitize_secret(exc.detail, API_TOKEN)
     return JSONResponse(
         status_code=exc.status_code,
-        content={"ok": False, "error": exc.detail, "updated_at": _now_iso()},
+        content={"ok": False, "error": detail, "updated_at": _now_iso()},
+        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
+    )
+
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    print(
+        f"[ERROR] {request.method} {request.url.path}: {sanitize_secret(exc, API_TOKEN)}",
+        flush=True,
+    )
+    return JSONResponse(
+        status_code=500,
+        content={"ok": False, "error": "일시적인 오류가 발생했습니다.", "updated_at": _now_iso()},
         headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"},
     )
 
@@ -737,22 +1022,76 @@ def health() -> Dict[str, object]:
 @app.get("/api/status")
 async def status(request: Request) -> Dict[str, object]:
     await guarded(request)
-    rows = _read_rows()
     path = _result_path()
-    mtime = _file_mtime_iso(path)
-    ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
-    generated_at = max((row.get("mobile_intel_generated_at", "") for row in rows), default="")
+    snapshot = _current_result_snapshot()
+    markets = sorted({normalized_market(row) for row in _iter_public_rows(path) if normalized_market(row)})
     scanner_status = _read_scanner_status()
     return {
         "ok": True,
-        "rows": len(rows),
-        "ok_rows": ok_rows,
-        "markets": sorted({row.get("market", "") for row in rows if row.get("market")}),
+        "rows": snapshot["rows"],
+        "ok_rows": snapshot["ok_rows"],
+        "canada_rows": snapshot.get("canada_rows", 0),
+        "market_counts": snapshot.get("market_counts", {}),
+        "markets": markets,
         "result_file": path.name,
-        "file_updated_at": mtime,
-        "data_generated_at": generated_at,
+        "file_updated_at": snapshot["file_updated_at"],
+        "data_generated_at": snapshot["data_generated_at"],
         "server_updated_at": _now_iso(),
         "scanner": scanner_status,
+    }
+
+
+@app.get("/api/bug-reports")
+async def bug_reports(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    with _bug_reports_lock:
+        store = _read_bug_reports_store()
+    reports = store["reports"]
+    return {
+        "ok": True,
+        "reports": reports,
+        "count": len(reports),
+        "updated_at": store.get("updated_at"),
+        "server_updated_at": _now_iso(),
+    }
+
+
+@app.post("/api/bug-reports/sync")
+async def sync_bug_reports(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    payload = await _read_json_payload(request)
+    incoming = payload.get("reports")
+    if not isinstance(incoming, list):
+        raise HTTPException(status_code=400, detail="reports must be a list")
+    incoming_reports = [report for report in incoming if isinstance(report, dict)]
+    with _bug_reports_lock:
+        store = _read_bug_reports_store()
+        merged, changed = _merge_bug_reports(store["reports"], incoming_reports)
+        saved = _write_bug_reports_store(merged)
+    return {
+        "ok": True,
+        "reports": saved["reports"],
+        "count": saved["count"],
+        "changed": changed,
+        "updated_at": saved["updated_at"],
+    }
+
+
+@app.post("/api/admin/verify")
+async def verify_admin_device(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    payload = await _read_json_payload(request)
+    provided = str(payload.get("admin_token") or "").strip()
+    expected = (ADMIN_TOKEN or API_TOKEN).strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="admin token is not configured")
+    if not provided or not secrets.compare_digest(provided, expected):
+        raise HTTPException(status_code=401, detail="admin unauthorized")
+    return {
+        "ok": True,
+        "admin": True,
+        "mode": "temporary_device",
+        "updated_at": _now_iso(),
     }
 
 
@@ -761,7 +1100,6 @@ async def quick_refresh(request: Request) -> Dict[str, object]:
     await guarded(request)
     started = time.time()
     _invalidate_results_cache()
-    rows = _read_rows()
     snapshot = _current_result_snapshot()
     _write_scanner_status(
         running=False,
@@ -771,11 +1109,11 @@ async def quick_refresh(request: Request) -> Dict[str, object]:
         mode="quick",
         **snapshot,
     )
-    _log_memory("quick-refresh", rows=len(rows), duration_ms=int((time.time() - started) * 1000))
+    _log_memory("quick-refresh", rows=snapshot.get("rows"), duration_ms=int((time.time() - started) * 1000))
     return {
         "ok": True,
         "message": "quick refresh completed",
-        "count": len(rows),
+        "count": snapshot.get("rows", 0),
         "status": _read_scanner_status(),
         **snapshot,
         "updated_at": _now_iso(),
@@ -786,6 +1124,8 @@ async def quick_refresh(request: Request) -> Dict[str, object]:
 async def scanner_run(request: Request, mode: str = Query(default="quick")) -> Dict[str, object]:
     global _scanner_running
     await guarded(request)
+    if not SAFE_MODE_PATTERN.match(mode.strip()):
+        raise HTTPException(status_code=400, detail="invalid scanner mode")
     scan_mode = "full" if mode.lower().strip() == "full" else "quick"
     with _scanner_lock:
         if _scanner_running:
@@ -888,14 +1228,19 @@ async def results(
     limit: int = Query(default=800, ge=1, le=1200),
 ) -> Dict[str, object]:
     await guarded(request)
+    market = _safe_market(market)
+    q = _safe_query(q)
     path = _result_path()
     file_updated_at = _file_mtime_iso(path)
-    rows = _filter_rows(_read_rows(), market=market, q=q, limit=limit)
+    rows = _filter_result_rows_streaming(market=market, q=q, limit=limit)
     generated_at = max((row.get("mobile_intel_generated_at", "") for row in rows), default="")
+    counts = market_counts(rows)
     return {
         "ok": True,
         "count": len(rows),
         "rows": rows,
+        "canada_rows": counts.get(CANADA_MARKET_LABEL, 0),
+        "market_counts": counts,
         "result_file": path.name,
         "file_updated_at": file_updated_at,
         "data_generated_at": generated_at,
@@ -916,15 +1261,17 @@ async def upload_results(request: Request) -> Dict[str, object]:
     if len(payload) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail=f"upload too large: {len(payload)} bytes")
 
-    rows = _parse_csv_bytes(payload)
+    payload, rows, counts = _prepare_upload_rows(payload)
     _replace_result_file(payload, rows)
     ok_rows = sum(1 for row in rows if row.get("status", "ok") == "ok")
     _write_scanner_status(
         running=False,
         state="uploaded",
-        message=f"CSV 즉시 업로드 완료 · {ok_rows}/{len(rows)} 정상",
+        message=f"CSV 즉시 업로드 완료 · {ok_rows}/{len(rows)} 정상 · 캐나다 {counts.get(CANADA_MARKET_LABEL, 0)}개",
         rows=len(rows),
         ok_rows=ok_rows,
+        canada_rows=counts.get(CANADA_MARKET_LABEL, 0),
+        market_counts=counts,
         mode="upload",
         progress=100,
     )
@@ -932,6 +1279,8 @@ async def upload_results(request: Request) -> Dict[str, object]:
         "ok": True,
         "rows": len(rows),
         "ok_rows": ok_rows,
+        "canada_rows": counts.get(CANADA_MARKET_LABEL, 0),
+        "market_counts": counts,
         "file_updated_at": _file_mtime_iso(RESULT_FILE),
         "updated_at": _now_iso(),
     }
@@ -944,7 +1293,8 @@ async def top_movers(
     limit: int = Query(default=20, ge=1, le=100),
 ) -> Dict[str, object]:
     await guarded(request)
-    rows = _filter_rows(_read_rows(), market=market, limit=2000)
+    market = _safe_market(market)
+    rows = _filter_result_rows_streaming(market=market, limit=2000)
     change_keys = ("change_pct", "change_percent", "change")
     gainers = sorted(rows, key=lambda row: _float_value(row, *change_keys), reverse=True)[:limit]
     losers = sorted(rows, key=lambda row: _float_value(row, *change_keys))[:limit]
@@ -976,9 +1326,7 @@ async def save_ai_screening_profile(request: Request) -> Dict[str, object]:
     await guarded(request)
     from korean_ai_screening_simulator import SAFETY_NOTICE, save_profile
 
-    payload = await request.json()
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="profile payload must be an object")
+    payload = await _read_json_payload(request)
     profile = save_profile(payload)
     return {
         "ok": True,
@@ -994,7 +1342,9 @@ async def run_ai_screening(request: Request, limit: int = Query(default=50, ge=1
     from korean_ai_screening_simulator import run_screening
 
     try:
-        payload = await request.json()
+        payload = await _read_json_payload(request)
+    except HTTPException:
+        raise
     except Exception:
         payload = {}
     profile = payload if isinstance(payload, dict) and payload else None
@@ -1010,10 +1360,14 @@ async def run_ai_screening_backtest(
     max_symbols: int = Query(default=30, ge=1, le=80),
 ) -> Dict[str, object]:
     await guarded(request)
+    if not SAFE_PERIOD_PATTERN.match(period.strip()):
+        raise HTTPException(status_code=400, detail="invalid backtest period")
     from korean_ai_screening_simulator import backtest_screening
 
     try:
-        payload = await request.json()
+        payload = await _read_json_payload(request)
+    except HTTPException:
+        raise
     except Exception:
         payload = {}
     profile = payload if isinstance(payload, dict) and payload else None
@@ -1035,7 +1389,7 @@ async def paper_trading_deposit(request: Request) -> Dict[str, object]:
     await guarded(request)
     from korean_ai_screening_simulator import deposit_paper_cash, paper_account_summary
 
-    payload = await request.json()
+    payload = await _read_json_payload(request)
     amount = float(payload.get("amount", 0)) if isinstance(payload, dict) else 0.0
     try:
         deposit_paper_cash(amount)
@@ -1049,15 +1403,22 @@ async def paper_trading_simulate(request: Request) -> Dict[str, object]:
     await guarded(request)
     from korean_ai_screening_simulator import paper_account_summary, simulate_paper_trade
 
-    payload = await request.json()
-    if not isinstance(payload, dict):
-        raise HTTPException(status_code=400, detail="paper trade payload must be an object")
+    payload = await _read_json_payload(request)
+    ticker = str(payload.get("ticker", "")).strip()
+    try:
+        validate_ticker(ticker)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    side = str(payload.get("side", "")).strip().lower()
+    if side not in {"buy", "sell"}:
+        raise HTTPException(status_code=400, detail="side must be buy or sell")
     try:
         simulate_paper_trade(
-            ticker=str(payload.get("ticker", "")).strip(),
+            ticker=ticker,
             quantity=float(payload.get("quantity", 0)),
             price=float(payload.get("price", 0)),
-            side=str(payload.get("side", "")).strip().lower(),
+            side=side,
+            cash_amount=float(payload.get("cash_amount", 0) or 0),
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
