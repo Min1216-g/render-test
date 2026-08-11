@@ -1,0 +1,115 @@
+name: Sync Bug Reports On Push
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  git-bug-sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      MARKET_API_BASE_URL: https://market-scanner-api-fo2m.onrender.com
+      MARKET_API_TOKEN: ${{ secrets.MARKET_API_TOKEN }}
+      COMMITS_JSON: ${{ toJson(github.event.commits) }}
+      GITHUB_RUN_ID_VALUE: ${{ github.run_id }}
+      GITHUB_RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+    steps:
+      - name: Prepare Git bug sync payload
+        id: payload
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import re
+
+          commits = json.loads(os.environ.get("COMMITS_JSON") or "[]")
+          pattern = re.compile(r"\b(?:BUG|FIX|IMP|DATA|UI)-\d{1,5}\b", re.IGNORECASE)
+          payload_commits = []
+          ids = set()
+          for commit in commits:
+              message = commit.get("message", "")
+              found = {item.upper() for item in pattern.findall(message)}
+              if not found:
+                  continue
+              ids.update(found)
+              payload_commits.append(
+                  {
+                      "hash": commit.get("id", ""),
+                      "message": message,
+                      "timestamp": commit.get("timestamp", ""),
+                      "source": "github_actions",
+                      "workflow_run_id": os.environ.get("GITHUB_RUN_ID_VALUE", ""),
+                      "workflow_run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT_VALUE", ""),
+                  }
+              )
+
+          with open("/tmp/bug-git-sync-payload.json", "w", encoding="utf-8") as handle:
+              json.dump({"commits": payload_commits}, handle, ensure_ascii=False)
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+              handle.write(f"has_ids={'true' if ids else 'false'}\n")
+              handle.write(f"ids={','.join(sorted(ids))}\n")
+              handle.write(f"commit_count={len(payload_commits)}\n")
+          print(f"Detected bug IDs: {', '.join(sorted(ids)) if ids else 'none'}")
+          print(f"Commit payload count: {len(payload_commits)}")
+          PY
+
+      - name: Stop when no bug IDs are present
+        if: steps.payload.outputs.has_ids != 'true'
+        run: |
+          echo "No BUG/FIX/IMP/DATA/UI IDs found in pushed commit messages."
+
+      - name: Ensure API token exists
+        if: steps.payload.outputs.has_ids == 'true'
+        run: |
+          if [ -z "$MARKET_API_TOKEN" ]; then
+            echo "Missing GitHub secret MARKET_API_TOKEN"
+            exit 2
+          fi
+
+      - name: Call Render bug git-sync API
+        if: steps.payload.outputs.has_ids == 'true'
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.error
+          import urllib.request
+
+          base_url = os.environ["MARKET_API_BASE_URL"].rstrip("/")
+          token = os.environ["MARKET_API_TOKEN"]
+          with open("/tmp/bug-git-sync-payload.json", "rb") as handle:
+              body = handle.read()
+
+          request = urllib.request.Request(
+              f"{base_url}/api/bug-reports/git-sync",
+              data=body,
+              method="POST",
+              headers={
+                  "Content-Type": "application/json",
+                  "Accept": "application/json",
+                  "X-Market-Token": token,
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=60) as response:
+                  status = response.status
+                  payload = json.loads(response.read().decode("utf-8"))
+          except urllib.error.HTTPError as exc:
+              detail = exc.read().decode("utf-8", errors="replace")
+              print(f"Git bug sync failed with HTTP {exc.code}: {detail}")
+              raise SystemExit(1)
+          except Exception as exc:
+              print(f"Git bug sync failed: {exc}")
+              raise SystemExit(1)
+
+          print(f"Git bug sync HTTP {status}")
+          print(f"changed={payload.get('git_changed')} received_commits={payload.get('received_commits')}")
+          if payload.get("git_unmatched_ids"):
+              print(f"unmatched_ids={','.join(payload['git_unmatched_ids'])}")
+          if not payload.get("ok"):
+              print(f"git_sync_error={payload.get('git_sync_error')}")
+              raise SystemExit(1)
+          PY

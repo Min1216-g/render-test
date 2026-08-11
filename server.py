@@ -360,10 +360,63 @@ def _bug_report_display_id(report: Dict[str, object]) -> str:
     return f"{_bug_report_prefix(report)}-{sequence_int:03d}"
 
 
-def _git_commits_for_bug_ids(bug_ids: Iterable[str], limit: int = 400) -> tuple[Dict[str, Dict[str, str]], Optional[str]]:
+BUG_ID_PATTERN = re.compile(r"\b(?:BUG|FIX|IMP|DATA|UI)-\d{1,5}\b", re.IGNORECASE)
+
+
+def _normalize_supplied_git_commits(commits: object) -> List[Dict[str, str]]:
+    if not isinstance(commits, list):
+        return []
+    normalized: List[Dict[str, str]] = []
+    for item in commits:
+        if not isinstance(item, dict):
+            continue
+        commit_hash = str(item.get("hash") or item.get("id") or item.get("sha") or "").strip()
+        message = str(item.get("message") or "").strip()
+        if not commit_hash or not message:
+            continue
+        normalized.append(
+            {
+                "hash": commit_hash,
+                "date": str(item.get("date") or item.get("timestamp") or "").strip() or _now_iso(),
+                "message": message,
+                "source": str(item.get("source") or "").strip(),
+                "workflow_run_id": str(item.get("workflow_run_id") or "").strip(),
+                "workflow_run_attempt": str(item.get("workflow_run_attempt") or "").strip(),
+            }
+        )
+    return normalized
+
+
+def _commit_map_for_bug_ids(
+    bug_ids: Iterable[str],
+    commits: Iterable[Dict[str, str]],
+) -> tuple[Dict[str, Dict[str, str]], List[str]]:
+    wanted = {bug_id.upper() for bug_id in bug_ids if bug_id}
+    matched: Dict[str, Dict[str, str]] = {}
+    unmatched: set[str] = set()
+    for commit in commits:
+        message = commit.get("message", "")
+        for raw_bug_id in BUG_ID_PATTERN.findall(message):
+            bug_id = raw_bug_id.upper()
+            if bug_id in wanted:
+                matched.setdefault(bug_id, commit)
+            else:
+                unmatched.add(bug_id)
+    return matched, sorted(unmatched)
+
+
+def _git_commits_for_bug_ids(
+    bug_ids: Iterable[str],
+    supplied_commits: Optional[List[Dict[str, str]]] = None,
+    limit: int = 400,
+) -> tuple[Dict[str, Dict[str, str]], Optional[str], List[str]]:
     wanted = {bug_id.upper() for bug_id in bug_ids if bug_id}
     if not wanted:
-        return {}, None
+        return {}, None, []
+    if supplied_commits:
+        commits, unmatched = _commit_map_for_bug_ids(wanted, supplied_commits)
+        return commits, None, unmatched
+
     try:
         result = subprocess.run(
             [
@@ -382,24 +435,17 @@ def _git_commits_for_bug_ids(bug_ids: Iterable[str], limit: int = 400) -> tuple[
             timeout=8,
         )
     except Exception as exc:
-        return {}, f"git commit 확인 실패: {exc}"
+        return {}, f"git commit 확인 실패: {exc}", []
 
-    commits: Dict[str, Dict[str, str]] = {}
-    bug_id_pattern = re.compile(r"\b(?:BUG|FIX|IMP|DATA|UI)-\d{1,5}\b", re.IGNORECASE)
+    local_commits: List[Dict[str, str]] = []
     for line in result.stdout.splitlines():
         parts = line.split("\x1f", 2)
         if len(parts) != 3:
             continue
         commit_hash, commit_date, message = parts
-        for raw_bug_id in bug_id_pattern.findall(message):
-            bug_id = raw_bug_id.upper()
-            if bug_id in wanted and bug_id not in commits:
-                commits[bug_id] = {
-                    "hash": commit_hash,
-                    "date": commit_date,
-                    "message": message,
-                }
-    return commits, None
+        local_commits.append({"hash": commit_hash, "date": commit_date, "message": message, "source": "server_git_log"})
+    commits, unmatched = _commit_map_for_bug_ids(wanted, local_commits)
+    return commits, None, unmatched
 
 
 def _extract_version_from_commit(message: str) -> str:
@@ -425,6 +471,14 @@ def _append_bug_history(report: Dict[str, object], action: str, detail: str, now
     report["history"] = history[:30]
 
 
+def _git_processing_source_title(source: str) -> str:
+    if source == "github_actions":
+        return "GitHub Actions 자동 처리"
+    if source == "server_git_log":
+        return "서버 Git log 확인"
+    return "수동 Git 반영 확인"
+
+
 def _auto_resolution_report(report: Dict[str, object], commit: Dict[str, str], bug_id: str) -> str:
     title = str(report.get("title") or "").strip() or str(report.get("content") or "내용 없음").strip()
     content = str(report.get("content") or "내용 없음").strip()
@@ -432,6 +486,7 @@ def _auto_resolution_report(report: Dict[str, object], commit: Dict[str, str], b
     test_result = str(report.get("testResult") or "").strip() or "테스트 결과 확인 필요"
     fix_reason = str(report.get("fixReason") or "").strip() or "원인 확인 필요"
     commit_message = commit.get("message", "")
+    source_title = _git_processing_source_title(commit.get("source", ""))
     return (
         "🟢 조치 완료\n\n"
         f"{bug_id} — {title}\n\n"
@@ -447,16 +502,21 @@ def _auto_resolution_report(report: Dict[str, object], commit: Dict[str, str], b
         f"{test_result}\n\n"
         "수정 commit\n"
         f"{commit.get('hash', '')[:12]}\n\n"
+        "처리 방식\n"
+        f"{source_title}\n\n"
         "상태\n"
         "🟢 조치 완료"
     )
 
 
-def _apply_git_commit_links(reports: List[Dict[str, object]]) -> tuple[List[Dict[str, object]], int, Optional[str]]:
+def _apply_git_commit_links(
+    reports: List[Dict[str, object]],
+    supplied_commits: Optional[List[Dict[str, str]]] = None,
+) -> tuple[List[Dict[str, object]], int, Optional[str], List[str]]:
     bug_ids = [_bug_report_display_id(report) for report in reports]
-    commits, error = _git_commits_for_bug_ids(bug_ids)
+    commits, error, unmatched_ids = _git_commits_for_bug_ids(bug_ids, supplied_commits=supplied_commits)
     if error:
-        return reports, 0, error
+        return reports, 0, error, unmatched_ids
 
     changed = 0
     now = _now_iso()
@@ -468,24 +528,31 @@ def _apply_git_commit_links(reports: List[Dict[str, object]]) -> tuple[List[Dict
         if str(report.get("gitCommitHash") or "") == commit["hash"]:
             continue
 
+        source = commit.get("source", "server_git_log")
         report["bugID"] = bug_id
         report["gitCommitHash"] = commit["hash"]
         report["gitCommitMessage"] = commit["message"]
         report["gitCommitDate"] = commit["date"]
         report["gitSyncedAt"] = now
+        report["gitAutoProcessedAt"] = now
+        report["gitAutoProcessingStatus"] = "completed"
+        report["gitAutoProcessingSource"] = source
+        report["gitAutoProcessingRunID"] = commit.get("workflow_run_id", "")
+        report["gitAutoProcessingRunAttempt"] = commit.get("workflow_run_attempt", "")
         report["latestStateChangedAt"] = now
         report["updatedAt"] = time.time()
-        report["fixVersion"] = str(report.get("fixVersion") or _extract_version_from_commit(commit["message"]))
+        report["fixVersion"] = str(report.get("fixVersion") or _extract_version_from_commit(commit["message"]) or "v1.0.22")
         report["status"] = "actionDone"
         report["completedAtText"] = commit["date"][:16].replace("T", " ")
         if not str(report.get("resolutionReport") or "").strip():
             report["resolutionReport"] = _auto_resolution_report(report, commit, bug_id)
-        _append_bug_history(report, "Git commit 자동 연결", f"{commit['hash'][:12]} · {commit['message']}", now)
+        source_title = _git_processing_source_title(source)
+        _append_bug_history(report, "Git commit 자동 연결", f"{source_title} · {commit['hash'][:12]} · {commit['message']}", now)
         changed += 1
 
     if changed:
         reports = sorted(reports, key=_bug_report_sort_value, reverse=True)
-    return reports, changed, None
+    return reports, changed, None, unmatched_ids
 
 
 def _paper_device_id(request: Request) -> str:
@@ -1204,7 +1271,7 @@ async def bug_reports(request: Request) -> Dict[str, object]:
     await guarded(request)
     with _bug_reports_lock:
         store = _read_bug_reports_store()
-        reports, git_changed, git_error = _apply_git_commit_links(store["reports"])
+        reports, git_changed, git_error, unmatched_ids = _apply_git_commit_links(store["reports"])
         if git_changed:
             store = _write_bug_reports_store(reports)
         else:
@@ -1216,6 +1283,7 @@ async def bug_reports(request: Request) -> Dict[str, object]:
         "count": len(reports),
         "git_changed": git_changed,
         "git_sync_error": git_error,
+        "git_unmatched_ids": unmatched_ids,
         "updated_at": store.get("updated_at"),
         "server_updated_at": _now_iso(),
     }
@@ -1232,7 +1300,7 @@ async def sync_bug_reports(request: Request) -> Dict[str, object]:
     with _bug_reports_lock:
         store = _read_bug_reports_store()
         merged, changed = _merge_bug_reports(store["reports"], incoming_reports)
-        merged, git_changed, git_error = _apply_git_commit_links(merged)
+        merged, git_changed, git_error, unmatched_ids = _apply_git_commit_links(merged)
         saved = _write_bug_reports_store(merged)
     return {
         "ok": True,
@@ -1241,6 +1309,7 @@ async def sync_bug_reports(request: Request) -> Dict[str, object]:
         "changed": changed + git_changed,
         "git_changed": git_changed,
         "git_sync_error": git_error,
+        "git_unmatched_ids": unmatched_ids,
         "updated_at": saved["updated_at"],
     }
 
@@ -1248,9 +1317,14 @@ async def sync_bug_reports(request: Request) -> Dict[str, object]:
 @app.post("/api/bug-reports/git-sync")
 async def sync_bug_reports_from_git(request: Request) -> Dict[str, object]:
     await guarded(request)
+    payload = await _read_json_payload(request)
+    supplied_commits = _normalize_supplied_git_commits(payload.get("commits"))
     with _bug_reports_lock:
         store = _read_bug_reports_store()
-        reports, changed, git_error = _apply_git_commit_links(store["reports"])
+        reports, changed, git_error, unmatched_ids = _apply_git_commit_links(
+            store["reports"],
+            supplied_commits=supplied_commits,
+        )
         if git_error:
             return {
                 "ok": False,
@@ -1259,6 +1333,8 @@ async def sync_bug_reports_from_git(request: Request) -> Dict[str, object]:
                 "changed": 0,
                 "git_changed": 0,
                 "git_sync_error": git_error,
+                "git_unmatched_ids": unmatched_ids,
+                "received_commits": len(supplied_commits),
                 "updated_at": store.get("updated_at"),
                 "server_updated_at": _now_iso(),
             }
@@ -1274,6 +1350,8 @@ async def sync_bug_reports_from_git(request: Request) -> Dict[str, object]:
         "changed": changed,
         "git_changed": changed,
         "git_sync_error": None,
+        "git_unmatched_ids": unmatched_ids,
+        "received_commits": len(supplied_commits),
         "updated_at": saved["updated_at"],
         "server_updated_at": _now_iso(),
     }
