@@ -53,7 +53,7 @@ FORCE_HTTPS = os.getenv("MARKET_FORCE_HTTPS", "true" if os.getenv("RENDER") else
 RATE_LIMIT_PER_MINUTE = int(os.getenv("MARKET_RATE_LIMIT_PER_MINUTE", "90"))
 CACHE_TTL_SECONDS = int(os.getenv("MARKET_RESULTS_CACHE_TTL", "20"))
 RESULTS_CACHE_MAX_ROWS = int(os.getenv("MARKET_RESULTS_CACHE_MAX_ROWS", "1200"))
-SCANNER_RUN_COOLDOWN_SECONDS = int(os.getenv("MARKET_SCANNER_RUN_COOLDOWN_SECONDS", "3600"))
+SCANNER_RUN_COOLDOWN_SECONDS = int(os.getenv("MARKET_SCANNER_RUN_COOLDOWN_SECONDS", "300"))
 ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "true").lower() == "true"
 SCANNER_DEFAULT_MAX_WORKERS = os.getenv("MARKET_RENDER_SCANNER_MAX_WORKERS", "2" if os.getenv("RENDER") else "4")
 SCANNER_DEFAULT_MAX_STOCKS = os.getenv("MARKET_RENDER_SCANNER_MAX_STOCKS", "420" if os.getenv("RENDER") else "550")
@@ -1128,7 +1128,11 @@ async def quick_refresh(request: Request) -> Dict[str, object]:
 
 
 @app.post("/api/scanner/run")
-async def scanner_run(request: Request, mode: str = Query(default="quick")) -> Dict[str, object]:
+async def scanner_run(
+    request: Request,
+    mode: str = Query(default="quick"),
+    force: bool = Query(default=False),
+) -> Dict[str, object]:
     global _scanner_running
     await guarded(request)
     if not SAFE_MODE_PATTERN.match(mode.strip()):
@@ -1145,7 +1149,7 @@ async def scanner_run(request: Request, mode: str = Query(default="quick")) -> D
                 "updated_at": _now_iso(),
             }
         current_status = _read_scanner_status()
-        cooldown_payload = None if scan_mode == "full" else _scanner_cooldown_payload(current_status)
+        cooldown_payload = None if scan_mode == "full" or force else _scanner_cooldown_payload(current_status)
         if cooldown_payload:
             _invalidate_results_cache()
             return cooldown_payload

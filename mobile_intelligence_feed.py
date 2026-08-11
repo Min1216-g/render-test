@@ -16,6 +16,8 @@ import pandas as pd
 from ops_guard import enforce_runtime_security
 from news_impact_engine import analyze_news_impact, learned_keyword_summary, update_news_outcomes
 from sector_keyword_profiles import classify_sector_keyword_impact, sector_keyword_text
+from canada_market_guard import MIN_CANADA_ROWS_FOR_APP_SYNC, canada_count, market_counts
+from stock_universe_guard import validate_no_stock_loss
 
 try:
     from ai_failure_memory import failure_adjustment_for
@@ -259,6 +261,8 @@ def parse_news_datetime(value: str) -> datetime | None:
 def market_text(row: pd.Series) -> str:
     market = text(row, "market")
     ticker = text(row, "ticker")
+    if market in {"캐나다", "CANADA", "CA", "TSX", "TSXV", "TSX-V"} or ticker.upper().endswith((".TO", ".V")):
+        return "캐나다"
     if market:
         return market
     if ticker.endswith((".KS", ".KQ")):
@@ -906,6 +910,28 @@ def sector_keyword_signal(row: pd.Series) -> str:
     return message or sector_keyword_text(sector)
 
 
+def has_confirmed_company_news(row: pd.Series, news_text: str) -> bool:
+    clean = " ".join(str(news_text or "").split())
+    if not clean or clean in {"-", "뉴스 중립"}:
+        return False
+    no_news_terms = [
+        "오늘 기준 관련 뉴스 없음",
+        "오늘 기준 회사 관련 뉴스 없음",
+        "최근 7일 내 공식/신뢰 캐나다 뉴스 없음",
+        "캐나다 뉴스 최신 수집 실패",
+        "뉴스 확인 실패",
+        "뉴스 생략",
+    ]
+    if any(term in clean for term in no_news_terms):
+        return False
+    if market_text(row) == "캐나다" and number(row.get("canada_news_count")) <= 0:
+        return False
+    generic_terms = ["해외 종목: 해외 주요 뉴스", "해외 종목: 실적/가이던스 이슈"]
+    if all(term in clean for term in generic_terms) or any(term in clean for term in generic_terms):
+        return False
+    return True
+
+
 def enrich() -> int:
     enforce_runtime_security(BASE_DIR, output_files=[MARKET_RESULTS, IOS_RESULTS])
     results = read_csv(MARKET_RESULTS)
@@ -913,12 +939,23 @@ def enrich() -> int:
         print("[mobile-intel] market_scanner_results.csv 없음")
         return 1
     ok_rows = int((results.get("status", "") == "ok").sum()) if "status" in results.columns else len(results)
+    records = results.to_dict("records")
+    counts = market_counts(records)
+    ca_rows = canada_count(records)
     if len(results) < MIN_TOTAL_ROWS_FOR_APP_SYNC:
         print(f"[mobile-intel] 앱 CSV 갱신 차단: 종목 {len(results)}개, 최소 {MIN_TOTAL_ROWS_FOR_APP_SYNC}개 필요")
         return 1
     if ok_rows < MIN_OK_ROWS_FOR_APP_SYNC:
         print(f"[mobile-intel] 앱 CSV 갱신 차단: 정상 분석 {ok_rows}개, 네트워크/데이터 실패 가능")
         return 1
+    if ca_rows < MIN_CANADA_ROWS_FOR_APP_SYNC:
+        print(
+            f"[mobile-intel] 앱 CSV 갱신 차단: 캐나다 종목 {ca_rows}개, "
+            f"최소 {MIN_CANADA_ROWS_FOR_APP_SYNC}개 필요 · markets={counts}",
+            flush=True,
+        )
+        return 1
+    print(f"[mobile-intel] input rows={len(results)} ok={ok_rows} markets={counts}", flush=True)
 
     quiet = read_csv(QUIET_RESULTS)
     news = read_csv(NEWS_RESULTS)
@@ -1009,7 +1046,12 @@ def enrich() -> int:
         row["mobile_news_expectation"] = news_impact["expectation"]
         row["mobile_news_impact_summary"] = news_impact["summary"]
         row["mobile_news_learned_keywords"] = learned_keyword_summary(adaptive_news_state)
-        row["mobile_news_focus"] = " · ".join(part for part in [news_text, row["mobile_sector_keywords"]] if part) or "주요 뉴스 대기"
+        focus_parts = [news_text] if news_text else []
+        if has_confirmed_company_news(row, news_text):
+            focus_parts.append(row["mobile_sector_keywords"])
+        elif not focus_parts:
+            focus_parts.append("확인된 최신 회사 뉴스 없음")
+        row["mobile_news_focus"] = " · ".join(part for part in focus_parts if part) or "주요 뉴스 대기"
         row["mobile_news_v2_strength"] = news_impact.get("v2_strength", 0)
         row["mobile_news_v2_duration"] = news_impact.get("v2_duration", "")
         row["mobile_news_v2_market_reaction"] = news_impact.get("v2_market_reaction", "")
@@ -1040,6 +1082,19 @@ def enrich() -> int:
         updated_count += 1
 
     enriched = pd.DataFrame(enriched_rows)
+    enriched_records = enriched.to_dict("records")
+    ok, reason = validate_no_stock_loss(enriched_records, records, "mobile-intel output")
+    print(f"[mobile-intel] {reason}", flush=True)
+    if not ok:
+        print("[mobile-intel] 앱 CSV 갱신 차단: 종목 삭제 감지", flush=True)
+        return 1
+    previous_ios_records = read_csv(IOS_RESULTS).to_dict("records")
+    if previous_ios_records:
+        ok, reason = validate_no_stock_loss(enriched_records, previous_ios_records, "mobile-intel iOS sync")
+        print(f"[mobile-intel] {reason}", flush=True)
+        if not ok:
+            print("[mobile-intel] iOS CSV 갱신 차단: 기존 앱 종목 삭제 감지", flush=True)
+            return 1
     enriched.to_csv(MARKET_RESULTS, index=False, encoding="utf-8-sig")
     IOS_RESULTS.parent.mkdir(parents=True, exist_ok=True)
     enriched.to_csv(IOS_RESULTS, index=False, encoding="utf-8-sig")
@@ -1051,7 +1106,8 @@ def enrich() -> int:
     enforce_runtime_security(BASE_DIR, output_files=[MARKET_RESULTS, IOS_RESULTS])
     print(
         f"[mobile-intel] enriched {len(enriched)} rows -> {MARKET_RESULTS.name}, iOS csv "
-        f"(updated={updated_count}, reused={reused_count}, incremental={ENABLE_INCREMENTAL})"
+        f"(updated={updated_count}, reused={reused_count}, incremental={ENABLE_INCREMENTAL}, "
+        f"markets={market_counts(enriched.to_dict('records'))})"
     )
     return 0
 
