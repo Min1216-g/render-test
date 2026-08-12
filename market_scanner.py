@@ -6283,6 +6283,17 @@ def build_sector_closing_comment(sector_leaderboard):
 
 def build_report(results, market_context):
     now = datetime.now(pd.Timestamp.now(tz=SEOUL_TZ).tzinfo).strftime("%Y-%m-%d %H:%M")
+    numeric_fields = ("score", "risk", "volume_ratio", "change_pct", "atr_pct", "rsi")
+    normalized_results = []
+    for item in results:
+        row = dict(item)
+        for field in numeric_fields:
+            try:
+                row[field] = float(str(row.get(field, 0)).replace(",", "").strip() or 0)
+            except (TypeError, ValueError):
+                row[field] = 0.0
+        normalized_results.append(row)
+    results = normalized_results
     candidates = [item for item in results if item.get("status") == "ok" and item["score"] >= 40]
     top = sorted(candidates, key=lambda item: (item["score"], -item["risk"], item["volume_ratio"]), reverse=True)[:TOP_N]
     sector_context = build_sector_context(results)
