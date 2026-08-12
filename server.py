@@ -1111,6 +1111,35 @@ def _run_scanner_background(mode: str = "quick", job_lock: Optional[InterProcess
                 except OSError:
                     pass
         if update.returncode != 0:
+            _invalidate_results_cache()
+            snapshot = _current_result_snapshot()
+            path = _result_path()
+            file_mtime = path.stat().st_mtime if path.exists() else 0.0
+            if (
+                file_mtime >= started_at
+                and int(snapshot.get("rows", 0) or 0) >= MIN_UPLOAD_ROWS
+                and int(snapshot.get("ok_rows", 0) or 0) >= MIN_UPLOAD_OK_ROWS
+                and snapshot.get("data_generated_at")
+            ):
+                duration_seconds = round(time.time() - started_at, 2)
+                _write_scanner_status(
+                    running=False,
+                    state="completed_with_warning",
+                    message=(
+                        f"최신 데이터 생성 완료 · 후속 작업 경고 code={update.returncode} · "
+                        f"{snapshot.get('ok_rows', 0)}/{snapshot.get('rows', 0)} 정상"
+                    ),
+                    return_code=update.returncode,
+                    output=(stdout + "\n" + stderr)[-4000:],
+                    progress=100,
+                    mode=scan_mode,
+                    duration_seconds=duration_seconds,
+                    completed_at=time.time(),
+                    completed_at_iso=_now_iso(),
+                    **snapshot,
+                )
+                _log_memory("scanner-completed-with-warning", rows=snapshot.get("rows"), ok_rows=snapshot.get("ok_rows"))
+                return
             _write_scanner_status(
                 running=False,
                 state="failed",
