@@ -27,6 +27,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from ops_guard import sanitize_secret, validate_search_text, validate_ticker
+from runtime_job_guard import InterProcessJobLock, read_lock_payload
 from canada_market_guard import (
     CANADA_MARKET_LABEL,
     MIN_CANADA_ROWS_FOR_APP_SYNC,
@@ -59,6 +60,8 @@ ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "true").lower() ==
 SCANNER_DEFAULT_MAX_WORKERS = os.getenv("MARKET_RENDER_SCANNER_MAX_WORKERS", "2" if os.getenv("RENDER") else "4")
 SCANNER_DEFAULT_MAX_STOCKS = os.getenv("MARKET_RENDER_SCANNER_MAX_STOCKS", "420" if os.getenv("RENDER") else "550")
 SCANNER_ENABLE_INTRADAY_1M = os.getenv("MARKET_RENDER_ENABLE_INTRADAY_1M", "false")
+SCANNER_START_MAX_RSS_MB = float(os.getenv("MARKET_SCANNER_START_MAX_RSS_MB", "430" if os.getenv("RENDER") else "2048"))
+HEAVY_JOB_STALE_SECONDS = int(os.getenv("MARKET_HEAVY_JOB_STALE_SECONDS", "7200"))
 MAX_UPLOAD_BYTES = int(os.getenv("MARKET_RESULTS_UPLOAD_MAX_BYTES", "6000000"))
 MAX_JSON_BYTES = int(os.getenv("MARKET_JSON_MAX_BYTES", "200000"))
 MIN_UPLOAD_ROWS = int(os.getenv("MARKET_RESULTS_UPLOAD_MIN_ROWS", "500"))
@@ -146,6 +149,7 @@ _scanner_lock = threading.Lock()
 _scanner_running = False
 _scanner_last_seen_mtime = 0.0
 _bug_reports_lock = threading.Lock()
+_memory_events: Deque[Dict[str, object]] = deque(maxlen=120)
 
 
 def _memory_rss_mb() -> float:
@@ -165,9 +169,76 @@ def _memory_rss_mb() -> float:
     return round(rss, 2)
 
 
+def _child_rss_mb(pid: int) -> float:
+    if not pid:
+        return 0.0
+    try:
+        result = subprocess.run(
+            ["ps", "-o", "rss=", "-p", str(pid)],
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=2,
+        )
+        rss_kb = float((result.stdout or "0").strip() or 0)
+        return round(rss_kb / 1024, 2)
+    except Exception:
+        return 0.0
+
+
 def _log_memory(stage: str, **extra: object) -> None:
     details = " ".join(f"{key}={value}" for key, value in extra.items() if value is not None)
     print(f"[MEM] {stage} rss_mb={_memory_rss_mb()} {details}".strip(), flush=True)
+    _record_memory_event(stage, **extra)
+
+
+def _record_memory_event(stage: str, **extra: object) -> None:
+    _memory_events.append(
+        {
+            "stage": stage,
+            "rss_mb": _memory_rss_mb(),
+            "at": _now_iso(),
+            **{key: value for key, value in extra.items() if value is not None},
+        }
+    )
+
+
+def _active_heavy_job() -> Optional[Dict[str, object]]:
+    lock = InterProcessJobLock("api_probe", stale_after_seconds=HEAVY_JOB_STALE_SECONDS)
+    ok, payload = lock.acquire()
+    if ok:
+        lock.release()
+        return None
+    return payload
+
+
+def _scanner_memory_block_payload(mode: str) -> Optional[Dict[str, object]]:
+    rss_mb = _memory_rss_mb()
+    if rss_mb < SCANNER_START_MAX_RSS_MB:
+        return None
+    snapshot = _current_result_snapshot()
+    status = {
+        "running": False,
+        "state": "memory_guard",
+        "message": f"서버 메모리 {rss_mb}MB · 새 스캔 생략하고 마지막 데이터를 표시",
+        "mode": mode,
+        "rss_mb": rss_mb,
+        "max_start_rss_mb": SCANNER_START_MAX_RSS_MB,
+        "progress": 100,
+        **snapshot,
+    }
+    _write_scanner_status(**status)
+    _record_memory_event("scanner-start-blocked", mode=mode, max_start_rss_mb=SCANNER_START_MAX_RSS_MB)
+    return {
+        "ok": True,
+        "started": False,
+        "running": False,
+        "skipped": True,
+        "reason": "memory_guard",
+        "message": status["message"],
+        "status": status,
+        "updated_at": _now_iso(),
+    }
 
 
 def _invalidate_results_cache() -> None:
@@ -875,10 +946,25 @@ def _scanner_cooldown_payload(status: Dict[str, object]) -> Optional[Dict[str, o
     }
 
 
-def _run_scanner_background(mode: str = "quick") -> None:
+def _run_scanner_background(mode: str = "quick", job_lock: Optional[InterProcessJobLock] = None) -> None:
     global _scanner_running, _scanner_last_seen_mtime
     scan_mode = "full" if mode == "full" else "quick"
     try:
+        if job_lock is None:
+            job_lock = InterProcessJobLock(f"api_scanner_{scan_mode}", stale_after_seconds=HEAVY_JOB_STALE_SECONDS)
+            ok, holder = job_lock.acquire()
+            if not ok:
+                snapshot = _current_result_snapshot()
+                _write_scanner_status(
+                    running=False,
+                    state="already_running",
+                    message=f"무거운 작업 실행중 · 새 스캔 생략: {holder.get('name', 'unknown')}",
+                    progress=100,
+                    mode=scan_mode,
+                    lock_holder=holder,
+                    **snapshot,
+                )
+                return
         _log_memory("scanner-start")
         _cleanup_runtime_storage()
         _clear_runtime_api_caches()
@@ -913,7 +999,9 @@ def _run_scanner_background(mode: str = "quick") -> None:
         scanner_env.setdefault("MARKET_SCANNER_CACHE_RETENTION_DAYS", "1")
         scanner_env.setdefault("MOBILE_INTEL_MAX_NEWS_OBSERVATIONS", "700" if os.getenv("RENDER") else "1200")
         scanner_env.setdefault("MARKET_SCANNER_CACHE_MAX_ITEMS", "128" if os.getenv("RENDER") else "512")
+        scanner_env.setdefault("MARKET_DATA_CACHE_MAX_ITEMS", "128" if os.getenv("RENDER") else "512")
         scanner_env.setdefault("MARKET_SCANNER_MEMORY_PROFILE", "true")
+        scanner_env["MARKET_HEAVY_JOB_LOCK_HELD_BY_PARENT"] = "1"
         scanner_env["MOBILE_SCAN_FAST_MODE"] = "false" if scan_mode == "full" else "true"
         if scan_mode == "quick":
             scanner_env["MARKET_SCANNER_ENABLE_INTRADAY_1M"] = "false"
@@ -987,14 +1075,18 @@ def _run_scanner_background(mode: str = "quick") -> None:
                         last_heartbeat = now
                 if now - last_heartbeat >= 15:
                     snapshot = _current_result_snapshot()
+                    child_rss = _child_rss_mb(update.pid)
                     progress = min(80, max(25, int(current_status.get("progress") or 25) + 1))
+                    _record_memory_event("scanner-child-running", mode=scan_mode, child_pid=update.pid, child_rss_mb=child_rss)
                     _write_scanner_status(
                         running=True,
                         state="running",
-                        message=f"{'전체' if scan_mode == 'full' else '빠른'} 스캔 실행중... {progress}%",
+                        message=f"{'전체' if scan_mode == 'full' else '빠른'} 스캔 실행중... {progress}% · child {child_rss}MB",
                         progress=progress,
                         started_at=started_at,
                         mode=scan_mode,
+                        server_rss_mb=_memory_rss_mb(),
+                        child_rss_mb=child_rss,
                         **snapshot,
                     )
                     last_heartbeat = now
@@ -1090,6 +1182,8 @@ def _run_scanner_background(mode: str = "quick") -> None:
     except Exception as exc:
         _write_scanner_status(running=False, state="failed", message=f"스캐너 오류: {exc}", progress=0)
     finally:
+        if job_lock is not None:
+            job_lock.release()
         with _scanner_lock:
             _scanner_running = False
 
@@ -1411,6 +1505,9 @@ async def scanner_run(
     if not SAFE_MODE_PATTERN.match(mode.strip()):
         raise HTTPException(status_code=400, detail="invalid scanner mode")
     scan_mode = "full" if mode.lower().strip() == "full" else "quick"
+    memory_block = _scanner_memory_block_payload(scan_mode)
+    if memory_block:
+        return memory_block
     with _scanner_lock:
         if _scanner_running:
             return {
@@ -1421,9 +1518,34 @@ async def scanner_run(
                 "status": _read_scanner_status(),
                 "updated_at": _now_iso(),
             }
+        job_lock = InterProcessJobLock(f"api_scanner_{scan_mode}", stale_after_seconds=HEAVY_JOB_STALE_SECONDS)
+        lock_ok, holder = job_lock.acquire()
+        if not lock_ok:
+            snapshot = _current_result_snapshot()
+            status = {
+                "running": True,
+                "state": "already_running",
+                "message": f"무거운 작업 실행중 · 새 스캔 생략: {holder.get('name', 'unknown')}",
+                "progress": 100,
+                "mode": scan_mode,
+                "lock_holder": holder,
+                **snapshot,
+            }
+            _write_scanner_status(**status)
+            return {
+                "ok": True,
+                "started": False,
+                "running": True,
+                "skipped": True,
+                "reason": "heavy_job_already_running",
+                "message": status["message"],
+                "status": status,
+                "updated_at": _now_iso(),
+            }
         current_status = _read_scanner_status()
         cooldown_payload = None if scan_mode == "full" or force else _scanner_cooldown_payload(current_status)
         if cooldown_payload:
+            job_lock.release()
             _invalidate_results_cache()
             return cooldown_payload
         _scanner_running = True
@@ -1438,7 +1560,7 @@ async def scanner_run(
             mode=scan_mode,
             **quick_snapshot,
         )
-        thread = threading.Thread(target=_run_scanner_background, args=(scan_mode,), daemon=True)
+        thread = threading.Thread(target=_run_scanner_background, args=(scan_mode, job_lock), daemon=True)
         thread.start()
     return {
         "ok": True,
@@ -1468,6 +1590,27 @@ async def scanner_status(request: Request) -> Dict[str, object]:
     return {
         "ok": True,
         "status": status,
+        "memory": {
+            "rss_mb": _memory_rss_mb(),
+            "scanner_start_max_rss_mb": SCANNER_START_MAX_RSS_MB,
+            "heavy_job_lock": read_lock_payload(),
+            "recent_events": list(_memory_events)[-20:],
+        },
+        "updated_at": _now_iso(),
+    }
+
+
+@app.get("/api/system/memory")
+async def system_memory(request: Request) -> Dict[str, object]:
+    await guarded(request)
+    return {
+        "ok": True,
+        "rss_mb": _memory_rss_mb(),
+        "scanner_running": _scanner_running,
+        "scanner_start_max_rss_mb": SCANNER_START_MAX_RSS_MB,
+        "heavy_job_lock": read_lock_payload(),
+        "recent_events": list(_memory_events),
+        "status": _read_scanner_status(),
         "updated_at": _now_iso(),
     }
 
@@ -1623,18 +1766,30 @@ async def save_ai_screening_profile(request: Request) -> Dict[str, object]:
 @app.post("/api/ai-screening/run")
 async def run_ai_screening(request: Request, limit: int = Query(default=50, ge=1, le=200)) -> Dict[str, object]:
     await guarded(request)
+    if _memory_rss_mb() >= SCANNER_START_MAX_RSS_MB:
+        raise HTTPException(status_code=503, detail="server memory guard active; retry later")
+    job_lock = InterProcessJobLock("api_ai_screening", stale_after_seconds=HEAVY_JOB_STALE_SECONDS)
+    lock_ok, holder = job_lock.acquire()
+    if not lock_ok:
+        raise HTTPException(status_code=409, detail=f"heavy job already running: {holder.get('name', 'unknown')}")
     from korean_ai_screening_simulator import run_screening
 
     try:
-        payload = await _read_json_payload(request)
-    except HTTPException:
-        raise
-    except Exception:
-        payload = {}
-    profile = payload if isinstance(payload, dict) and payload else None
-    result = run_screening(profile=profile, limit=limit)
-    result["updated_at"] = _now_iso()
-    return result
+        _log_memory("ai-screening-start", limit=limit)
+        try:
+            payload = await _read_json_payload(request)
+        except HTTPException:
+            raise
+        except Exception:
+            payload = {}
+        profile = payload if isinstance(payload, dict) and payload else None
+        result = run_screening(profile=profile, limit=limit)
+        result["updated_at"] = _now_iso()
+        _log_memory("ai-screening-finished", limit=limit)
+        return result
+    finally:
+        job_lock.release()
+        gc.collect()
 
 
 @app.post("/api/ai-screening/backtest")
@@ -1646,18 +1801,30 @@ async def run_ai_screening_backtest(
     await guarded(request)
     if not SAFE_PERIOD_PATTERN.match(period.strip()):
         raise HTTPException(status_code=400, detail="invalid backtest period")
+    if _memory_rss_mb() >= SCANNER_START_MAX_RSS_MB:
+        raise HTTPException(status_code=503, detail="server memory guard active; retry later")
+    job_lock = InterProcessJobLock("api_ai_backtest", stale_after_seconds=HEAVY_JOB_STALE_SECONDS)
+    lock_ok, holder = job_lock.acquire()
+    if not lock_ok:
+        raise HTTPException(status_code=409, detail=f"heavy job already running: {holder.get('name', 'unknown')}")
     from korean_ai_screening_simulator import backtest_screening
 
     try:
-        payload = await _read_json_payload(request)
-    except HTTPException:
-        raise
-    except Exception:
-        payload = {}
-    profile = payload if isinstance(payload, dict) and payload else None
-    result = backtest_screening(profile=profile, period=period, max_symbols=max_symbols)
-    result["updated_at"] = _now_iso()
-    return result
+        _log_memory("ai-backtest-start", period=period, max_symbols=max_symbols)
+        try:
+            payload = await _read_json_payload(request)
+        except HTTPException:
+            raise
+        except Exception:
+            payload = {}
+        profile = payload if isinstance(payload, dict) and payload else None
+        result = backtest_screening(profile=profile, period=period, max_symbols=max_symbols)
+        result["updated_at"] = _now_iso()
+        _log_memory("ai-backtest-finished", period=period, max_symbols=max_symbols)
+        return result
+    finally:
+        job_lock.release()
+        gc.collect()
 
 
 @app.get("/api/paper-trading/account")

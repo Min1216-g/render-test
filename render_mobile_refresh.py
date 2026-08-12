@@ -9,11 +9,13 @@ import json
 import os
 from pathlib import Path
 
+from runtime_job_guard import InterProcessJobLock
 from run_market_scanner_update import RESULT_FILE, upload_results_to_remote
 
 
 BASE_DIR = Path(__file__).resolve().parent
 PERF_REPORT_FILE = BASE_DIR / "mobile_scan_performance_report.json"
+HEAVY_JOB_STALE_SECONDS = int(os.getenv("MARKET_HEAVY_JOB_STALE_SECONDS", "7200"))
 
 
 class PerfReport:
@@ -53,13 +55,18 @@ def mobile_fast_env() -> dict[str, str]:
     env = os.environ.copy()
     if env.get("MOBILE_SCAN_FAST_MODE", "true").lower() in {"0", "false", "no"}:
         return env
-    existing_workers = int(env.get("MARKET_SCANNER_MAX_WORKERS", "0") or 0)
-    env["MARKET_SCANNER_MAX_WORKERS"] = str(max(existing_workers, int(env.get("MOBILE_SCAN_FAST_WORKERS", "8"))))
+    render_default_workers = "2" if env.get("RENDER") else "4"
+    requested_workers = int(env.get("MOBILE_SCAN_FAST_WORKERS", render_default_workers) or render_default_workers)
+    existing_workers = int(env.get("MARKET_SCANNER_MAX_WORKERS", requested_workers) or requested_workers)
+    max_workers = int(env.get("MARKET_SCANNER_RENDER_WORKER_CAP", render_default_workers) or render_default_workers)
+    env["MARKET_SCANNER_MAX_WORKERS"] = str(max(1, min(existing_workers, requested_workers, max_workers)))
     env.setdefault("MARKET_SCANNER_ENABLE_INTRADAY_1M", "false")
     env.setdefault("MARKET_SCANNER_NEWS_SOURCES", "google_news")
     env.setdefault("MARKET_SCANNER_ENABLE_SECTOR_NEWS", "false")
+    env.setdefault("MARKET_SCANNER_CACHE_MAX_ITEMS", "96" if env.get("RENDER") else "256")
+    env.setdefault("MARKET_DATA_CACHE_MAX_ITEMS", "96" if env.get("RENDER") else "256")
     env.setdefault("MOBILE_INTEL_INCREMENTAL", "true")
-    env.setdefault("MOBILE_INTEL_MAX_NEWS_OBSERVATIONS", "500")
+    env.setdefault("MOBILE_INTEL_MAX_NEWS_OBSERVATIONS", "250" if env.get("RENDER") else "500")
     env.setdefault("MOBILE_INTEL_MAX_NEWS_PATTERNS", "50")
     return env
 
@@ -79,32 +86,45 @@ def main() -> int:
     perf = PerfReport()
     py = sys.executable
     env = mobile_fast_env()
+    lock = None
+    if env.get("MARKET_HEAVY_JOB_LOCK_HELD_BY_PARENT") != "1":
+        lock = InterProcessJobLock("render_mobile_refresh", stale_after_seconds=HEAVY_JOB_STALE_SECONDS)
+        lock_ok, holder = lock.acquire()
+        if not lock_ok:
+            perf.save(status="skipped_already_running", lock_holder=holder)
+            print(f"skip render_mobile_refresh: heavy job already running {holder}", flush=True)
+            return 0
     perf.save(
         status="started",
         api_call_policy="batch where available, reduced mobile news sources",
         cache_policy="incremental mobile intel enabled",
+        max_workers=env.get("MARKET_SCANNER_MAX_WORKERS"),
     )
-    scanner_code = run_step("market_scanner_update", [py, str(BASE_DIR / "run_market_scanner_update.py"), "--force"], 3000, perf, env)
-    if scanner_code != 0:
-        perf.save(status="failed_at_scanner")
-        return scanner_code
+    try:
+        scanner_code = run_step("market_scanner_update", [py, str(BASE_DIR / "run_market_scanner_update.py"), "--force"], 3000, perf, env)
+        if scanner_code != 0:
+            perf.save(status="failed_at_scanner")
+            return scanner_code
 
-    intel_script = BASE_DIR / "mobile_intelligence_feed.py"
-    if intel_script.exists():
-        intel_code = run_step("mobile_intelligence_feed", [py, str(intel_script)], 300, perf, env)
-        if intel_code != 0:
-            print("mobile intelligence failed, keeping scanner CSV", flush=True)
+        intel_script = BASE_DIR / "mobile_intelligence_feed.py"
+        if intel_script.exists():
+            intel_code = run_step("mobile_intelligence_feed", [py, str(intel_script)], 300, perf, env)
+            if intel_code != 0:
+                print("mobile intelligence failed, keeping scanner CSV", flush=True)
 
-    print("upload final mobile CSV", flush=True)
-    upload_started = time.perf_counter()
-    upload_results_to_remote(RESULT_FILE)
-    perf.add("remote_upload", upload_started, ok=True)
-    perf.save(
-        status="completed",
-        api_call_policy="mobile fast mode uses reduced news sources and disabled 1m intraday",
-        cache_policy="unchanged mobile intelligence rows reused",
-    )
-    return 0
+        print("upload final mobile CSV", flush=True)
+        upload_started = time.perf_counter()
+        upload_results_to_remote(RESULT_FILE)
+        perf.add("remote_upload", upload_started, ok=True)
+        perf.save(
+            status="completed",
+            api_call_policy="mobile fast mode uses reduced news sources and disabled 1m intraday",
+            cache_policy="unchanged mobile intelligence rows reused",
+        )
+        return 0
+    finally:
+        if lock is not None:
+            lock.release()
 
 
 if __name__ == "__main__":

@@ -15,6 +15,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from ops_guard import enforce_runtime_security
+from runtime_job_guard import InterProcessJobLock
 from run_market_scanner_update import RESULT_FILE, upload_results_to_remote
 
 
@@ -22,6 +23,7 @@ BASE_DIR = Path(__file__).resolve().parent
 VANCOUVER_TZ = ZoneInfo("America/Vancouver")
 REPORT_FILE = BASE_DIR / "run_all_market_programs_report.json"
 LOG_FILE = BASE_DIR / "run_all_market_programs.log"
+HEAVY_JOB_STALE_SECONDS = int(os.getenv("MARKET_HEAVY_JOB_STALE_SECONDS", "7200"))
 SECRET_PATTERNS = (
     re.compile(r"\b\d{8,12}:[A-Za-z0-9_-]{20,}\b"),
     re.compile(r"(?i)(bot|token|api[_-]?key|secret|password)([=: /]+)([^\s\"']{8,})"),
@@ -170,28 +172,49 @@ def main() -> int:
     args = parser.parse_args()
 
     enforce_runtime_security(BASE_DIR, output_files=[REPORT_FILE, LOG_FILE])
+    lock = InterProcessJobLock("run_all_market_programs", stale_after_seconds=HEAVY_JOB_STALE_SECONDS)
+    lock_ok, holder = lock.acquire()
+    if not lock_ok:
+        write_log(f"skip: heavy job already running {holder}")
+        save_report(
+            [
+                {
+                    "name": "heavy_job_lock",
+                    "ok": True,
+                    "optional": False,
+                    "returncode": 0,
+                    "duration_seconds": 0,
+                    "stdout_tail": "skipped because another heavy market job is running",
+                    "stderr_tail": "",
+                }
+            ]
+        )
+        return 0
     py = python_bin()
     results: list[dict[str, object]] = []
 
-    for step in step_plan(py, quick=args.quick):
-        item = run_step(step)
-        results.append(item)
+    try:
+        for step in step_plan(py, quick=args.quick):
+            item = run_step(step)
+            results.append(item)
+            save_report(results)
+            if not item["ok"] and not args.continue_on_error and not step.optional:
+                break
+
+        if all(item["ok"] or item["optional"] for item in results):
+            results.append(upload_final_mobile_result())
+
         save_report(results)
-        if not item["ok"] and not args.continue_on_error and not step.optional:
-            break
+        failed_required = [item["name"] for item in results if not item["ok"] and not item["optional"]]
+        if failed_required:
+            write_log(f"required failures: {', '.join(failed_required)}")
+            write_log("run: python3 program_error_doctor.py")
+            return 1
 
-    if all(item["ok"] or item["optional"] for item in results):
-        results.append(upload_final_mobile_result())
-
-    save_report(results)
-    failed_required = [item["name"] for item in results if not item["ok"] and not item["optional"]]
-    if failed_required:
-        write_log(f"required failures: {', '.join(failed_required)}")
-        write_log("run: python3 program_error_doctor.py")
-        return 1
-
-    write_log("all required programs finished")
-    return 0
+        write_log("all required programs finished")
+        return 0
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":
