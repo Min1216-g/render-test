@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import html
 import json
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
@@ -15,6 +16,7 @@ from urllib.parse import urljoin
 from zoneinfo import ZoneInfo
 
 import requests
+from concurrent.futures import TimeoutError
 
 from canada_market_guard import is_canada_row, is_canada_ticker
 
@@ -23,6 +25,7 @@ BASE_DIR = Path(__file__).resolve().parent
 CANADA_NEWS_CACHE_FILE = BASE_DIR / "canada_news_cache.json"
 TORONTO_TZ = ZoneInfo("America/Toronto")
 REQUEST_TIMEOUT = 8
+COLLECT_TIMEOUT_SECONDS = int(os.getenv("CANADA_NEWS_COLLECT_TIMEOUT_SECONDS", "45"))
 PRIMARY_NEWS_HOURS = 24
 FALLBACK_NEWS_DAYS = 7
 MAX_ITEMS_PER_TICKER = 5
@@ -419,23 +422,44 @@ def apply_canada_news_to_rows(rows: list[dict], max_symbols: int | None = None) 
     news_by_index = {}
     if targets:
         workers = min(8, max(1, len(targets)))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
             futures = {
                 executor.submit(fetch_canada_news_for_symbol, ticker, company, cache): (index, ticker)
                 for index, ticker, company in targets
             }
-            for future in as_completed(futures):
+            pending = set(futures)
+            try:
+                completed_iter = as_completed(futures, timeout=COLLECT_TIMEOUT_SECONDS)
+                for future in completed_iter:
+                    pending.discard(future)
+                    index, ticker = futures[future]
+                    try:
+                        news_by_index[index] = future.result(timeout=1)
+                    except Exception as exc:
+                        news_by_index[index] = {
+                            "status": "unavailable",
+                            "freshness": "",
+                            "items": [],
+                            "source_status": f"canada_news_error:{exc.__class__.__name__}",
+                            "collected_at_local": _local_iso(_now()),
+                        }
+            except TimeoutError:
+                pass
+            for future in pending:
+                future.cancel()
                 index, ticker = futures[future]
-                try:
-                    news_by_index[index] = future.result()
-                except Exception as exc:
-                    news_by_index[index] = {
-                        "status": "unavailable",
-                        "freshness": "",
-                        "items": [],
-                        "source_status": f"canada_news_error:{exc.__class__.__name__}",
-                        "collected_at_local": _local_iso(_now()),
-                    }
+                cached = cache.get(ticker, {}).get("items", [])
+                items, freshness = _fresh_filter(cached)
+                news_by_index[index] = {
+                    "status": "cache" if items else "timeout",
+                    "freshness": freshness,
+                    "items": items,
+                    "source_status": f"canada_news_timeout:{COLLECT_TIMEOUT_SECONDS}s",
+                    "collected_at_local": _local_iso(_now()),
+                }
+        finally:
+            executor.shutdown(wait=False, cancel_futures=True)
 
     for index, row in enumerate(rows):
         item = dict(row)
