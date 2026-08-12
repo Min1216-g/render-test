@@ -3599,6 +3599,35 @@ def should_block_result_overwrite(rows, expected_count):
     return False, ""
 
 
+def merge_unscanned_previous_rows(rows):
+    if MAX_STOCKS <= 0:
+        return rows
+    previous_rows = read_guard_csv_rows(RESULT_FILE)
+    if not previous_rows or len(previous_rows) <= len(rows):
+        return rows
+    merged = []
+    seen = set()
+    for row in rows:
+        key = str(row.get("ticker") or row.get("name") or "").strip().upper()
+        if key:
+            seen.add(key)
+        merged.append(row)
+    restored = 0
+    for row in previous_rows:
+        key = str(row.get("ticker") or row.get("name") or "").strip().upper()
+        if key and key not in seen:
+            item = dict(row)
+            item["status"] = item.get("status") or "cached_unscanned"
+            item["data_sources"] = f"{item.get('data_sources', '')}, preserved_unscanned".strip(", ")
+            item["news_one_line"] = item.get("news_one_line") or "빠른 갱신 미스캔 · 이전 데이터 보존"
+            merged.append(item)
+            seen.add(key)
+            restored += 1
+    if restored:
+        print(f"빠른 스캔 병합: 신규 {len(rows)}개 + 기존 미스캔 {restored}개 보존 = {len(merged)}개", flush=True)
+    return merged
+
+
 def market_label_for_ticker(ticker):
     clean_ticker = normalize_market_ticker(ticker)
     if clean_ticker.endswith((".TO", ".V")):
@@ -6513,6 +6542,7 @@ def main():
         print(f"캐나다 뉴스 수집 상태: {canada_news_stats}", flush=True)
     except Exception as exc:
         print(f"캐나다 뉴스 수집 실패: {sanitize_error(exc)} · 종목 데이터는 유지", flush=True)
+    rows = merge_unscanned_previous_rows(rows)
     counts = market_counts(rows)
     ca_rows = canada_count(rows)
     print(f"시장별 수집 결과: {counts} · 캐나다 {ca_rows}개", flush=True)
