@@ -57,7 +57,7 @@ CACHE_TTL_SECONDS = int(os.getenv("MARKET_RESULTS_CACHE_TTL", "20"))
 RESULTS_CACHE_MAX_ROWS = int(os.getenv("MARKET_RESULTS_CACHE_MAX_ROWS", "1200"))
 SCANNER_RUN_COOLDOWN_SECONDS = int(os.getenv("MARKET_SCANNER_RUN_COOLDOWN_SECONDS", "300"))
 ENABLE_FULL_SCANNER = os.getenv("MARKET_ENABLE_FULL_SCANNER", "true").lower() == "true"
-SCANNER_DEFAULT_MAX_WORKERS = os.getenv("MARKET_RENDER_SCANNER_MAX_WORKERS", "2" if os.getenv("RENDER") else "4")
+SCANNER_DEFAULT_MAX_WORKERS = os.getenv("MARKET_RENDER_SCANNER_MAX_WORKERS", "3" if os.getenv("RENDER") else "4")
 SCANNER_DEFAULT_MAX_STOCKS = os.getenv("MARKET_RENDER_SCANNER_MAX_STOCKS", "420" if os.getenv("RENDER") else "550")
 SCANNER_ENABLE_INTRADAY_1M = os.getenv("MARKET_RENDER_ENABLE_INTRADAY_1M", "false")
 SCANNER_START_MAX_RSS_MB = float(os.getenv("MARKET_SCANNER_START_MAX_RSS_MB", "430" if os.getenv("RENDER") else "2048"))
@@ -1076,6 +1076,9 @@ def _run_scanner_background(mode: str = "quick", job_lock: Optional[InterProcess
                 if now - last_heartbeat >= 15:
                     snapshot = _current_result_snapshot()
                     child_rss = _child_rss_mb(update.pid)
+                    stdout_log.flush()
+                    stderr_log.flush()
+                    live_output = (_read_text_tail(stdout_path, max_chars=1800) + "\n" + _read_text_tail(stderr_path, max_chars=800))[-2200:]
                     progress = min(80, max(25, int(current_status.get("progress") or 25) + 1))
                     _record_memory_event("scanner-child-running", mode=scan_mode, child_pid=update.pid, child_rss_mb=child_rss)
                     _write_scanner_status(
@@ -1087,6 +1090,7 @@ def _run_scanner_background(mode: str = "quick", job_lock: Optional[InterProcess
                         mode=scan_mode,
                         server_rss_mb=_memory_rss_mb(),
                         child_rss_mb=child_rss,
+                        live_output=live_output,
                         **snapshot,
                     )
                     last_heartbeat = now

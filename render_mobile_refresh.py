@@ -58,7 +58,7 @@ def mobile_fast_env() -> dict[str, str]:
     env = os.environ.copy()
     if env.get("MOBILE_SCAN_FAST_MODE", "true").lower() in {"0", "false", "no"}:
         return env
-    render_default_workers = "2" if env.get("RENDER") else "4"
+    render_default_workers = "3" if env.get("RENDER") else "4"
     requested_workers = int(env.get("MOBILE_SCAN_FAST_WORKERS", render_default_workers) or render_default_workers)
     existing_workers = int(env.get("MARKET_SCANNER_MAX_WORKERS", requested_workers) or requested_workers)
     max_workers = int(env.get("MARKET_SCANNER_RENDER_WORKER_CAP", render_default_workers) or render_default_workers)
