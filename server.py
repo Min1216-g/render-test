@@ -1007,6 +1007,7 @@ def _run_scanner_background(mode: str = "quick", job_lock: Optional[InterProcess
             scanner_env["MARKET_SCANNER_ENABLE_INTRADAY_1M"] = "false"
             scanner_env["MARKET_SCANNER_NEWS_SOURCES"] = "google_news"
             scanner_env["MARKET_SCANNER_ENABLE_SECTOR_NEWS"] = "false"
+            scanner_env["MARKET_SCANNER_SKIP_OPTIONAL_YAHOO"] = "true"
             scanner_env["MOBILE_INTEL_INCREMENTAL"] = "true"
             scanner_env["MOBILE_INTEL_MAX_NEWS_OBSERVATIONS"] = "300" if os.getenv("RENDER") else "500"
         else:

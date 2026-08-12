@@ -2,11 +2,15 @@
 
 import html
 import ast
+import csv
+import gc
 import json
 import os
 import re
+import resource
 import shutil
 import stat
+import sys
 import threading
 import time as time_module
 import xml.etree.ElementTree as ET
@@ -22,7 +26,11 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from market_data_provider import clear_provider_caches, get_historical_ohlcv, get_quote
 from ops_guard import enforce_runtime_security
+from canada_market_guard import MIN_CANADA_ROWS_FOR_APP_SYNC, canada_count, market_counts
+from canada_news_service import apply_canada_news_to_rows
+from stock_universe_guard import read_csv_rows as read_guard_csv_rows, validate_no_stock_loss
 
 try:
     from ai_failure_memory import failure_adjustment_for
@@ -996,6 +1004,8 @@ CANADA_DEFAULT_STOCKS = {
 
 CANADA_EXPANDED_STOCKS = {
     "Vanguard S&P 500 Index ETF": "VFV.TO",
+    "Kraken Robotics": "PNG.V",
+    "HIVE Digital Technologies": "HIVE.TO",
     "National Bank": "NA.TO",
     "Equitable Bank": "EQB.TO",
     "Laurentian Bank": "LB.TO",
@@ -1257,6 +1267,8 @@ CANADA_SECTOR_MAP = {
 
 CANADA_EXPANDED_SECTOR_MAP = {
     "Vanguard S&P 500 Index ETF": "캐나다/ETF",
+    "Kraken Robotics": "캐나다/TSXV/해양로봇",
+    "HIVE Digital Technologies": "캐나다/AI인프라/디지털자산",
     "National Bank": "캐나다/은행",
     "Equitable Bank": "캐나다/은행",
     "Laurentian Bank": "캐나다/은행",
@@ -1394,6 +1406,8 @@ US_TOP100_STOCKS = {
     "Intel": "INTC",
     "Qualcomm": "QCOM",
     "Micron": "MU",
+    "Sandisk": "SNDK",
+    "Western Digital": "WDC",
     "Texas Instruments": "TXN",
     "Applied Materials": "AMAT",
     "Lam Research": "LRCX",
@@ -1481,6 +1495,62 @@ US_WIRE_STOCKS = {
     "American Superconductor": "AMSC",
 }
 
+US_SEMICONDUCTOR_FOCUS_STOCKS = {
+    "Marvell Technology": "MRVL",
+    "KLA": "KLAC",
+    "Synopsys": "SNPS",
+    "Cadence Design": "CDNS",
+    "ON Semiconductor": "ON",
+    "NXP Semiconductors": "NXPI",
+    "Monolithic Power": "MPWR",
+    "Microchip Technology": "MCHP",
+    "Analog Devices": "ADI",
+    "GlobalFoundries": "GFS",
+    "Teradyne": "TER",
+    "Entegris": "ENTG",
+    "Coherent": "COHR",
+    "Wolfspeed": "WOLF",
+    "iShares Semiconductor ETF": "SOXX",
+    "VanEck Semiconductor ETF": "SMH",
+    "Invesco PHLX Semiconductor ETF": "SOXQ",
+    "SPDR S&P Semiconductor ETF": "XSD",
+    "First Trust Nasdaq Semiconductor ETF": "FTXL",
+    "Invesco Dynamic Semiconductors ETF": "PSI",
+    "Direxion Semiconductor Bull 3X": "SOXL",
+    "Direxion Semiconductor Bear 3X": "SOXS",
+}
+
+US_POPULAR_ETF_STOCKS = {
+    "Invesco QQQ Trust": "QQQ",
+    "Invesco Nasdaq 100 ETF": "QQQM",
+    "State Street Nasdaq 100 ETF": "QNDX",
+    "ProShares UltraPro QQQ": "TQQQ",
+    "ProShares UltraPro Short QQQ": "SQQQ",
+    "SPDR S&P 500 ETF": "SPY",
+    "Vanguard S&P 500 ETF": "VOO",
+    "iShares Core S&P 500 ETF": "IVV",
+    "SPDR Portfolio S&P 500 ETF": "SPLG",
+    "SPDR Dow Jones Industrial Average ETF": "DIA",
+    "iShares Russell 2000 ETF": "IWM",
+    "Direxion Daily TSLA Bull 2X ETF": "TSLL",
+    "Direxion Daily TSLA Bear 1X ETF": "TSLS",
+    "AXS TSLA Bear Daily ETF": "TSLQ",
+    "GraniteShares 2x Long NVDA Daily ETF": "NVDL",
+    "Direxion Daily NVDA Bull 2X ETF": "NVDU",
+    "T-Rex 2X Inverse NVIDIA Daily Target ETF": "NVDQ",
+    "Direxion Daily AAPL Bull 2X ETF": "AAPU",
+    "Direxion Daily AAPL Bear 1X ETF": "AAPD",
+    "Direxion Daily MSFT Bull 2X ETF": "MSFU",
+    "Direxion Daily MSFT Bear 1X ETF": "MSFD",
+    "Direxion Daily GOOGL Bull 2X ETF": "GGLL",
+    "Direxion Daily GOOGL Bear 1X ETF": "GGLS",
+    "Direxion Daily AMZN Bull 2X ETF": "AMZU",
+    "Direxion Daily AMZN Bear 1X ETF": "AMZD",
+    "T-REX 2X Long SNDK ETF": "SNDU",
+    "Tradr 2X Short SNDK ETF": "SNDQ",
+    "Schwab U.S. Treasury Money Fund": "SNSXX",
+}
+
 US_TOP100_SECTOR_MAP = {
     "Apple": "미장/빅테크",
     "Microsoft": "미장/빅테크",
@@ -1506,6 +1576,8 @@ US_TOP100_SECTOR_MAP = {
     "Intel": "미장/반도체",
     "Qualcomm": "미장/반도체",
     "Micron": "미장/메모리",
+    "Sandisk": "미장/메모리/플래시",
+    "Western Digital": "미장/스토리지",
     "Texas Instruments": "미장/반도체",
     "Applied Materials": "미장/반도체장비",
     "Lam Research": "미장/반도체장비",
@@ -1591,6 +1663,62 @@ US_WIRE_SECTOR_MAP = {
     "nVent Electric": "미장/전선",
     "Powell Industries": "미장/전선",
     "American Superconductor": "미장/전선",
+}
+
+US_SEMICONDUCTOR_FOCUS_SECTOR_MAP = {
+    "Marvell Technology": "미장/반도체/데이터센터",
+    "KLA": "미장/반도체장비/검사",
+    "Synopsys": "미장/반도체/EDA",
+    "Cadence Design": "미장/반도체/EDA",
+    "ON Semiconductor": "미장/전력반도체",
+    "NXP Semiconductors": "미장/차량용반도체",
+    "Monolithic Power": "미장/전력관리반도체",
+    "Microchip Technology": "미장/MCU",
+    "Analog Devices": "미장/아날로그반도체",
+    "GlobalFoundries": "미장/파운드리",
+    "Teradyne": "미장/반도체장비/테스트",
+    "Entegris": "미장/반도체소재",
+    "Coherent": "미장/광통신/반도체",
+    "Wolfspeed": "미장/SiC전력반도체",
+    "iShares Semiconductor ETF": "미장/반도체ETF",
+    "VanEck Semiconductor ETF": "미장/반도체ETF",
+    "Invesco PHLX Semiconductor ETF": "미장/반도체ETF",
+    "SPDR S&P Semiconductor ETF": "미장/반도체ETF",
+    "First Trust Nasdaq Semiconductor ETF": "미장/반도체ETF",
+    "Invesco Dynamic Semiconductors ETF": "미장/반도체ETF",
+    "Direxion Semiconductor Bull 3X": "미장/반도체ETF/3배레버리지",
+    "Direxion Semiconductor Bear 3X": "미장/반도체ETF/3배인버스",
+}
+
+US_POPULAR_ETF_SECTOR_MAP = {
+    "Invesco QQQ Trust": "미장/대표ETF/나스닥100",
+    "Invesco Nasdaq 100 ETF": "미장/대표ETF/나스닥100",
+    "State Street Nasdaq 100 ETF": "미장/대표ETF/나스닥100",
+    "ProShares UltraPro QQQ": "미장/레버리지ETF/나스닥100/3배",
+    "ProShares UltraPro Short QQQ": "미장/인버스ETF/나스닥100/3배",
+    "SPDR S&P 500 ETF": "미장/대표ETF/S&P500",
+    "Vanguard S&P 500 ETF": "미장/대표ETF/S&P500",
+    "iShares Core S&P 500 ETF": "미장/대표ETF/S&P500",
+    "SPDR Portfolio S&P 500 ETF": "미장/대표ETF/S&P500",
+    "SPDR Dow Jones Industrial Average ETF": "미장/대표ETF/다우",
+    "iShares Russell 2000 ETF": "미장/대표ETF/러셀2000",
+    "Direxion Daily TSLA Bull 2X ETF": "미장/단일종목레버리지ETF/테슬라/2배",
+    "Direxion Daily TSLA Bear 1X ETF": "미장/단일종목인버스ETF/테슬라",
+    "AXS TSLA Bear Daily ETF": "미장/단일종목인버스ETF/테슬라",
+    "GraniteShares 2x Long NVDA Daily ETF": "미장/단일종목레버리지ETF/엔비디아/2배",
+    "Direxion Daily NVDA Bull 2X ETF": "미장/단일종목레버리지ETF/엔비디아/2배",
+    "T-Rex 2X Inverse NVIDIA Daily Target ETF": "미장/단일종목인버스ETF/엔비디아/2배",
+    "Direxion Daily AAPL Bull 2X ETF": "미장/단일종목레버리지ETF/애플/2배",
+    "Direxion Daily AAPL Bear 1X ETF": "미장/단일종목인버스ETF/애플",
+    "Direxion Daily MSFT Bull 2X ETF": "미장/단일종목레버리지ETF/마이크로소프트/2배",
+    "Direxion Daily MSFT Bear 1X ETF": "미장/단일종목인버스ETF/마이크로소프트",
+    "Direxion Daily GOOGL Bull 2X ETF": "미장/단일종목레버리지ETF/알파벳/2배",
+    "Direxion Daily GOOGL Bear 1X ETF": "미장/단일종목인버스ETF/알파벳",
+    "Direxion Daily AMZN Bull 2X ETF": "미장/단일종목레버리지ETF/아마존/2배",
+    "Direxion Daily AMZN Bear 1X ETF": "미장/단일종목인버스ETF/아마존",
+    "T-REX 2X Long SNDK ETF": "미장/단일종목레버리지ETF/샌디스크/2배",
+    "Tradr 2X Short SNDK ETF": "미장/단일종목인버스ETF/샌디스크/2배",
+    "Schwab U.S. Treasury Money Fund": "미장/머니마켓/현금성",
 }
 
 KOREA_SPACE_AEROSPACE_STOCKS = {
@@ -2044,6 +2172,10 @@ DEFAULT_STOCKS.update(US_TOP100_STOCKS)
 SECTOR_MAP.update(US_TOP100_SECTOR_MAP)
 DEFAULT_STOCKS.update(US_WIRE_STOCKS)
 SECTOR_MAP.update(US_WIRE_SECTOR_MAP)
+DEFAULT_STOCKS.update(US_SEMICONDUCTOR_FOCUS_STOCKS)
+SECTOR_MAP.update(US_SEMICONDUCTOR_FOCUS_SECTOR_MAP)
+DEFAULT_STOCKS.update(US_POPULAR_ETF_STOCKS)
+SECTOR_MAP.update(US_POPULAR_ETF_SECTOR_MAP)
 DEFAULT_STOCKS.update(KOREA_SPACE_AEROSPACE_STOCKS)
 SECTOR_MAP.update(KOREA_SPACE_AEROSPACE_SECTOR_MAP)
 DEFAULT_STOCKS.update(US_SPACE_AEROSPACE_STOCKS)
@@ -2762,6 +2894,10 @@ MIN_BUY_VOLUME_RATIO = float(os.getenv("MARKET_SCANNER_MIN_BUY_VOLUME_RATIO", "0
 MIN_BUY_TRADE_VALUE_RATIO = float(os.getenv("MARKET_SCANNER_MIN_BUY_TRADE_VALUE_RATIO", "0.8"))
 MAX_WORKERS = max(1, int(os.getenv("MARKET_SCANNER_MAX_WORKERS", "10")))
 CACHE_RETENTION_DAYS = max(1, int(os.getenv("MARKET_SCANNER_CACHE_RETENTION_DAYS", "2")))
+MEMORY_PROFILE_ENABLED = os.getenv("MARKET_SCANNER_MEMORY_PROFILE", "false").lower() in {"1", "true", "yes"}
+MAX_IN_MEMORY_CACHE_ITEMS = max(32, int(os.getenv("MARKET_SCANNER_CACHE_MAX_ITEMS", "512")))
+GC_EVERY_RESULTS = max(10, int(os.getenv("MARKET_SCANNER_GC_EVERY_RESULTS", "25")))
+SKIP_OPTIONAL_YAHOO_CALLS = os.getenv("MARKET_SCANNER_SKIP_OPTIONAL_YAHOO", "false").lower() in {"1", "true", "yes"}
 ENABLE_INTRADAY_1M = os.getenv("MARKET_SCANNER_ENABLE_INTRADAY_1M", "true").lower() not in {
     "0",
     "false",
@@ -2781,6 +2917,52 @@ CACHE_CLEANUP_TARGETS = [
     "no_data_symbols.csv",
     "excluded_no_data_symbols.csv",
 ]
+
+
+def memory_rss_mb():
+    statm = Path("/proc/self/statm")
+    if statm.exists():
+        try:
+            pages = int(statm.read_text(encoding="utf-8").split()[1])
+            return round(pages * os.sysconf("SC_PAGE_SIZE") / 1024 / 1024, 2)
+        except Exception:
+            pass
+    usage = resource.getrusage(resource.RUSAGE_SELF)
+    rss = float(usage.ru_maxrss)
+    if sys.platform == "darwin":
+        rss = rss / 1024 / 1024
+    else:
+        rss = rss / 1024
+    return round(rss, 2)
+
+
+def log_memory(stage, **extra):
+    if not MEMORY_PROFILE_ENABLED:
+        return
+    details = " ".join(f"{key}={value}" for key, value in extra.items() if value is not None)
+    print(f"[MEM] {stage} rss_mb={memory_rss_mb()} {details}".strip(), flush=True)
+
+
+def bounded_cache_set(cache, key, value, max_items=MAX_IN_MEMORY_CACHE_ITEMS):
+    cache[key] = value
+    while len(cache) > max_items:
+        try:
+            cache.pop(next(iter(cache)))
+        except StopIteration:
+            break
+
+
+def clear_runtime_caches():
+    with INTRADAY_CACHE_LOCK:
+        INTRADAY_CACHE.clear()
+    with WEEKLY_RSI_CACHE_LOCK:
+        WEEKLY_RSI_CACHE.clear()
+    with ETF_HOLDINGS_CACHE_LOCK:
+        ETF_HOLDINGS_CACHE.clear()
+    SECTOR_NEWS_CACHE.clear()
+    COMPANY_RISK_NEWS_CACHE.clear()
+    clear_provider_caches()
+    gc.collect()
 
 
 def mask_secret(value, visible=4):
@@ -2816,6 +2998,11 @@ def korean_stock_code(ticker):
     if re.fullmatch(r"[0-9A-Z]{6}", clean_ticker) and any(char.isdigit() for char in clean_ticker):
         return clean_ticker
     return None
+
+
+def is_unqualified_korean_code(ticker):
+    clean_ticker = normalize_market_ticker(ticker)
+    return bool(korean_stock_code(clean_ticker)) and not clean_ticker.endswith((".KS", ".KQ"))
 
 
 def naver_period_start():
@@ -2943,6 +3130,10 @@ def weekly_rsi_context(ticker):
     key = str(ticker or "").strip().upper()
     if not key:
         return {"weekly_rsi": 0.0, "score": 0, "summary": "주봉 RSI 확인 불가", "status": "no_ticker"}
+    if SKIP_OPTIONAL_YAHOO_CALLS:
+        return {"weekly_rsi": 0.0, "score": 0, "summary": "Render 빠른 갱신 · 주봉 RSI 생략", "status": "skipped_render_quick"}
+    if is_unqualified_korean_code(key):
+        return {"weekly_rsi": 0.0, "score": 0, "summary": "주봉 RSI는 해외/Yahoo 심볼만 확인", "status": "skip_korean_internal_code"}
     with WEEKLY_RSI_CACHE_LOCK:
         if key in WEEKLY_RSI_CACHE:
             return WEEKLY_RSI_CACHE[key]
@@ -2969,7 +3160,7 @@ def weekly_rsi_context(ticker):
             "status": "unavailable",
         }
     with WEEKLY_RSI_CACHE_LOCK:
-        WEEKLY_RSI_CACHE[key] = context
+        bounded_cache_set(WEEKLY_RSI_CACHE, key, context)
     return context
 
 
@@ -3194,27 +3385,20 @@ def download_price_data(ticker):
             print(f"{ticker} 네이버 가격 확인 실패: {sanitize_error(exc)}", flush=True)
             return pd.DataFrame()
 
-    with YFINANCE_DOWNLOAD_LOCK:
-        df = yf.download(
-            clean_ticker,
-            period=SCAN_PERIOD,
-            interval=SCAN_INTERVAL,
-            progress=False,
-            threads=False,
-        )
+    df = get_historical_ohlcv(clean_ticker, period=SCAN_PERIOD, interval=SCAN_INTERVAL)
     return normalize_ohlcv_dataframe(df)
 
 
 def download_market_data(ticker):
     clean_ticker = normalize_market_ticker(ticker)
-    with YFINANCE_DOWNLOAD_LOCK:
-        df = yf.download(
-            clean_ticker,
-            period="6mo",
-            interval="1d",
-            progress=False,
-            threads=False,
-        )
+    if korean_stock_code(clean_ticker):
+        try:
+            return download_naver_price_data(clean_ticker)
+        except Exception as exc:
+            print(f"{ticker} 네이버 시장 데이터 확인 실패: {sanitize_error(exc)}", flush=True)
+            return pd.DataFrame()
+
+    df = get_historical_ohlcv(clean_ticker, period="6mo", interval="1d")
     return normalize_ohlcv_dataframe(df)
 
 
@@ -3264,7 +3448,7 @@ def download_intraday_1m_data(ticker):
         normalized = pd.DataFrame()
 
     with INTRADAY_CACHE_LOCK:
-        INTRADAY_CACHE[clean_ticker] = normalized
+        bounded_cache_set(INTRADAY_CACHE, clean_ticker, normalized)
     return normalized
 
 
@@ -3390,6 +3574,12 @@ def cleanup_old_caches():
 
 
 def should_block_result_overwrite(rows, expected_count):
+    previous_rows = read_guard_csv_rows(RESULT_FILE)
+    if previous_rows:
+        ok, reason = validate_no_stock_loss(rows, previous_rows, "scanner result write")
+        if not ok:
+            return True, reason
+        print(reason, flush=True)
     if not RESULT_FILE.exists():
         return False, ""
     total = len(rows)
@@ -3441,16 +3631,9 @@ def latest_quote_price(ticker):
         return naver_price, "naver_realtime"
 
     try:
-        with YFINANCE_DOWNLOAD_LOCK:
-            fast_info = yf.Ticker(ticker).fast_info
-            for key in ("last_price", "regular_market_price", "lastPrice"):
-                value = None
-                try:
-                    value = fast_info.get(key)
-                except (AttributeError, KeyError):
-                    value = getattr(fast_info, key, None)
-                if value is not None and float(value) > 0:
-                    return float(value), "fast_quote"
+        quote = get_quote(ticker)
+        if quote.status == "ok" and quote.price > 0:
+            return float(quote.price), quote.source or quote.provider or "provider_quote"
     except Exception as exc:
         print(f"{ticker} 최신가 확인 실패: {sanitize_error(exc)}", flush=True)
     return None, "daily_close"
@@ -3487,6 +3670,17 @@ def fetch_dividend_context(ticker):
         }
 
     group = dividend_group_for_ticker(ticker)
+    if SKIP_OPTIONAL_YAHOO_CALLS:
+        return {
+            "dividend_group": group,
+            "dividend_amount": 0.0,
+            "dividend_annual_amount": 0.0,
+            "dividend_yield_pct": 0.0,
+            "last_dividend_date": "",
+            "next_dividend_estimate": "",
+            "dividend_frequency_days": 0,
+            "dividend_summary": f"{group} · Render 빠른 갱신 · 배당 상세 생략",
+        }
     amount = 0.0
     annual_amount = 0.0
     yield_pct = 0.0
@@ -3905,7 +4099,7 @@ def fetch_holding_daily_moves(holdings):
         if not symbol or symbol in {"N/A", "NAN"}:
             continue
         clean_symbol = normalize_holding_symbol(symbol)
-        if re.fullmatch(r"\d{6}", clean_symbol):
+        if korean_stock_code(clean_symbol):
             kr_symbols.append(clean_symbol)
             item["quote_symbol"] = clean_symbol
             continue
@@ -4027,7 +4221,7 @@ def fetch_etf_holdings_context(name, ticker, sector=""):
         context = empty_etf_holdings_context("보유비중 확인 실패 · 다음 갱신 때 재시도")
 
     with ETF_HOLDINGS_CACHE_LOCK:
-        ETF_HOLDINGS_CACHE[cache_key] = context
+        bounded_cache_set(ETF_HOLDINGS_CACHE, cache_key, context)
     return context
 
 
@@ -4489,7 +4683,7 @@ def fetch_sector_news_headlines(name, sector):
             headlines.extend(fetch_naver_news_headlines_for_query(query, limit=3))
         except Exception:
             pass
-    SECTOR_NEWS_CACHE[base_sector] = [title for title in dict.fromkeys(headlines) if title][:4]
+    bounded_cache_set(SECTOR_NEWS_CACHE, base_sector, [title for title in dict.fromkeys(headlines) if title][:4])
     return SECTOR_NEWS_CACHE[base_sector]
 
 
@@ -4522,12 +4716,16 @@ def fetch_company_risk_news_headlines(name, sector):
             pass
     context_terms = COMPANY_RISK_CONTEXT_TERMS.get(name, [])
     allow_context_only = name == "현대건설"
-    COMPANY_RISK_NEWS_CACHE[cache_key] = filter_company_news_headlines(
-        name,
-        list(dict.fromkeys(headlines)),
-        ticker=ticker_symbol_for_news(name),
-        allow_context_terms=context_terms if allow_context_only else None,
-    )[:4]
+    bounded_cache_set(
+        COMPANY_RISK_NEWS_CACHE,
+        cache_key,
+        filter_company_news_headlines(
+            name,
+            list(dict.fromkeys(headlines)),
+            ticker=ticker_symbol_for_news(name),
+            allow_context_terms=context_terms if allow_context_only else None,
+        )[:4],
+    )
     return COMPANY_RISK_NEWS_CACHE[cache_key]
 
 
@@ -4740,7 +4938,19 @@ def determine_trade_action(
     ):
         return "🚀 강한 추세 지속 후보", "이미 올랐지만 재료·수급·추세 지속성 확인", chase_risk, overheated
     if final_score >= 65 and chase_risk:
-        return "⏳ 눌림 대기", "이미 오른 구간이라 추격 금지", chase_risk, overheated
+        chase_reasons = []
+        if change_pct >= 7:
+            chase_reasons.append(f"당일 상승률 {change_pct:.1f}%")
+        if range_pos >= CHASE_RANGE_POS:
+            chase_reasons.append(f"20일 가격범위 상단 {range_pos:.0f}%")
+        if rsi_value >= 72:
+            chase_reasons.append(f"RSI {rsi_value:.0f}")
+        if gap_pct >= 4:
+            chase_reasons.append(f"이동평균 이격 {gap_pct:.1f}%")
+        if volume_burst and change_pct >= 5:
+            chase_reasons.append("거래량 동반 급등")
+        reason = " · ".join(chase_reasons[:3]) or "단기 가격 위치 부담"
+        return "⏳ 눌림 대기", f"{reason} 기준으로 바로 추격보다 눌림 확인 우선", chase_risk, overheated
     if final_score >= 55 and overheated:
         return "⚡ 단타 관찰", "과열이지만 모멘텀은 유지", chase_risk, overheated
     if final_score >= 45:
@@ -5924,6 +6134,24 @@ def apply_sector_context(results):
     return adjusted, sector_context
 
 
+def write_result_rows_streaming(rows, path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fieldnames = []
+    seen = set()
+    for row in rows:
+        for key in row.keys():
+            if key not in seen:
+                seen.add(key)
+                fieldnames.append(key)
+    tmp_path = path.with_suffix(path.suffix + ".tmp")
+    with tmp_path.open("w", encoding="utf-8-sig", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+    tmp_path.replace(path)
+
+
 def build_breadth_context(results, market_context):
     ok_results = [item for item in results if item.get("status") == "ok"]
     if not ok_results:
@@ -6186,9 +6414,11 @@ def send_telegram(text):
 
 def main():
     print("마켓 스캐너 시작", flush=True)
+    log_memory("scanner-main-start")
     cleanup_old_caches()
     print("시장 상태 확인 중", flush=True)
     market_context = get_market_context()
+    log_memory("market-context-loaded")
     print(f"시장: {market_context['regime']} / 리스크 {market_context['risk']}", flush=True)
 
     results = []
@@ -6213,7 +6443,8 @@ def main():
         stock_items = (protected_items + other_items)[:MAX_STOCKS]
         print(f"최적화: 상위 {len(stock_items)}개만 스캔(MARKET_SCANNER_MAX_STOCKS)", flush=True)
 
-    workers = min(MAX_WORKERS, len(stock_items))
+    render_worker_cap = 2 if os.getenv("RENDER") else MAX_WORKERS
+    workers = min(MAX_WORKERS, render_worker_cap, len(stock_items))
     print(f"스캔 최적화: 병렬 분석 {workers}개 워커", flush=True)
 
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -6269,20 +6500,41 @@ def main():
                         "reason": str(exc),
                     }
                 )
+            if len(results) % GC_EVERY_RESULTS == 0:
+                log_memory("scanner-progress", completed=len(results), total=len(stock_items))
+                clear_runtime_caches()
 
+    log_memory("scanner-analysis-complete", rows=len(results))
     results, sector_context = apply_sector_context(results)
     rows = sorted(results, key=lambda item: item.get("score", 0), reverse=True)
+    try:
+        canada_news_limit = int(os.getenv("CANADA_NEWS_MAX_SYMBOLS", "200"))
+        rows, canada_news_stats = apply_canada_news_to_rows(rows, max_symbols=canada_news_limit)
+        print(f"캐나다 뉴스 수집 상태: {canada_news_stats}", flush=True)
+    except Exception as exc:
+        print(f"캐나다 뉴스 수집 실패: {sanitize_error(exc)} · 종목 데이터는 유지", flush=True)
+    counts = market_counts(rows)
+    ca_rows = canada_count(rows)
+    print(f"시장별 수집 결과: {counts} · 캐나다 {ca_rows}개", flush=True)
+    if ca_rows < MIN_CANADA_ROWS_FOR_APP_SYNC:
+        print(
+            f"캐나다 수집 경고: {ca_rows}개 / 최소 {MIN_CANADA_ROWS_FOR_APP_SYNC}개 · 기존 앱/서버 데이터 보호 필요",
+            flush=True,
+        )
     block_write, block_reason = should_block_result_overwrite(rows, len(stock_items))
     if block_write:
         print(f"결과 저장 차단: {block_reason}. 기존 결과 파일 유지.", flush=True)
         return
-    pd.DataFrame(rows).to_csv(RESULT_FILE, index=False, encoding="utf-8-sig")
+    write_result_rows_streaming(rows, RESULT_FILE)
     secure_file_permissions(RESULT_FILE)
+    log_memory("scanner-results-written", rows=len(rows))
 
     report = build_report(rows, market_context)
     print("\n" + report, flush=True)
     if send_telegram(report):
         print("텔레그램 전송 완료", flush=True)
+    clear_runtime_caches()
+    log_memory("scanner-main-finished", rows=len(rows))
 
 
 if __name__ == "__main__":

@@ -66,6 +66,7 @@ def mobile_fast_env() -> dict[str, str]:
     env.setdefault("MARKET_SCANNER_ENABLE_INTRADAY_1M", "false")
     env.setdefault("MARKET_SCANNER_NEWS_SOURCES", "google_news")
     env.setdefault("MARKET_SCANNER_ENABLE_SECTOR_NEWS", "false")
+    env.setdefault("MARKET_SCANNER_SKIP_OPTIONAL_YAHOO", "true")
     env.setdefault("MARKET_SCANNER_CACHE_MAX_ITEMS", "96" if env.get("RENDER") else "256")
     env.setdefault("MARKET_DATA_CACHE_MAX_ITEMS", "96" if env.get("RENDER") else "256")
     env.setdefault("MOBILE_INTEL_INCREMENTAL", "true")
