@@ -1,16 +1,28 @@
 #!/usr/bin/env python3
 
+from __future__ import annotations
+
 import argparse
+import json
 import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import pandas as pd
 import requests
+
+from canada_market_guard import (
+    MIN_CANADA_ROWS_FOR_APP_SYNC,
+    canada_count,
+    market_counts,
+    read_csv_rows,
+)
+from stock_universe_guard import validate_no_stock_loss
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -27,6 +39,7 @@ MIN_TOTAL_ROWS_FOR_APP_SYNC = 500
 MIN_OK_ROWS_FOR_APP_SYNC = 50
 REMOTE_UPLOAD_URL = os.getenv("MARKET_SCANNER_REMOTE_UPLOAD_URL", "https://market-scanner-api-fo2m.onrender.com/api/results/upload").strip()
 REMOTE_API_TOKEN = os.getenv("MARKET_API_TOKEN", "").strip()
+LOCK_STALE_SECONDS = int(os.getenv("MARKET_SCANNER_UPDATE_LOCK_STALE_SECONDS", "7200"))
 
 
 def should_run_now(force: bool) -> tuple[bool, str]:
@@ -44,7 +57,7 @@ def should_run_now(force: bool) -> tuple[bool, str]:
     return False, f"skip at Vancouver {now:%Y-%m-%d %H:%M %Z}"
 
 
-def result_file_is_safe_for_app(path: Path) -> tuple[bool, str]:
+def result_file_is_safe_for_app(path: Path, previous_rows: list[dict] | None = None) -> tuple[bool, str]:
     if not path.exists():
         return False, f"missing result file: {path}"
     try:
@@ -54,11 +67,27 @@ def result_file_is_safe_for_app(path: Path) -> tuple[bool, str]:
 
     total_rows = len(df)
     ok_rows = int((df.get("status", "") == "ok").sum()) if "status" in df.columns else total_rows
+    records = df.to_dict("records")
+    if previous_rows:
+        ok, reason = validate_no_stock_loss(records, previous_rows, "scheduled app sync")
+        if not ok:
+            return False, reason
+        print(reason, flush=True)
+    counts = market_counts(records)
+    ca_rows = canada_count(records)
     if total_rows < MIN_TOTAL_ROWS_FOR_APP_SYNC:
         return False, f"app sync blocked: only {total_rows} rows, need at least {MIN_TOTAL_ROWS_FOR_APP_SYNC}"
     if ok_rows < MIN_OK_ROWS_FOR_APP_SYNC:
         return False, f"app sync blocked: only {ok_rows} ok rows, likely network/data failure"
-    return True, f"result safe: {total_rows} rows, {ok_rows} ok rows"
+    if ca_rows < MIN_CANADA_ROWS_FOR_APP_SYNC:
+        previous_ca_rows = canada_count(read_csv_rows(IOS_RESULT_FILE))
+        if previous_ca_rows >= MIN_CANADA_ROWS_FOR_APP_SYNC:
+            return False, (
+                f"app sync blocked: Canada rows dropped to {ca_rows}, "
+                f"keeping previous {previous_ca_rows} Canada rows"
+            )
+        return False, f"app sync blocked: Canada rows {ca_rows}, need at least {MIN_CANADA_ROWS_FOR_APP_SYNC}"
+    return True, f"result safe: {total_rows} rows, {ok_rows} ok rows, markets={counts}"
 
 
 def upload_results_to_remote(path: Path) -> None:
@@ -78,11 +107,51 @@ def upload_results_to_remote(path: Path) -> None:
         response.raise_for_status()
         payload = response.json()
         print(
-            f"remote upload ok: {payload.get('ok_rows', '?')}/{payload.get('rows', '?')} rows",
+            f"remote upload ok: {payload.get('ok_rows', '?')}/{payload.get('rows', '?')} rows "
+            f"markets={payload.get('market_counts', {})}",
             flush=True,
         )
     except Exception as exc:
         print(f"remote upload failed: {exc}", flush=True)
+
+
+def process_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+
+
+def acquire_update_lock() -> tuple[bool, str]:
+    now = time.time()
+    while True:
+        try:
+            fd = os.open(str(LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            payload = {"pid": os.getpid(), "started_at": now, "updated_at": now}
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False)
+            return True, "lock acquired"
+        except FileExistsError:
+            try:
+                payload = json.loads(LOCK_FILE.read_text(encoding="utf-8"))
+                pid = int(payload.get("pid") or 0)
+                started_at = float(payload.get("started_at") or LOCK_FILE.stat().st_mtime)
+            except Exception:
+                pid = 0
+                started_at = LOCK_FILE.stat().st_mtime
+            if not process_is_alive(pid) or now - started_at > LOCK_STALE_SECONDS:
+                try:
+                    LOCK_FILE.unlink(missing_ok=True)
+                    print("removed stale market scanner update lock", flush=True)
+                    continue
+                except OSError as exc:
+                    return False, f"stale lock remove failed: {exc}"
+            return False, f"already running: {LOCK_FILE}"
 
 
 def main() -> int:
@@ -95,12 +164,13 @@ def main() -> int:
     if not run:
         return 0
 
-    if LOCK_FILE.exists():
-        print(f"already running: {LOCK_FILE}", flush=True)
-        return 0
+    lock_ok, lock_reason = acquire_update_lock()
+    print(lock_reason, flush=True)
+    if not lock_ok:
+        return 75
 
-    LOCK_FILE.write_text(str(datetime.now()), encoding="utf-8")
     try:
+        previous_rows = read_csv_rows(IOS_RESULT_FILE) or read_csv_rows(RESULT_FILE)
         completed = subprocess.run(
             [sys.executable, str(SCANNER)],
             cwd=BASE_DIR,
@@ -117,7 +187,7 @@ def main() -> int:
         if failure_completed.returncode != 0:
             print(f"ai failure memory skipped: code {failure_completed.returncode}", flush=True)
 
-        safe, safe_reason = result_file_is_safe_for_app(RESULT_FILE)
+        safe, safe_reason = result_file_is_safe_for_app(RESULT_FILE, previous_rows)
         print(safe_reason, flush=True)
         if not safe:
             return 1

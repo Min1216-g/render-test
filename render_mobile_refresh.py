@@ -7,6 +7,8 @@ import sys
 import time
 import json
 import os
+import csv
+from datetime import datetime, timezone
 from pathlib import Path
 
 from runtime_job_guard import InterProcessJobLock
@@ -16,6 +18,7 @@ from run_market_scanner_update import RESULT_FILE, upload_results_to_remote
 BASE_DIR = Path(__file__).resolve().parent
 PERF_REPORT_FILE = BASE_DIR / "mobile_scan_performance_report.json"
 HEAVY_JOB_STALE_SECONDS = int(os.getenv("MARKET_HEAVY_JOB_STALE_SECONDS", "7200"))
+MOBILE_INTEL_MAX_AGE_HOURS = float(os.getenv("MARKET_MOBILE_INTEL_MAX_AGE_HOURS", "8"))
 
 
 class PerfReport:
@@ -82,6 +85,41 @@ def run_step(name: str, command: list[str], timeout: int, perf: PerfReport, env:
     return completed.returncode
 
 
+def _parse_mobile_timestamp(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    for fmt in ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+        except ValueError:
+            continue
+    return None
+
+
+def mobile_intel_is_fresh(path: Path) -> tuple[bool, str]:
+    newest: datetime | None = None
+    rows = 0
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as handle:
+            for row in csv.DictReader(handle):
+                rows += 1
+                parsed = _parse_mobile_timestamp(row.get("mobile_intel_generated_at", ""))
+                if parsed and (newest is None or parsed > newest):
+                    newest = parsed
+    except Exception as exc:
+        return False, f"mobile intel freshness read failed: {exc}"
+    if newest is None:
+        return False, f"mobile_intel_generated_at missing rows={rows}"
+    age_hours = (datetime.now(timezone.utc) - newest).total_seconds() / 3600
+    if age_hours > MOBILE_INTEL_MAX_AGE_HOURS:
+        return False, f"mobile intel stale: newest={newest.isoformat()} age_hours={age_hours:.2f}"
+    return True, f"mobile intel fresh: newest={newest.isoformat()} age_hours={age_hours:.2f}"
+
+
 def main() -> int:
     perf = PerfReport()
     py = sys.executable
@@ -110,7 +148,15 @@ def main() -> int:
         if intel_script.exists():
             intel_code = run_step("mobile_intelligence_feed", [py, str(intel_script)], 300, perf, env)
             if intel_code != 0:
-                print("mobile intelligence failed, keeping scanner CSV", flush=True)
+                perf.save(status="failed_at_mobile_intelligence")
+                print("mobile intelligence failed, not uploading stale scanner CSV", flush=True)
+                return intel_code
+
+        fresh, fresh_reason = mobile_intel_is_fresh(RESULT_FILE)
+        print(f"mobile intelligence freshness: {fresh_reason}", flush=True)
+        if not fresh:
+            perf.save(status="failed_stale_mobile_intelligence", freshness=fresh_reason)
+            return 1
 
         print("upload final mobile CSV", flush=True)
         upload_started = time.perf_counter()
