@@ -737,7 +737,7 @@ def _filter_result_rows_streaming(
     q: Optional[str] = None,
     limit: int = 800,
 ) -> List[Dict[str, str]]:
-    return _filter_rows(_iter_public_rows(), market=market, q=q, limit=limit)
+    return _filter_rows(_read_rows(), market=market, q=q, limit=limit)
 
 
 def _parse_csv_bytes(payload: bytes) -> List[Dict[str, str]]:
