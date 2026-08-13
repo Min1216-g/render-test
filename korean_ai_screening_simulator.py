@@ -11,6 +11,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import statistics
 import time
 from dataclasses import dataclass, field
@@ -36,6 +37,7 @@ SCREENING_RESULTS_FILE = BASE_DIR / "ai_screening_results.csv"
 BACKTEST_RESULTS_FILE = BASE_DIR / "ai_screening_backtest_results.csv"
 BACKTEST_TRADES_FILE = BASE_DIR / "ai_screening_backtest_trades.csv"
 PAPER_ACCOUNT_FILE = BASE_DIR / "paper_trading_account.json"
+PAPER_ACCOUNT_DIR = Path(os.getenv("MARKET_PAPER_TRADING_DIR", "/var/data" if os.getenv("RENDER") else str(BASE_DIR)))
 RECOMMENDATION_HISTORY_FILE = BASE_DIR / "ai_recommendation_tracking.csv"
 WEIGHT_HISTORY_FILE = BASE_DIR / "ai_signal_weight_history.csv"
 EVENT_LOG_FILE = BASE_DIR / "ai_screening_event_log.jsonl"
@@ -481,6 +483,13 @@ def summarize_trades(trades: List[Dict[str, object]]) -> Dict[str, object]:
 def paper_account_file(account_id: str = "") -> Path:
     clean = "".join(ch for ch in str(account_id or "") if ch.isalnum() or ch in {"-", "_"}).strip("-_")
     if not clean:
+        return PAPER_ACCOUNT_DIR / "paper_trading_account.json"
+    return PAPER_ACCOUNT_DIR / f"paper_trading_account.{clean[:80]}.json"
+
+
+def legacy_paper_account_file(account_id: str = "") -> Path:
+    clean = "".join(ch for ch in str(account_id or "") if ch.isalnum() or ch in {"-", "_"}).strip("-_")
+    if not clean:
         return PAPER_ACCOUNT_FILE
     return BASE_DIR / f"paper_trading_account.{clean[:80]}.json"
 
@@ -488,6 +497,14 @@ def paper_account_file(account_id: str = "") -> Path:
 def load_paper_account(account_id: str = "") -> Dict[str, object]:
     account_file = paper_account_file(account_id)
     if not account_file.exists():
+        legacy_file = legacy_paper_account_file(account_id)
+        if legacy_file.exists() and legacy_file != account_file:
+            try:
+                account = json.loads(legacy_file.read_text(encoding="utf-8"))
+                save_paper_account(account, account_id=account_id)
+                return account
+            except (OSError, json.JSONDecodeError):
+                pass
         account = {"cash": 0.0, "positions": {}, "trades": [], "created_at": utc_now_iso(), "safety_notice": SAFETY_NOTICE}
         save_paper_account(account, account_id=account_id)
         return account
@@ -500,7 +517,15 @@ def load_paper_account(account_id: str = "") -> Dict[str, object]:
 def save_paper_account(account: Dict[str, object], account_id: str = "") -> Dict[str, object]:
     account["updated_at"] = utc_now_iso()
     account["safety_notice"] = SAFETY_NOTICE
-    paper_account_file(account_id).write_text(json.dumps(account, ensure_ascii=False, indent=2), encoding="utf-8")
+    account_file = paper_account_file(account_id)
+    payload = json.dumps(account, ensure_ascii=False, indent=2)
+    try:
+        account_file.parent.mkdir(parents=True, exist_ok=True)
+        account_file.write_text(payload, encoding="utf-8")
+    except OSError as exc:
+        fallback_file = legacy_paper_account_file(account_id)
+        print(f"[PAPER] primary write failed path={account_file}: {exc}; fallback={fallback_file}", flush=True)
+        fallback_file.write_text(payload, encoding="utf-8")
     return account
 
 

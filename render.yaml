@@ -17,6 +17,8 @@ services:
         value: market_scanner_results.csv
       - key: MARKET_BUG_REPORTS_FILE
         value: /var/data/bug_reports.json
+      - key: MARKET_PAPER_TRADING_DIR
+        value: /var/data
       - key: MARKET_RATE_LIMIT_PER_MINUTE
         value: "90"
       - key: MARKET_RESULTS_CACHE_TTL
