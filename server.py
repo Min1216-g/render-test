@@ -453,6 +453,11 @@ def _normalize_supplied_git_commits(commits: object) -> List[Dict[str, str]]:
                 "source": str(item.get("source") or "").strip(),
                 "workflow_run_id": str(item.get("workflow_run_id") or "").strip(),
                 "workflow_run_attempt": str(item.get("workflow_run_attempt") or "").strip(),
+                "added": item.get("added") if isinstance(item.get("added"), list) else [],
+                "modified": item.get("modified") if isinstance(item.get("modified"), list) else [],
+                "removed": item.get("removed") if isinstance(item.get("removed"), list) else [],
+                "url": str(item.get("url") or "").strip(),
+                "author": str((item.get("author") or {}).get("name") if isinstance(item.get("author"), dict) else item.get("author") or "").strip(),
             }
         )
     return normalized
@@ -550,6 +555,142 @@ def _git_processing_source_title(source: str) -> str:
     return "수동 Git 반영 확인"
 
 
+def _clean_report_text(value: object) -> str:
+    return str(value or "").strip()
+
+
+def _commit_changed_files_from_payload(commit: Dict[str, str]) -> List[str]:
+    files: List[str] = []
+    for key in ("modified", "added", "removed"):
+        raw = commit.get(key)  # type: ignore[arg-type]
+        if isinstance(raw, list):
+            files.extend(str(item).strip() for item in raw if str(item).strip())
+    seen: set[str] = set()
+    unique: List[str] = []
+    for file_name in files:
+        if file_name not in seen:
+            seen.add(file_name)
+            unique.append(file_name)
+    return unique
+
+
+def _commit_changed_files_from_git(commit_hash: str) -> List[str]:
+    if not commit_hash or not re.fullmatch(r"[0-9a-fA-F]{7,40}", commit_hash):
+        return []
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(BASE_DIR), "show", "--name-only", "--format=", commit_hash],
+            check=True,
+            text=True,
+            capture_output=True,
+            timeout=8,
+        )
+    except Exception:
+        return []
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+def _commit_changed_files(commit: Dict[str, str]) -> List[str]:
+    files = _commit_changed_files_from_payload(commit)
+    if files:
+        return files
+    return _commit_changed_files_from_git(str(commit.get("hash") or ""))
+
+
+def _changed_file_summary(files: List[str], limit: int = 8) -> str:
+    if not files:
+        return "변경 파일 확인 불가"
+    shown = files[:limit]
+    suffix = f" 외 {len(files) - limit}개" if len(files) > limit else ""
+    return ", ".join(shown) + suffix
+
+
+def _infer_fix_area(report: Dict[str, object], files: List[str]) -> str:
+    existing = _clean_report_text(report.get("relatedFeature")) or _clean_report_text(report.get("screen"))
+    lowered = " ".join(files).lower()
+    areas: List[str] = []
+    if "server.py" in lowered or "api" in lowered:
+        areas.append("서버/API")
+    if "market_scanner" in lowered or "render_mobile_refresh" in lowered or "scanner" in lowered:
+        areas.append("스캐너/데이터 갱신")
+    if "marketscannerios" in lowered or ".swift" in lowered:
+        areas.append("모바일 앱")
+    if "workflow" in lowered or ".github" in lowered:
+        areas.append("GitHub Actions 자동 처리")
+    if "csv" in lowered:
+        areas.append("스캐너 데이터 파일")
+    if areas:
+        return " / ".join(dict.fromkeys(areas))
+    return existing or "영향 범위 자동 판정 필요"
+
+
+def _build_auto_fix_details(
+    report: Dict[str, object],
+    commit: Dict[str, str],
+    bug_id: str,
+) -> Dict[str, str]:
+    files = _commit_changed_files(commit)
+    file_summary = _changed_file_summary(files)
+    commit_message = _clean_report_text(commit.get("message"))
+    title = _clean_report_text(report.get("title")) or _clean_report_text(report.get("content")) or bug_id
+    content = _clean_report_text(report.get("content")) or "신고 내용 없음"
+    area = _infer_fix_area(report, files)
+    reason = _clean_report_text(report.get("fixReason"))
+    if not reason:
+        reason = (
+            f"추정 원인: 신고 내용({title})과 commit 메시지({commit_message})를 기준으로, "
+            "해당 기능의 처리 로직 또는 데이터 흐름에서 오류가 발생한 것으로 자동 분류했습니다. "
+            "실제 세부 원인은 변경 diff 확인이 필요합니다."
+        )
+    summary = _clean_report_text(report.get("fixSummary"))
+    if not summary:
+        summary = (
+            f"commit `{commit_message}`에서 {file_summary} 영역을 수정했습니다. "
+            f"영향 범위는 {area}로 자동 분류했습니다."
+        )
+    test_result = _clean_report_text(report.get("testResult"))
+    if not test_result:
+        test_result = (
+            "자동 기록: commit 연결 및 서버 저장은 확인했습니다. "
+            "기능 동작 검증 결과는 실제 앱/서버 테스트 후 보강이 필요합니다."
+        )
+    completed_at = _clean_report_text(report.get("completedAtText")) or str(commit.get("date", ""))[:16].replace("T", " ")
+    source_title = _git_processing_source_title(str(commit.get("source") or ""))
+    resolution = (
+        "🟢 조치 완료\n\n"
+        f"{bug_id} — {title}\n\n"
+        "신고 내용\n"
+        f"{content}\n\n"
+        "원인\n"
+        f"{reason}\n\n"
+        "수정 내용\n"
+        f"{summary}\n\n"
+        "수정 파일\n"
+        f"{file_summary}\n\n"
+        "영향 범위\n"
+        f"{area}\n\n"
+        "Commit\n"
+        f"{commit.get('hash', '')[:12]} · {commit_message}\n\n"
+        "테스트 결과\n"
+        f"{test_result}\n\n"
+        "수정 완료 시간\n"
+        f"{completed_at}\n\n"
+        "처리 방식\n"
+        f"{source_title}\n\n"
+        "현재 상태\n"
+        "🟢 조치 완료"
+    )
+    return {
+        "fixReason": reason,
+        "fixSummary": summary,
+        "fixFile": file_summary,
+        "changedFeature": area,
+        "testResult": test_result,
+        "completedAtText": completed_at,
+        "resolutionReport": resolution,
+    }
+
+
 def _auto_resolution_report(report: Dict[str, object], commit: Dict[str, str], bug_id: str) -> str:
     title = str(report.get("title") or "").strip() or str(report.get("content") or "내용 없음").strip()
     content = str(report.get("content") or "내용 없음").strip()
@@ -596,10 +737,16 @@ def _apply_git_commit_links(
         commit = commits.get(bug_id)
         if not commit:
             continue
-        if str(report.get("gitCommitHash") or "") == commit["hash"]:
+        same_commit = str(report.get("gitCommitHash") or "") == commit["hash"]
+        needs_details = any(
+            not _clean_report_text(report.get(field))
+            for field in ("fixReason", "fixSummary", "fixFile", "testResult", "resolutionReport")
+        )
+        if same_commit and not needs_details:
             continue
 
         source = commit.get("source", "server_git_log")
+        details = _build_auto_fix_details(report, commit, bug_id)
         report["bugID"] = bug_id
         report["gitCommitHash"] = commit["hash"]
         report["gitCommitMessage"] = commit["message"]
@@ -613,12 +760,15 @@ def _apply_git_commit_links(
         report["latestStateChangedAt"] = now
         report["updatedAt"] = time.time()
         report["fixVersion"] = str(report.get("fixVersion") or _extract_version_from_commit(commit["message"]) or "v1.0.22")
+        for field, value in details.items():
+            if field == "resolutionReport" or not _clean_report_text(report.get(field)):
+                report[field] = value
         report["status"] = "actionDone"
-        report["completedAtText"] = commit["date"][:16].replace("T", " ")
-        if not str(report.get("resolutionReport") or "").strip():
-            report["resolutionReport"] = _auto_resolution_report(report, commit, bug_id)
         source_title = _git_processing_source_title(source)
-        _append_bug_history(report, "Git commit 자동 연결", f"{source_title} · {commit['hash'][:12]} · {commit['message']}", now)
+        if same_commit:
+            _append_bug_history(report, "Git 수정 이력 자동 보강", f"{source_title} · {commit['hash'][:12]} · {details['fixFile']}", now)
+        else:
+            _append_bug_history(report, "Git commit 자동 연결", f"{source_title} · {commit['hash'][:12]} · {commit['message']}", now)
         changed += 1
 
     if changed:
