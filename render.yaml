@@ -6,11 +6,17 @@ services:
     buildCommand: pip install --no-cache-dir -r requirements.txt && python -m compileall -q server.py render_mobile_refresh.py render_cron_runner.py
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     autoDeploy: true
+    disk:
+      name: market-scanner-data
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: MARKET_API_TOKEN
         sync: false
       - key: MARKET_RESULTS_FILE
         value: market_scanner_results.csv
+      - key: MARKET_BUG_REPORTS_FILE
+        value: /var/data/bug_reports.json
       - key: MARKET_RATE_LIMIT_PER_MINUTE
         value: "90"
       - key: MARKET_RESULTS_CACHE_TTL

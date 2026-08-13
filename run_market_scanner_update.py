@@ -34,7 +34,7 @@ LOCK_FILE = BASE_DIR / ".market_scanner_update.lock"
 STATE_FILE = BASE_DIR / ".market_scanner_update_state"
 VANCOUVER_TZ = ZoneInfo("America/Vancouver")
 VANCOUVER_RUN_TIMES = {(15, 0), (15, 30), (16, 0)}
-VANCOUVER_SKIP_WEEKDAYS = {4, 5}
+VANCOUVER_SKIP_WEEKDAYS = {5, 6}  # Saturday, Sunday. Python: Monday=0.
 MIN_TOTAL_ROWS_FOR_APP_SYNC = 500
 MIN_OK_ROWS_FOR_APP_SYNC = 50
 REMOTE_UPLOAD_URL = os.getenv("MARKET_SCANNER_REMOTE_UPLOAD_URL", "https://market-scanner-api-fo2m.onrender.com/api/results/upload").strip()

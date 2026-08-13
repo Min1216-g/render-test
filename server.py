@@ -47,7 +47,15 @@ IOS_RESULT_FILE = BASE_DIR / "MarketScannerIOS" / "MarketScannerIOS" / "market_s
 REFRESH_SCRIPT = BASE_DIR / os.getenv("MARKET_SCANNER_REFRESH_SCRIPT", "render_mobile_refresh.py")
 MOBILE_INTEL_SCRIPT = BASE_DIR / "mobile_intelligence_feed.py"
 SCANNER_STATUS_FILE = BASE_DIR / "scanner_run_status.json"
-BUG_REPORTS_FILE = BASE_DIR / os.getenv("MARKET_BUG_REPORTS_FILE", "bug_reports.json")
+BUG_REPORTS_SEED_FILE = BASE_DIR / os.getenv("MARKET_BUG_REPORTS_SEED_FILE", "bug_reports_seed.json")
+BUG_REPORTS_FALLBACK_FILE = BASE_DIR / "bug_reports.json"
+BUG_REPORTS_FILE = Path(
+    os.getenv(
+        "MARKET_BUG_REPORTS_FILE",
+        "/var/data/bug_reports.json" if os.getenv("RENDER") else str(BUG_REPORTS_FALLBACK_FILE),
+    )
+)
+BUG_REPORTS_BACKUP_FILE = Path(os.getenv("MARKET_BUG_REPORTS_BACKUP_FILE", str(BUG_REPORTS_FILE.with_suffix(".backup.json"))))
 API_TOKEN = os.getenv("MARKET_API_TOKEN", "")
 ADMIN_TOKEN = os.getenv("MARKET_ADMIN_TOKEN", "")
 ALLOW_UNAUTH_HEALTH = os.getenv("MARKET_ALLOW_UNAUTH_HEALTH", "true").lower() == "true"
@@ -350,11 +358,11 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def _read_bug_reports_store() -> Dict[str, object]:
-    if not BUG_REPORTS_FILE.exists():
+def _read_bug_reports_payload(path: Path) -> Dict[str, object]:
+    if not path.exists():
         return {"reports": [], "updated_at": None}
     try:
-        payload = json.loads(BUG_REPORTS_FILE.read_text(encoding="utf-8"))
+        payload = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return {"reports": [], "updated_at": None}
     if not isinstance(payload, dict):
@@ -368,13 +376,65 @@ def _read_bug_reports_store() -> Dict[str, object]:
     }
 
 
+def _bug_report_store_sort_value(report: Dict[str, object]) -> float:
+    for key in ("updatedAt", "createdAt"):
+        value = report.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+    return 0.0
+
+
+def _merge_bug_report_store_payloads(payloads: Iterable[Dict[str, object]]) -> Dict[str, object]:
+    by_id: Dict[str, Dict[str, object]] = {}
+    updated_at = None
+    for payload in payloads:
+        candidate_updated_at = payload.get("updated_at")
+        if candidate_updated_at and (updated_at is None or str(candidate_updated_at) > str(updated_at)):
+            updated_at = candidate_updated_at
+        for report in payload.get("reports", []):
+            if not isinstance(report, dict):
+                continue
+            report_id = str(report.get("id") or "").strip()
+            if not report_id:
+                continue
+            current = by_id.get(report_id)
+            if current is None or _bug_report_store_sort_value(report) >= _bug_report_store_sort_value(current):
+                by_id[report_id] = report
+    reports = sorted(by_id.values(), key=_bug_report_store_sort_value, reverse=True)
+    return {"reports": reports, "count": len(reports), "updated_at": updated_at}
+
+
+def _read_bug_reports_store() -> Dict[str, object]:
+    return _merge_bug_report_store_payloads(
+        [
+            _read_bug_reports_payload(BUG_REPORTS_FILE),
+            _read_bug_reports_payload(BUG_REPORTS_BACKUP_FILE),
+            _read_bug_reports_payload(BUG_REPORTS_FALLBACK_FILE),
+            _read_bug_reports_payload(BUG_REPORTS_SEED_FILE),
+        ]
+    )
+
+
+def _write_bug_reports_payload(path: Path, payload: Dict[str, object]) -> bool:
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+    except OSError as exc:
+        print(f"[BUG-STORE] write failed path={path}: {exc}", flush=True)
+        return False
+
+
 def _write_bug_reports_store(reports: List[Dict[str, object]]) -> Dict[str, object]:
     payload = {
         "reports": reports,
         "count": len(reports),
         "updated_at": _now_iso(),
     }
-    BUG_REPORTS_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    wrote_primary = _write_bug_reports_payload(BUG_REPORTS_FILE, payload)
+    _write_bug_reports_payload(BUG_REPORTS_BACKUP_FILE, payload)
+    if not wrote_primary and BUG_REPORTS_FILE != BUG_REPORTS_FALLBACK_FILE:
+        _write_bug_reports_payload(BUG_REPORTS_FALLBACK_FILE, payload)
     return payload
 
 

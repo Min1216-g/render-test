@@ -13,7 +13,7 @@ from zoneinfo import ZoneInfo
 
 BASE_DIR = Path(__file__).resolve().parent
 VANCOUVER_TZ = ZoneInfo("America/Vancouver")
-SKIP_WEEKDAYS = {4, 5}  # Friday, Saturday in Vancouver.
+SKIP_WEEKDAYS = {5, 6}  # Saturday, Sunday in Vancouver. Python: Monday=0.
 
 
 def run_command(command: list[str]) -> int:

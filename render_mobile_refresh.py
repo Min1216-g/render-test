@@ -10,6 +10,7 @@ import os
 import csv
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from runtime_job_guard import InterProcessJobLock
 from run_market_scanner_update import RESULT_FILE, upload_results_to_remote
@@ -19,6 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 PERF_REPORT_FILE = BASE_DIR / "mobile_scan_performance_report.json"
 HEAVY_JOB_STALE_SECONDS = int(os.getenv("MARKET_HEAVY_JOB_STALE_SECONDS", "7200"))
 MOBILE_INTEL_MAX_AGE_HOURS = float(os.getenv("MARKET_MOBILE_INTEL_MAX_AGE_HOURS", "8"))
+VANCOUVER_TZ = ZoneInfo("America/Vancouver")
 
 
 class PerfReport:
@@ -91,6 +93,13 @@ def _parse_mobile_timestamp(value: str) -> datetime | None:
     text = str(value or "").strip()
     if not text:
         return None
+    for suffix in (" PDT", " PST"):
+        if text.endswith(suffix):
+            try:
+                local_time = datetime.strptime(text[: -len(suffix)], "%Y-%m-%d %H:%M:%S")
+                return local_time.replace(tzinfo=VANCOUVER_TZ).astimezone(timezone.utc)
+            except ValueError:
+                break
     for fmt in ("%Y-%m-%d %H:%M:%S %Z", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S"):
         try:
             parsed = datetime.strptime(text, fmt)
