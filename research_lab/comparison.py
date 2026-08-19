@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 
 from .config import ResearchLabConfig
-from .engine import ResearchEngine, _num, _text
+from .engine import ResearchEngine, _num, _text, validate_market_row, validate_news_row
 from .models import ResearchResult, utc_now_iso
 from .storage import JsonlStore
 
@@ -195,38 +195,72 @@ class ComparisonLab:
         )
 
     def _select_sample(self, df: pd.DataFrame, limit: int) -> list[tuple[str, pd.Series]]:
+        valid_df = df[df.apply(lambda row: validate_market_row(row).get("status") == "VALID", axis=1)].copy()
+        if valid_df.empty:
+            return []
+        df = valid_df
+        market_values = sorted(df["market"].astype(str).unique()) if "market" in df.columns else []
+        if len(market_values) > 1 and limit >= len(market_values):
+            selected: list[tuple[str, pd.Series]] = []
+            seen: set[str] = set()
+            base_quota = max(1, limit // len(market_values))
+            remainder = limit % len(market_values)
+            for index, market in enumerate(market_values):
+                quota = base_quota + (1 if index < remainder else 0)
+                for category, row in self._select_sample(df[df["market"].astype(str) == market].copy(), quota):
+                    ticker = str(row.get("ticker", "")).upper()
+                    if ticker and ticker not in seen:
+                        seen.add(ticker)
+                        selected.append((category, row))
+            if len(selected) < limit:
+                for category, row in self._select_sample(df, limit):
+                    ticker = str(row.get("ticker", "")).upper()
+                    if ticker and ticker not in seen:
+                        seen.add(ticker)
+                        selected.append((category, row))
+                    if len(selected) >= limit:
+                        break
+            return selected[:limit]
         buckets: list[tuple[str, pd.DataFrame]] = []
         change = df.get("change_pct", pd.Series([0] * len(df))).apply(lambda value: _num(value, 0) or 0)
         volume = df.get("volume_ratio", pd.Series([0] * len(df))).apply(lambda value: _num(value, 0) or 0)
-        news = df.get("news_one_line", pd.Series([""] * len(df))).astype(str)
+        news_ok = df.apply(lambda row: validate_news_row(row).get("status") == "NEWS_AVAILABLE", axis=1)
         rsi = df.get("rsi", pd.Series([0] * len(df))).apply(lambda value: _num(value, 0) or 0)
-        buckets.append(("gainer", df.assign(_rank=change).sort_values("_rank", ascending=False).head(10)))
-        buckets.append(("decliner", df.assign(_rank=change).sort_values("_rank", ascending=True).head(10)))
-        buckets.append(("volume_spike", df.assign(_rank=volume).sort_values("_rank", ascending=False).head(10)))
-        buckets.append(("news", df[news.ne("") & ~news.str.contains("뉴스 없음|NO_RECENT_NEWS", na=False)].head(10)))
-        buckets.append(("already_risen", df[(change >= 5) | (rsi >= 70)].head(10)))
-        buckets.append(("general", df.head(10)))
+        trade_value = df.get("trade_value", pd.Series([0] * len(df))).apply(lambda value: _num(value, 0) or 0)
+        ticker_sorted = df.assign(_ticker=df["ticker"].astype(str).str.upper()).sort_values("_ticker")
+        buckets.append(("gainer", df.assign(_rank=change).sort_values(["_rank", "ticker"], ascending=[False, True]).head(20)))
+        buckets.append(("decliner", df.assign(_rank=change).sort_values(["_rank", "ticker"], ascending=[True, True]).head(20)))
+        buckets.append(("volume_spike", df.assign(_rank=volume).sort_values(["_rank", "ticker"], ascending=[False, True]).head(20)))
+        buckets.append(("news", df[news_ok].assign(_ticker=df[news_ok]["ticker"].astype(str).str.upper()).sort_values("_ticker").head(20)))
+        buckets.append(("already_risen", df[(change >= 5) | (rsi >= 70)].assign(_rank=change).sort_values(["_rank", "ticker"], ascending=[False, True]).head(20)))
+        buckets.append(("large_liquid", df.assign(_rank=trade_value).sort_values(["_rank", "ticker"], ascending=[False, True]).head(20)))
+        buckets.append(("mid_small", df.assign(_rank=trade_value).sort_values(["_rank", "ticker"], ascending=[True, True]).head(20)))
+        buckets.append(("general", ticker_sorted.head(20)))
         seen: set[str] = set()
         selected: list[tuple[str, pd.Series]] = []
-        per_bucket = max(2, math.ceil(limit / max(1, len(buckets))))
+        per_bucket = max(2, min(6, math.ceil(limit / max(1, len(buckets)))))
         for category, bucket in buckets:
+            added = 0
             for _, row in bucket.head(per_bucket).iterrows():
                 ticker = str(row.get("ticker", "")).upper()
                 if not ticker or ticker in seen:
                     continue
                 seen.add(ticker)
-                selected.append((category, row.drop(labels=["_rank"], errors="ignore")))
+                selected.append((category, row.drop(labels=["_rank", "_ticker"], errors="ignore")))
+                added += 1
                 if len(selected) >= limit:
-                    return selected
+                    return selected[:limit]
+                if added >= per_bucket:
+                    break
         if len(selected) < limit:
-            for _, row in df.iterrows():
+            for _, row in ticker_sorted.iterrows():
                 ticker = str(row.get("ticker", "")).upper()
                 if ticker and ticker not in seen:
                     seen.add(ticker)
-                    selected.append(("fill", row))
+                    selected.append(("fill", row.drop(labels=["_rank", "_ticker"], errors="ignore")))
                     if len(selected) >= limit:
                         break
-        return selected
+        return selected[:limit]
 
     def _direction_from_decision(self, decision: str, current_change: float) -> str:
         if decision == "BUY CANDIDATE":
@@ -311,4 +345,3 @@ class ComparisonLab:
 
 def dump_json(data: Any) -> str:
     return json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True)
-

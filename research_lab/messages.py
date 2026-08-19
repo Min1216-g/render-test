@@ -61,11 +61,21 @@ def _decision_pair(record: dict) -> tuple[str, str]:
     return str(record.get("existing_ai_decision") or "N/A").upper(), str(record.get("research_decision") or "N/A").upper()
 
 
+def _kr_decision(value: object) -> str:
+    mapping = {"BUY CANDIDATE": "매수 후보", "WATCH": "관찰", "WAIT": "대기", "AVOID": "회피", "N/A": "정보 없음"}
+    return mapping.get(str(value or "N/A").upper(), str(value or "정보 없음"))
+
+
+def _kr_risk(value: object) -> str:
+    mapping = {"LOW": "낮음", "MEDIUM": "보통", "HIGH": "높음"}
+    return mapping.get(str(value or "").upper(), str(value or "정보 없음"))
+
+
 def compact_ai_comparison_message(record: dict) -> str:
     market = str(record.get("market") or "")
     existing, research = _decision_pair(record)
     different = existing != research
-    title = "⚔️ AI CONFLICT" if different else "📊 AI COMPARISON"
+    title = "⚔️ AI 의견 충돌" if different else "📊 AI 비교"
     return "\n".join(
         [
             title,
@@ -73,23 +83,27 @@ def compact_ai_comparison_message(record: dict) -> str:
             f"{_market_flag(market)} {record.get('ticker')}",
             str(record.get("name") or ""),
             "",
-            "Reference:",
+            "기준 가격:",
             _format_price(record.get("reference_price"), market),
+            "",
+            "기준 시각:",
             _format_time(record.get("reference_timestamp"), market),
             "",
-            "EXISTING",
-            f"{existing} · {record.get('existing_ai_score')}",
-            f"Risk: {record.get('existing_risk')}",
+            "기존 AI",
+            f"점수: {record.get('existing_ai_score')}",
+            f"판단: {_kr_decision(existing)}",
+            f"위험도: {_kr_risk(record.get('existing_risk'))}",
             "",
-            "RESEARCH",
-            f"{research} · {record.get('research_score')}",
-            f"Risk: {record.get('research_risk')}",
+            "Research AI",
+            f"점수: {record.get('research_score')}",
+            f"판단: {_kr_decision(research)}",
+            f"위험도: {_kr_risk(record.get('research_risk'))}",
             "",
-            "Decision:",
-            "DIFFERENT" if different else "SAME",
+            "의견:",
+            "다름" if different else "같음",
             "",
-            "Result:",
-            "PENDING",
+            "결과:",
+            "대기 중",
         ]
     )
 
@@ -238,38 +252,38 @@ def research_lab_message(record: dict) -> str:
 
 def comparison_started_message(records: list[dict]) -> str:
     if not records:
-        return "DAILY AI COMPARISON\n\nDATA_UNAVAILABLE"
+        return "일일 AI 비교\n\nDATA_UNAVAILABLE"
     conflicts = [record for record in records if _decision_pair(record)[0] != _decision_pair(record)[1]]
     same_count = len(records) - len(conflicts)
     market = _market_key(records[0].get("market"))
     lines = [
-        "📊 PRIMARY TEST SUMMARY",
+        "📊 PRIMARY 테스트 요약",
         "",
         f"{_market_flag(records[0].get('market'))} {market}",
         _format_time(records[0].get("reference_timestamp"), records[0].get("market")),
         "",
-        "Tested:",
+        "테스트:",
         str(len(records)),
         "",
-        "Same Decision:",
+        "같은 의견:",
         str(same_count),
         "",
-        "Conflict:",
+        "다른 의견:",
         str(len(conflicts)),
         "",
-        "Status:",
-        "RUNNING",
+        "상태:",
+        "진행 중",
     ]
     if conflicts:
-        lines.extend(["", "━━━━━━━━━━━━━━", "", "⚔️ CONFLICT CASES", ""])
+        lines.extend(["", "━━━━━━━━━━━━━━", "", "⚔️ 의견 다른 종목", ""])
         for record in conflicts[:12]:
             existing, research = _decision_pair(record)
             lines.append(
-                f"{record.get('ticker')} · Existing: {existing} · {record.get('existing_ai_score')} / "
-                f"Research: {research} · {record.get('research_score')}"
+                f"{record.get('ticker')} · 기존: {_kr_decision(existing)} · {record.get('existing_ai_score')} / "
+                f"Research AI: {_kr_decision(research)} · {record.get('research_score')}"
             )
         if len(conflicts) > 12:
-            lines.append(f"... +{len(conflicts) - 12} more")
+            lines.append(f"... 외 {len(conflicts) - 12}개")
     return "\n".join(lines)
 
 
@@ -277,21 +291,21 @@ def comparison_report_message(report: dict) -> str:
     if report.get("status") != "OK":
         return "\n".join(
             [
-                "DAILY AI COMPARISON",
+                "일일 AI 비교",
                 "",
                 "DATA_UNAVAILABLE",
-                f"Total samples: {report.get('total_samples', 0)}",
-                f"Completed 5D: {report.get('completed_5d', 0)}",
+                f"전체 표본: {report.get('total_samples', 0)}",
+                f"5일 평가 완료: {report.get('completed_5d', 0)}",
                 str(report.get("message", "")),
             ]
         )
     metrics = report.get("metrics") or {}
     lines = [
-        "DAILY AI COMPARISON",
+        "일일 AI 비교",
         "",
-        f"Tested: {report.get('total_samples')}",
-        f"Evaluated: {report.get('evaluated_samples')}",
-        f"Completed 5D: {report.get('completed_5d')}",
+        f"테스트: {report.get('total_samples')}",
+        f"평가 완료: {report.get('evaluated_samples')}",
+        f"5일 평가 완료: {report.get('completed_5d')}",
         "",
     ]
     for window in ("1H", "CLOSE", "1D", "3D", "5D"):
@@ -300,16 +314,16 @@ def comparison_report_message(report: dict) -> str:
             continue
         lines.extend(
             [
-                f"{window} Result",
-                f"Existing Accuracy: {item.get('existing_accuracy')}%",
-                f"Research Accuracy: {item.get('research_accuracy')}%",
-                f"Average Return: {item.get('average_return')}%",
+                f"{window} 결과",
+                f"기존 AI 정확도: {item.get('existing_accuracy')}%",
+                f"Research AI 정확도: {item.get('research_accuracy')}%",
+                f"평균 수익률: {item.get('average_return')}%",
                 "",
             ]
         )
-    lines.append("Top Differences:")
+    lines.append("차이가 큰 종목:")
     for item in (report.get("top_differences") or [])[:5]:
         lines.append(
-            f"- {item.get('ticker')}: Existing {item.get('existing_score')} vs Research {item.get('research_score')}"
+            f"- {item.get('ticker')}: 기존 {item.get('existing_score')} vs Research AI {item.get('research_score')}"
         )
     return "\n".join(lines)

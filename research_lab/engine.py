@@ -15,6 +15,21 @@ from .storage import JsonlStore
 
 POSITIVE_WORDS = ("호재", "상향", "성장", "수주", "계약", "실적", "투자", "돌파", "확대", "beat")
 NEGATIVE_WORDS = ("악재", "하향", "소송", "감소", "손실", "miss", "리콜", "규제", "부진", "위험")
+SCANNER_TEXT_FIELDS = {"ai_reason", "action_reason", "risks", "sector_summary"}
+STALE_NEWS_PATTERNS = (
+    re.compile(r"2026-0[1-7]-"),
+    re.compile(r"2026-08-0[1-9]"),
+    re.compile(r"2026-08-1[0-7]"),
+)
+GENERIC_NEWS_MARKERS = (
+    "오늘 기준 회사 관련 뉴스 없음",
+    "엉뚱한 뉴스는 제외",
+    "최근 7일 내 공식/신뢰 캐나다 뉴스 없음",
+    "ETF 경량 모드",
+    "해외 종목: 해외 주요 뉴스",
+    "뉴스 확인 전",
+    "뉴스 확인 실패",
+)
 
 
 def _num(value: Any, default: float | None = None) -> float | None:
@@ -47,6 +62,61 @@ def _text(value: Any, default: str = "") -> str:
 
 def _clamp(value: float, low: int = 0, high: int = 100) -> int:
     return int(max(low, min(high, round(value))))
+
+
+def validate_market_row(row: pd.Series) -> dict[str, Any]:
+    ticker = _text(row.get("ticker")).upper()
+    market = _text(row.get("market"))
+    name = _text(row.get("name"), ticker)
+    price = _num(row.get("price"))
+    change = _num(row.get("change_pct"))
+    volume_ratio = _num(row.get("volume_ratio"))
+    data_timestamp = _text(row.get("mobile_intel_generated_at"), _text(row.get("data_generated_at"), _text(row.get("file_updated_at"))))
+    issues = []
+    if not ticker:
+        issues.append("ticker_missing")
+    if not market:
+        issues.append("market_missing")
+    if not name:
+        issues.append("company_missing")
+    if price is None or price <= 0:
+        issues.append("reference_price_invalid")
+    if change is None:
+        issues.append("change_pct_missing")
+    if volume_ratio is None:
+        issues.append("volume_ratio_missing")
+    if not data_timestamp:
+        issues.append("reference_timestamp_missing")
+    return {
+        "status": "VALID" if not issues else "DATA_INVALID",
+        "issues": issues,
+        "ticker": ticker,
+        "market": market,
+        "company": name,
+        "reference_price": price,
+        "change_pct": change,
+        "volume_ratio": volume_ratio,
+        "sector": _text(row.get("sector")),
+        "reference_timestamp": data_timestamp,
+    }
+
+
+def validate_news_row(row: pd.Series) -> dict[str, Any]:
+    title = " ".join([_text(row.get("news")), _text(row.get("news_one_line")), _text(row.get("headlines"))]).strip()
+    source = _text(row.get("news_source"), "unknown")
+    if not title or "NO_RECENT_NEWS" in title or "뉴스 없음" in title:
+        status = "NEWS_MISSING"
+    elif any(marker in title for marker in GENERIC_NEWS_MARKERS):
+        status = "NEWS_MISSING"
+    elif any(pattern.search(title) for pattern in STALE_NEWS_PATTERNS):
+        status = "NEWS_STALE"
+    else:
+        status = "NEWS_AVAILABLE"
+    return {
+        "status": status,
+        "source": source,
+        "title": title if status == "NEWS_AVAILABLE" else "",
+    }
 
 
 class ResearchEngine:
@@ -158,9 +228,11 @@ class ResearchEngine:
         return changed
 
     def _build_result(self, row: pd.Series) -> ResearchResult:
+        data_quality = validate_market_row(row)
+        news_quality = validate_news_row(row)
         technical = self._technical(row)
         fundamental = self._fundamental(row)
-        sentiment = self._sentiment(row)
+        sentiment = self._sentiment(row, news_quality)
         bull = self._bull(row, technical, sentiment)
         bear = self._bear(row, technical, sentiment)
         risk_level, overheat = self._risk(row)
@@ -178,6 +250,17 @@ class ResearchEngine:
             "bull_case": bull,
             "bear_case": bear,
             "risk": {"level": risk_level, "overheat_risk": overheat},
+            "data_quality": data_quality,
+            "news_quality": news_quality,
+            "score_inputs": {
+                "price": "VALID" if data_quality["reference_price"] is not None and data_quality["reference_price"] > 0 else "INVALID",
+                "momentum": "VALID" if data_quality["change_pct"] is not None else "MISSING",
+                "volume": "VALID" if data_quality["volume_ratio"] is not None else "MISSING",
+                "technical": technical.status,
+                "news": news_quality["status"],
+                "risk": "VALID" if risk_level in {"LOW", "MEDIUM", "HIGH"} else "INVALID",
+                "continuation": "VALID",
+            },
             "comparison": self._comparison(existing_ai_score, existing_decision, research_score, research_decision),
         }
         return ResearchResult(
@@ -229,7 +312,6 @@ class ResearchEngine:
         available = [
             _text(row.get("dividend_summary")),
             _text(row.get("etf_summary")),
-            _text(row.get("sector_summary")),
         ]
         if not any(text and text not in {"해당 없음", "섹터 확인 부족"} for text in available):
             return AnalystResult(None, "DATA_UNAVAILABLE", "Fundamental fields are not available in the current scanner dataset.", "DATA_UNAVAILABLE")
@@ -238,10 +320,11 @@ class ResearchEngine:
             base += 5
         return AnalystResult(_clamp(base), "Neutral", "Limited scanner-level fundamental context only.")
 
-    def _sentiment(self, row: pd.Series) -> AnalystResult:
-        news = " ".join([_text(row.get("news")), _text(row.get("news_one_line")), _text(row.get("headlines"))])
-        if not news or "뉴스 없음" in news:
-            return AnalystResult(None, "NO_RECENT_NEWS", "NO_RECENT_NEWS", "NEWS_UNAVAILABLE")
+    def _sentiment(self, row: pd.Series, news_quality: dict[str, Any] | None = None) -> AnalystResult:
+        news_quality = news_quality or validate_news_row(row)
+        news = _text(news_quality.get("title"))
+        if news_quality.get("status") != "NEWS_AVAILABLE" or not news:
+            return AnalystResult(None, "NO_RECENT_NEWS", str(news_quality.get("status") or "NEWS_MISSING"), "NEWS_UNAVAILABLE")
         positives = sum(1 for word in POSITIVE_WORDS if word.lower() in news.lower())
         negatives = sum(1 for word in NEGATIVE_WORDS if word.lower() in news.lower())
         score = _clamp(50 + positives * 10 - negatives * 12 + (_num(row.get("news_score"), 0) or 0) * 0.5)
@@ -273,9 +356,13 @@ class ResearchEngine:
             reasons.append("당일 상승폭이 커 추격 위험이 있습니다.")
         if sentiment.direction == "Bearish":
             reasons.append("뉴스/심리 쪽 위험 신호가 있습니다.")
-        risk_text = _text(row.get("risks"))
-        if risk_text:
-            reasons.append(risk_text[:120])
+        atr = _num(row.get("atr_pct"), 0) or 0
+        volume = _num(row.get("volume_ratio"), 1) or 1
+        trade = _num(row.get("trade_value_ratio"), 1) or 1
+        if atr >= 6:
+            reasons.append("변동성이 높아 손실 위험이 큽니다.")
+        if volume < 0.7 or trade < 0.7:
+            reasons.append("거래 확인이 약해 신호 신뢰도가 낮습니다.")
         if not reasons:
             reasons.append("뚜렷한 하락 근거는 제한적입니다.")
         score = _clamp(35 + max(0, rsi - 65) * 1.4 + max(0, change - 4) * 3 + (15 if sentiment.direction == "Bearish" else 0))
@@ -354,4 +441,3 @@ class ResearchEngine:
             "difference": None if existing_score is None else research_score - existing_score,
             "alignment": "CONFIRMED" if existing_positive == research_positive else "CONFLICT",
         }
-

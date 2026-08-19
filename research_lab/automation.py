@@ -15,7 +15,7 @@ import requests
 from .comparison import ComparisonLab
 from .config import DATA_DIR, DEFAULT_MARKET_RESULTS, ResearchLabConfig
 from .daily_comparison import DailyComparisonLab
-from .engine import ResearchEngine, _num
+from .engine import ResearchEngine, _num, validate_market_row, validate_news_row
 from .storage import JsonlStore
 
 
@@ -449,34 +449,46 @@ def validate_snapshot(
 
 
 def select_market_sample(df: pd.DataFrame, limit: int) -> list[tuple[str, pd.Series]]:
+    valid_df = df[df.apply(lambda row: validate_market_row(row).get("status") == "VALID", axis=1)].copy()
+    if valid_df.empty:
+        return []
+    df = valid_df
     change = df.get("change_pct", pd.Series([0] * len(df))).apply(lambda value: _num(value, 0) or 0)
     volume = df.get("volume_ratio", pd.Series([0] * len(df))).apply(lambda value: _num(value, 0) or 0)
-    news = df.get("news_one_line", pd.Series([""] * len(df))).astype(str)
+    news_ok = df.apply(lambda row: validate_news_row(row).get("status") == "NEWS_AVAILABLE", axis=1)
     rsi = df.get("rsi", pd.Series([0] * len(df))).apply(lambda value: _num(value, 0) or 0)
+    trade_value = df.get("trade_value", pd.Series([0] * len(df))).apply(lambda value: _num(value, 0) or 0)
+    ticker_sorted = df.assign(_ticker=df["ticker"].astype(str).str.upper()).sort_values("_ticker")
     buckets = [
-        ("gainer", df.assign(_rank=change).sort_values("_rank", ascending=False)),
-        ("decliner", df.assign(_rank=change).sort_values("_rank", ascending=True)),
-        ("volume_spike", df.assign(_rank=volume).sort_values("_rank", ascending=False)),
-        ("news", df[news.ne("") & ~news.str.contains("뉴스 없음|NO_RECENT_NEWS", na=False)]),
-        ("already_risen", df[(change >= 5) | (rsi >= 70)]),
-        ("general", df.sort_values("ticker")),
+        ("gainer", df.assign(_rank=change).sort_values(["_rank", "ticker"], ascending=[False, True])),
+        ("decliner", df.assign(_rank=change).sort_values(["_rank", "ticker"], ascending=[True, True])),
+        ("volume_spike", df.assign(_rank=volume).sort_values(["_rank", "ticker"], ascending=[False, True])),
+        ("news", df[news_ok].assign(_ticker=df[news_ok]["ticker"].astype(str).str.upper()).sort_values("_ticker")),
+        ("already_risen", df[(change >= 5) | (rsi >= 70)].assign(_rank=change).sort_values(["_rank", "ticker"], ascending=[False, True])),
+        ("large_liquid", df.assign(_rank=trade_value).sort_values(["_rank", "ticker"], ascending=[False, True])),
+        ("mid_small", df.assign(_rank=trade_value).sort_values(["_rank", "ticker"], ascending=[True, True])),
+        ("general", ticker_sorted),
     ]
     seen: set[str] = set()
     selected: list[tuple[str, pd.Series]] = []
+    per_bucket = max(2, min(6, (limit + len(buckets) - 1) // len(buckets)))
     for category, bucket in buckets:
-        for _, row in bucket.iterrows():
+        added = 0
+        for _, row in bucket.head(max(per_bucket * 3, per_bucket)).iterrows():
             ticker = str(row.get("ticker", "")).upper()
             if ticker and ticker not in seen:
                 seen.add(ticker)
-                selected.append((category, row.drop(labels=["_rank"], errors="ignore")))
-                break
+                selected.append((category, row.drop(labels=["_rank", "_ticker"], errors="ignore")))
+                added += 1
+                if added >= per_bucket:
+                    break
             if len(selected) >= limit:
-                return selected
-    for _, row in df.iterrows():
+                return selected[:limit]
+    for _, row in ticker_sorted.iterrows():
         ticker = str(row.get("ticker", "")).upper()
         if ticker and ticker not in seen:
             seen.add(ticker)
-            selected.append(("fill", row))
+            selected.append(("fill", row.drop(labels=["_rank", "_ticker"], errors="ignore")))
             if len(selected) >= limit:
                 break
     return selected[:limit]
@@ -515,6 +527,16 @@ def compact_decision_pair(record: dict[str, Any]) -> tuple[str, str]:
     return existing, research
 
 
+def kr_decision(value: Any) -> str:
+    mapping = {"BUY CANDIDATE": "매수 후보", "WATCH": "관찰", "WAIT": "대기", "AVOID": "회피", "N/A": "정보 없음"}
+    return mapping.get(str(value or "N/A").upper(), str(value or "정보 없음"))
+
+
+def kr_risk(value: Any) -> str:
+    mapping = {"LOW": "낮음", "MEDIUM": "보통", "HIGH": "높음"}
+    return mapping.get(str(value or "").upper(), str(value or "정보 없음"))
+
+
 def is_conflict(record: dict[str, Any]) -> bool:
     existing, research = compact_decision_pair(record)
     return existing != research
@@ -523,8 +545,8 @@ def is_conflict(record: dict[str, Any]) -> bool:
 def compact_comparison_line(record: dict[str, Any]) -> str:
     existing, research = compact_decision_pair(record)
     return (
-        f"{record.get('ticker')} · Existing: {existing} · {record.get('existing_ai_score')} / "
-        f"Research: {research} · {record.get('research_score')}"
+        f"{record.get('ticker')} · 기존: {kr_decision(existing)} · {record.get('existing_ai_score')} / "
+        f"Research AI: {kr_decision(research)} · {record.get('research_score')}"
     )
 
 
@@ -532,28 +554,32 @@ def existing_message(record: dict[str, Any], market_key: str) -> str:
     existing, research = compact_decision_pair(record)
     return "\n".join(
         [
-            "⚔️ AI CONFLICT" if existing != research else "📊 AI COMPARISON",
+            "⚔️ AI 의견 충돌" if existing != research else "📊 AI 비교",
             "",
             f"{market_flag(market_key)} {record.get('ticker')}",
             str(record.get("name") or ""),
             "",
-            "Reference:",
+            "기준 가격:",
             format_reference_price(record.get("reference_price"), market_key),
+            "",
+            "기준 시각:",
             format_reference_time(record.get("reference_timestamp"), market_key),
             "",
-            "EXISTING",
-            f"{existing} · {record.get('existing_ai_score')}",
-            f"Risk: {record.get('existing_risk')}",
+            "기존 AI",
+            f"점수: {record.get('existing_ai_score')}",
+            f"판단: {kr_decision(existing)}",
+            f"위험도: {kr_risk(record.get('existing_risk'))}",
             "",
-            "RESEARCH",
-            f"{research} · {record.get('research_score')}",
-            f"Risk: {record.get('research_risk')}",
+            "Research AI",
+            f"점수: {record.get('research_score')}",
+            f"판단: {kr_decision(research)}",
+            f"위험도: {kr_risk(record.get('research_risk'))}",
             "",
-            "Decision:",
-            "DIFFERENT" if existing != research else "SAME",
+            "의견:",
+            "다름" if existing != research else "같음",
             "",
-            "Result:",
-            "PENDING",
+            "결과:",
+            "대기 중",
         ]
     )
 
@@ -569,29 +595,29 @@ def existing_summary_message(records: list[dict[str, Any]], market_key: str, slo
     same_count = len(records) - len(conflicts)
     ref_time = format_reference_time(records[0].get("reference_timestamp"), market_key) if records else "DATA_UNAVAILABLE"
     lines = [
-        "📊 PRIMARY TEST" if slot.snapshot_type == "PRIMARY_TEST" else "📊 AI SNAPSHOT",
+        "📊 PRIMARY 테스트" if slot.snapshot_type == "PRIMARY_TEST" else "📊 AI 스냅샷",
         "",
         f"{market_flag(market_key)} {market_key}",
         ref_time,
         "",
-        "Tested:",
+        "테스트:",
         str(len(records)),
         "",
-        "Same Decision:",
+        "같은 의견:",
         str(same_count),
         "",
-        "Conflict:",
+        "다른 의견:",
         str(len(conflicts)),
         "",
-        "Status:",
-        "COMPLETED" if slot.official_evaluation else "PENDING",
+        "상태:",
+        "완료" if slot.official_evaluation else "대기 중",
     ]
     if conflicts:
-        lines.extend(["", "━━━━━━━━━━━━━━", "", "⚔️ CONFLICT CASES", ""])
+        lines.extend(["", "━━━━━━━━━━━━━━", "", "⚔️ 의견 다른 종목", ""])
         for record in conflicts[:12]:
             lines.append(compact_comparison_line(record))
         if len(conflicts) > 12:
-            lines.append(f"... +{len(conflicts) - 12} more")
+            lines.append(f"... 외 {len(conflicts) - 12}개")
     return "\n".join(lines)
 
 
@@ -610,25 +636,25 @@ def intraday_update_message(records: list[dict[str, Any]], market_key: str, slot
         return ""
     ref_time = format_reference_time(records[0].get("reference_timestamp"), market_key) if records else slot.local_time.strftime("%H:%M")
     lines = [
-        "📈 INTRADAY UPDATE",
+        "📈 장중 업데이트",
         "",
         f"{market_flag(market_key)} {market_key}",
         ref_time,
         "",
-        "Tracked:",
+        "추적 종목:",
         str(len(records)),
         "",
-        "Signal Changes:",
+        "신호 변화:",
         str(len(conflicts)),
         "",
-        "Major Moves:",
+        "주요 변동:",
     ]
     if major_moves:
         for record, change_pct in major_moves[:8]:
             lines.append(f"{record.get('ticker')} {change_pct:+.1f}%")
     else:
-        lines.append("None")
-    lines.extend(["", "Research Changes:", str(len(conflicts)), "", "Existing Changes:", str(len(conflicts))])
+        lines.append("없음")
+    lines.extend(["", "Research 변화:", str(len(conflicts)), "", "기존 AI 변화:", str(len(conflicts))])
     return "\n".join(lines)
 
 
@@ -636,20 +662,20 @@ def primary_skip_message(market_key: str, slot: ResearchSlot, reason: str, attem
     flag = "🇰🇷" if market_key == "KOREA" else "🇺🇸"
     return "\n".join(
         [
-            "[RESEARCH LAB]",
+            "[Research Lab]",
             "",
-            f"{flag} {market_key} PRIMARY TEST",
+            f"{flag} {market_key} PRIMARY 테스트",
             "",
-            "Status:",
+            "상태:",
             JOB_STATUS_SKIPPED_NO_FRESH_SNAPSHOT,
             "",
-            "Reason:",
-            "Fresh Existing Scanner snapshot unavailable.",
+            "사유:",
+            "최신 Existing Scanner 스냅샷을 찾지 못했습니다.",
             "",
-            "Last Check:",
+            "마지막 확인:",
             reason,
             "",
-            "Retry:",
+            "재확인:",
             "\n".join(attempts),
         ]
     )
@@ -921,7 +947,7 @@ def run_daily_close(market_key: str, *, dry_run: bool = False, now: datetime | N
 def notify_failure(env: dict[str, str], config: ResearchLabConfig, market_key: str, phase: str, reason: str) -> None:
     token = config.telegram_bot_token or env.get("BACKTEST_BOT_TOKEN", "").strip()
     chat_id = config.allowed_chat_id or env.get("BACKTEST_CHAT_ID", "8749935590").strip()
-    text = "\n".join(["[RESEARCH LAB AUTO WARNING]", "", f"Market: {market_key}", f"Phase: {phase}", f"Reason: {reason}"])
+    text = "\n".join(["[Research Lab 자동화 경고]", "", f"시장: {market_key}", f"단계: {phase}", f"사유: {reason}"])
     send_telegram(token, chat_id, text, config.request_timeout)
 
 
