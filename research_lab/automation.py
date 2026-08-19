@@ -537,6 +537,40 @@ def kr_risk(value: Any) -> str:
     return mapping.get(str(value or "").upper(), str(value or "정보 없음"))
 
 
+def kr_data_status(record: dict[str, Any]) -> str:
+    quality = record.get("data_quality")
+    if isinstance(quality, dict):
+        status = str(quality.get("status") or "")
+        issues = quality.get("issues") or []
+        if status == "VALID":
+            return "정상"
+        if issues:
+            return f"확인 필요 ({', '.join(map(str, issues[:2]))})"
+        return status or "확인 필요"
+    if record.get("reference_price") is not None and record.get("reference_timestamp"):
+        return "정상"
+    return "DATA_UNAVAILABLE"
+
+
+def kr_news_status(record: dict[str, Any]) -> str:
+    quality = record.get("news_quality")
+    if isinstance(quality, dict):
+        status = str(quality.get("status") or "")
+    else:
+        sentiment = record.get("sentiment_analysis") if isinstance(record.get("sentiment_analysis"), dict) else {}
+        reason = str(sentiment.get("reason") or "")
+        status = str(sentiment.get("status") or reason or "")
+        if status == "NEWS_UNAVAILABLE" and reason in {"NEWS_MISSING", "NEWS_STALE"}:
+            status = reason
+    mapping = {
+        "NEWS_AVAILABLE": "최신 뉴스 확인",
+        "NEWS_MISSING": "최근 뉴스 없음",
+        "NEWS_STALE": "오래된 뉴스 제외",
+        "NEWS_UNAVAILABLE": "뉴스 없음",
+    }
+    return mapping.get(status, status or "뉴스 상태 확인 필요")
+
+
 def is_conflict(record: dict[str, Any]) -> bool:
     existing, research = compact_decision_pair(record)
     return existing != research
@@ -559,11 +593,10 @@ def existing_message(record: dict[str, Any], market_key: str) -> str:
             f"{market_flag(market_key)} {record.get('ticker')}",
             str(record.get("name") or ""),
             "",
-            "기준 가격:",
-            format_reference_price(record.get("reference_price"), market_key),
-            "",
-            "기준 시각:",
-            format_reference_time(record.get("reference_timestamp"), market_key),
+            f"현재가: {format_reference_price(record.get('reference_price'), market_key)}",
+            f"기준 시각: {format_reference_time(record.get('reference_timestamp'), market_key)}",
+            f"데이터 상태: {kr_data_status(record)}",
+            f"뉴스 상태: {kr_news_status(record)}",
             "",
             "기존 AI",
             f"점수: {record.get('existing_ai_score')}",
@@ -575,11 +608,8 @@ def existing_message(record: dict[str, Any], market_key: str) -> str:
             f"판단: {kr_decision(research)}",
             f"위험도: {kr_risk(record.get('research_risk'))}",
             "",
-            "의견:",
-            "다름" if existing != research else "같음",
-            "",
-            "결과:",
-            "대기 중",
+            f"의견: {'다름' if existing != research else '같음'}",
+            "결과: 대기 중",
         ]
     )
 
@@ -843,6 +873,9 @@ def run_snapshot_slot(
                 "snapshot_type": slot.snapshot_type,
                 "official_evaluation": slot.official_evaluation,
                 "lookahead_guard": "fixed_snapshot_no_recalculation",
+                "data_quality": research.reasoning.get("data_quality", {}),
+                "news_quality": research.reasoning.get("news_quality", {}),
+                "score_inputs": research.reasoning.get("score_inputs", {}),
             }
         )
         records.append(record)

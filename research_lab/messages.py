@@ -87,6 +87,40 @@ def _kr_risk(value: object) -> str:
     return mapping.get(str(value or "").upper(), str(value or "정보 없음"))
 
 
+def _kr_data_status(record: dict) -> str:
+    quality = record.get("data_quality")
+    if isinstance(quality, dict):
+        status = str(quality.get("status") or "")
+        issues = quality.get("issues") or []
+        if status == "VALID":
+            return "정상"
+        if issues:
+            return f"확인 필요 ({', '.join(map(str, issues[:2]))})"
+        return status or "확인 필요"
+    if record.get("reference_price") is not None and record.get("reference_timestamp"):
+        return "정상"
+    return "DATA_UNAVAILABLE"
+
+
+def _kr_news_status(record: dict) -> str:
+    quality = record.get("news_quality")
+    if isinstance(quality, dict):
+        status = str(quality.get("status") or "")
+    else:
+        sentiment = record.get("sentiment_analysis") if isinstance(record.get("sentiment_analysis"), dict) else {}
+        reason = str(sentiment.get("reason") or "")
+        status = str(sentiment.get("status") or reason or "")
+        if status == "NEWS_UNAVAILABLE" and reason in {"NEWS_MISSING", "NEWS_STALE"}:
+            status = reason
+    mapping = {
+        "NEWS_AVAILABLE": "최신 뉴스 확인",
+        "NEWS_MISSING": "최근 뉴스 없음",
+        "NEWS_STALE": "오래된 뉴스 제외",
+        "NEWS_UNAVAILABLE": "뉴스 없음",
+    }
+    return mapping.get(status, status or "뉴스 상태 확인 필요")
+
+
 def compact_ai_comparison_message(record: dict) -> str:
     market = str(record.get("market") or "")
     existing, research = _decision_pair(record)
@@ -99,11 +133,10 @@ def compact_ai_comparison_message(record: dict) -> str:
             f"{_market_flag(market)} {record.get('ticker')}",
             str(record.get("name") or ""),
             "",
-            "기준 가격:",
-            _format_price(record.get("reference_price"), market),
-            "",
-            "기준 시각:",
-            _format_time(record.get("reference_timestamp"), market),
+            f"현재가: {_format_price(record.get('reference_price'), market)}",
+            f"기준 시각: {_format_time(record.get('reference_timestamp'), market)}",
+            f"데이터 상태: {_kr_data_status(record)}",
+            f"뉴스 상태: {_kr_news_status(record)}",
             "",
             "기존 AI",
             f"점수: {record.get('existing_ai_score')}",
@@ -115,11 +148,8 @@ def compact_ai_comparison_message(record: dict) -> str:
             f"판단: {_kr_decision(research)}",
             f"위험도: {_kr_risk(record.get('research_risk'))}",
             "",
-            "의견:",
-            "다름" if different else "같음",
-            "",
-            "결과:",
-            "대기 중",
+            f"의견: {'다름' if different else '같음'}",
+            "결과: 대기 중",
         ]
     )
 
