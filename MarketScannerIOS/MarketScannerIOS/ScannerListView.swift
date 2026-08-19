@@ -4952,6 +4952,27 @@ private struct AppUpdateNoticeCard: View {
 
     private let entries: [AppUpdateEntry] = [
         AppUpdateEntry(
+            version: "v1.0.24",
+            updatedAt: "2026-08-18 20:50 PDT",
+            features: [
+                "메인폰과 관리자폰 신고 목록을 중앙 API 기준으로 동기화",
+                "모바일 데이터 요청 단계별 진단 로그 추가"
+            ],
+            fixes: [
+                "신고 건수와 상태가 기기마다 다르게 보일 수 있는 문제 수정",
+                "서버 응답 실패, 인증 오류, 제한 응답을 구분해 표시하도록 개선",
+                "제한된 결과나 비정상적으로 적은 데이터가 기존 정상 캐시를 덮어쓰지 않도록 유지"
+            ],
+            dataChanges: [
+                "중앙 BUG 저장소의 신고 수와 상태 카운트를 앱에서 확인 가능",
+                "종목 데이터, 스캐너 결과, 모의투자 포트폴리오 변경 없음"
+            ],
+            important: [
+                "중앙 API 데이터를 기준으로 신고 목록을 맞추도록 변경",
+                "업데이트 내용은 앱 첫 화면에 계속 표시"
+            ]
+        ),
+        AppUpdateEntry(
             version: "v1.0.23",
             updatedAt: "2026-08-11 20:20 PDT",
             features: [
