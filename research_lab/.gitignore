@@ -1,4 +1,5 @@
 data/*.jsonl
+data/*.json
 data/*.tmp
+data/.*.lock
 .env
-

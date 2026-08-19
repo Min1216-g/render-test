@@ -129,3 +129,44 @@ research_lab/data/daily_comparison_results.jsonl
 이미 저장된 Daily Result는 다시 생성하거나 Telegram으로 중복 전송하지 않습니다. 서버 재시작 후에도 같은 저장 파일을 확인해서 중복 전송을 막습니다.
 
 Daily Score는 Direction, Return, Risk, Momentum, News, Continuation 항목으로 계산하고, `DATA_UNAVAILABLE` 항목은 제외한 뒤 남은 항목 비율로 재계산합니다.
+
+## 자동 실행
+
+Research Lab 자동화는 기존 `market_scanner_results.csv`를 읽기 전용 snapshot으로 사용합니다. 기존 Scanner, 모바일 앱, 기존 AI SCORE 계산식은 변경하지 않습니다.
+
+```bash
+./install_research_lab_schedule.sh
+```
+
+등록되는 launchd 작업:
+
+```text
+com.m2.stock.researchlab.automation
+```
+
+동작:
+
+- 5분마다 due 상태만 확인합니다.
+- 한국장 open: `Asia/Seoul` 09:05~09:50
+- 미국장 open: `America/New_York` 09:35~10:20
+- 한국장 close daily: `Asia/Seoul` 15:50~17:20
+- 미국장 close daily: `America/New_York` 16:20~17:50
+
+장 시작 작업은 snapshot 존재, market row, reference price, reference timestamp, stale 여부를 검증한 뒤 같은 `market + trading_date + reference_timestamp` job ID로 중복 실행을 막습니다.
+
+수동 검증:
+
+```bash
+python3 -m research_lab.automation status
+python3 -m research_lab.automation open --market KOREA --dry-run --now 2026-08-19T09:05:00+09:00
+python3 -m research_lab.automation open --market US --dry-run --now 2026-08-19T09:35:00-04:00
+python3 -m research_lab.automation daily --market KOREA --dry-run --now 2026-08-19T15:50:00+09:00
+python3 -m research_lab.automation daily --market US --dry-run --now 2026-08-19T16:20:00-04:00
+```
+
+로그와 중복 실행 상태:
+
+```text
+research_lab/data/automation_log.jsonl
+research_lab/data/automation_state.json
+```
