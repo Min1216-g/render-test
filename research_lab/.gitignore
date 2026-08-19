@@ -1,0 +1,4 @@
+data/*.jsonl
+data/*.tmp
+.env
+
