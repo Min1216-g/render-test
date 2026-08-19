@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import asdict, is_dataclass
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -10,6 +11,23 @@ MARKET_ORDER = (
     ("US", "🇺🇸 미국장", {"미장", "US", "USA", "미국"}),
     ("CANADA", "🇨🇦 캐나다장", {"캐나다", "CANADA", "TSX", "TSXV"}),
 )
+
+
+def _as_record_dict(record: object) -> dict:
+    if isinstance(record, dict):
+        return record
+    if is_dataclass(record):
+        return asdict(record)
+    to_dict = getattr(record, "to_dict", None)
+    if callable(to_dict):
+        data = to_dict()
+        if isinstance(data, dict):
+            return data
+    return {}
+
+
+def _normalize_records(records: list[dict] | list[object]) -> list[dict]:
+    return [_as_record_dict(record) for record in records]
 
 
 def _money(value: float | None) -> str:
@@ -137,25 +155,8 @@ def _kr_news_status(record: dict) -> str:
     return mapping.get(status, status or "뉴스 상태 확인 필요")
 
 
-def _market_open(market_key: str, now: datetime | None = None) -> bool:
-    zones = {
-        "KOREA": ZoneInfo("Asia/Seoul"),
-        "US": ZoneInfo("America/New_York"),
-        "CANADA": ZoneInfo("America/New_York"),
-    }
-    local_now = (now or datetime.now(ZoneInfo("UTC"))).astimezone(zones.get(market_key, ZoneInfo("UTC")))
-    if local_now.weekday() >= 5:
-        return False
-    open_time = (9, 0) if market_key == "KOREA" else (9, 30)
-    close_time = (15, 30) if market_key == "KOREA" else (16, 0)
-    current = local_now.hour * 60 + local_now.minute
-    open_minutes = open_time[0] * 60 + open_time[1]
-    close_minutes = close_time[0] * 60 + close_time[1]
-    return open_minutes <= current < close_minutes
-
-
-def _market_records(records: list[dict], aliases: set[str]) -> list[dict]:
-    return [record for record in records if str(record.get("market") or "") in aliases]
+def _market_records(records: list[dict] | list[object], aliases: set[str]) -> list[dict]:
+    return [record for record in _normalize_records(records) if str(record.get("market") or "") in aliases]
 
 
 def _record_has_current_data(record: dict, market_key: str, now: datetime | None = None) -> bool:
@@ -178,13 +179,15 @@ def _record_has_current_data(record: dict, market_key: str, now: datetime | None
 
 def _display_name(record: dict | None) -> str:
     if not record:
-        return "데이터 없음"
+        return "현재 유효한 강세 후보 없음"
     name = str(record.get("name") or "").strip()
     ticker = str(record.get("ticker") or "").strip()
-    return name or ticker or "데이터 없음"
+    if name and ticker and name.upper() != ticker.upper():
+        return f"{name} ({ticker})"
+    return name or ticker or "현재 유효한 강세 후보 없음"
 
 
-def _scanner_pick(records: list[dict], market_key: str, now: datetime | None = None) -> dict | None:
+def _scanner_picks(records: list[dict], market_key: str, now: datetime | None = None, limit: int = 5) -> list[dict]:
     bullish = {"BUY CANDIDATE", "WATCH"}
     candidates = [
         record
@@ -192,35 +195,59 @@ def _scanner_pick(records: list[dict], market_key: str, now: datetime | None = N
         if _record_has_current_data(record, market_key, now)
         and str(record.get("existing_ai_decision") or "").upper() in bullish
     ]
-    return max(candidates, key=lambda record: float(record.get("existing_ai_score") or 0), default=None)
+    return sorted(
+        candidates,
+        key=lambda record: (
+            float(record.get("existing_ai_score") or 0),
+            float(record.get("reference_change_pct") or record.get("change_pct") or 0),
+            str(record.get("ticker") or ""),
+        ),
+        reverse=True,
+    )[:limit]
 
 
-def _research_pick(records: list[dict], market_key: str, now: datetime | None = None) -> dict | None:
+def _research_picks(records: list[dict], market_key: str, now: datetime | None = None, limit: int = 5) -> list[dict]:
     bullish = {"BUY CANDIDATE", "WATCH"}
-    candidates = [
+    valid_records = [
         record
         for record in records
         if _record_has_current_data(record, market_key, now)
-        and str(record.get("research_decision") or "").upper() in bullish
     ]
-    return max(candidates, key=lambda record: float(record.get("research_score") or 0), default=None)
+    candidates = [
+        record
+        for record in valid_records
+        if str(record.get("research_decision") or "").upper() in bullish
+    ]
+    if not candidates:
+        candidates = [
+            record
+            for record in valid_records
+            if float(record.get("research_score") or 0) >= 45
+        ]
+    return sorted(
+        candidates,
+        key=lambda record: (
+            float(record.get("research_score") or 0),
+            float(record.get("reference_change_pct") or record.get("change_pct") or 0),
+            str(record.get("ticker") or ""),
+        ),
+        reverse=True,
+    )[:limit]
 
 
-def _market_line(label: str, records: list[dict], picker, *, now: datetime | None = None) -> str:
+def _market_block(label: str, records: list[dict], picker, *, now: datetime | None = None, limit: int = 5) -> list[str]:
     market_key = next((key for key, market_label, _ in MARKET_ORDER if market_label == label), "")
-    if market_key and not _market_open(market_key, now):
-        return f"{label}: 장 마감"
-    if not records:
-        return f"{label}: 데이터 없음"
+    lines = [label, ""]
     if not any(_record_has_current_data(record, market_key, now) for record in records):
-        return f"{label}: 데이터 없음"
-    picked = picker(records, market_key, now)
+        return lines + ["현재 유효한 강세 후보 없음"]
+    picked = picker(records, market_key, now, limit)
     if not picked:
-        return f"{label}: 강세 후보 없음"
-    return f"{label}: {_display_name(picked)}"
+        return lines + ["현재 유효한 강세 후보 없음"]
+    return lines + [f"{index}. {_display_name(record)}" for index, record in enumerate(picked, start=1)]
 
 
-def scanner_prediction_message(records: list[dict], *, now: datetime | None = None) -> str:
+def scanner_prediction_message(records: list[dict] | list[object], *, now: datetime | None = None) -> str:
+    records = _normalize_records(records)
     lines = [
         "[scanner.py]",
         "현재 기준 강세로 예측되는 종목",
@@ -228,11 +255,15 @@ def scanner_prediction_message(records: list[dict], *, now: datetime | None = No
     ]
     grouped = [(key, label, _market_records(records, aliases)) for key, label, aliases in MARKET_ORDER]
     for _, label, market_records in grouped:
-        lines.append(_market_line(label, market_records, _scanner_pick, now=now))
+        lines.extend(_market_block(label, market_records, _scanner_picks, now=now))
+        lines.append("")
+    if lines and not lines[-1]:
+        lines.pop()
     return "\n".join(lines)
 
 
-def research_prediction_message(records: list[dict], *, now: datetime | None = None) -> str:
+def research_prediction_message(records: list[dict] | list[object], *, now: datetime | None = None) -> str:
+    records = _normalize_records(records)
     lines = [
         "[research]",
         "현재 기준 강세로 예측되는 종목",
@@ -240,11 +271,15 @@ def research_prediction_message(records: list[dict], *, now: datetime | None = N
     ]
     grouped = [(key, label, _market_records(records, aliases)) for key, label, aliases in MARKET_ORDER]
     for _, label, market_records in grouped:
-        lines.append(_market_line(label, market_records, _research_pick, now=now))
+        lines.extend(_market_block(label, market_records, _research_picks, now=now))
+        lines.append("")
+    if lines and not lines[-1]:
+        lines.pop()
     return "\n".join(lines)
 
 
-def prediction_summary_message(records: list[dict], *, now: datetime | None = None) -> str:
+def prediction_summary_message(records: list[dict] | list[object], *, now: datetime | None = None) -> str:
+    records = _normalize_records(records)
     return "\n\n".join(
         [
             scanner_prediction_message(records, now=now),
