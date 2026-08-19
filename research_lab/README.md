@@ -158,7 +158,11 @@ com.m2.stock.researchlab.automation
 
 `PRIMARY_TEST`만 공식 Daily Winner 평가에 사용합니다. `PRE_MARKET`과 `INTRADAY_MONITORING`은 `monitoring_history.jsonl`에 별도로 저장하며, 같은 종목을 여러 번 분석해도 공식 점수 표본으로 중복 계산하지 않습니다.
 
-각 작업은 snapshot 존재, market row, reference price, reference timestamp, stale 여부를 검증한 뒤 같은 `market + slot + trading_date` job ID로 중복 실행을 막습니다.
+Primary test는 fresh scanner snapshot이 없으면 즉시 실패 처리하지 않고 5분 간격으로 짧게 재확인합니다. 한국장은 09:05 / 09:10 / 09:15 / 09:20 / 09:25, 미국장은 09:35 / 09:40 / 09:45 / 09:50 / 09:55에 확인합니다. 마지막 재확인까지 fresh snapshot이 없으면 `SKIPPED_NO_FRESH_SNAPSHOT`으로 기록하고, stale 데이터로 Research 분석을 실행하지 않습니다.
+
+각 작업은 snapshot 존재, market row, reference price, reference timestamp, stale 여부를 검증한 뒤 같은 `market + slot + trading_date` job ID로 중복 실행을 막습니다. 상태는 `PENDING`, `RUNNING`, `COMPLETED`, `SKIPPED_NO_FRESH_SNAPSHOT`으로 관리합니다. `COMPLETED` 이후에는 같은 primary job을 다시 실행하지 않습니다.
+
+장중 monitoring도 stale snapshot을 사용하지 않습니다. fresh data가 없으면 `MONITORING_SKIPPED_STALE_DATA`로 기록하고 해당 시점의 monitoring만 건너뜁니다.
 
 수동 검증:
 
@@ -166,9 +170,11 @@ com.m2.stock.researchlab.automation
 python3 -m research_lab.automation status
 python3 -m research_lab.automation slot --market KOREA --slot PREMARKET --dry-run --now 2026-08-19T08:45:00+09:00
 python3 -m research_lab.automation open --market KOREA --dry-run --now 2026-08-19T09:05:00+09:00
+python3 -m research_lab.automation open --market KOREA --dry-run --now 2026-08-19T09:25:00+09:00
 python3 -m research_lab.automation monitor --market KOREA --slot MONITOR_0930 --dry-run --now 2026-08-19T09:30:00+09:00
 python3 -m research_lab.automation slot --market US --slot PREMARKET --dry-run --now 2026-08-19T09:15:00-04:00
 python3 -m research_lab.automation open --market US --dry-run --now 2026-08-19T09:35:00-04:00
+python3 -m research_lab.automation open --market US --dry-run --now 2026-08-19T09:55:00-04:00
 python3 -m research_lab.automation monitor --market US --slot MONITOR_1030 --dry-run --now 2026-08-19T10:30:00-04:00
 python3 -m research_lab.automation daily --market KOREA --dry-run --now 2026-08-19T15:50:00+09:00
 python3 -m research_lab.automation daily --market US --dry-run --now 2026-08-19T16:20:00-04:00

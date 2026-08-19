@@ -29,6 +29,10 @@ TELEGRAM_MAX_LENGTH = 3900
 DEFAULT_PRIMARY_LIMIT = 40
 DEFAULT_MONITORING_LIMIT = 40
 DEFAULT_SNAPSHOT_MAX_AGE_MINUTES = 180
+JOB_STATUS_PENDING = "PENDING"
+JOB_STATUS_RUNNING = "RUNNING"
+JOB_STATUS_COMPLETED = "COMPLETED"
+JOB_STATUS_SKIPPED_NO_FRESH_SNAPSHOT = "SKIPPED_NO_FRESH_SNAPSHOT"
 
 
 @dataclass(frozen=True)
@@ -115,7 +119,7 @@ MARKETS = {
 SCHEDULE_SLOTS = {
     "KOREA": (
         ResearchSlot("PREMARKET", "PRE_MARKET", "PRE_MARKET", time(8, 45), 10, False),
-        ResearchSlot("PRIMARY", "PRIMARY_TEST", "PRIMARY_TEST", time(9, 5), 10, True),
+        ResearchSlot("PRIMARY", "PRIMARY_TEST", "PRIMARY_TEST", time(9, 5), 24, True),
         ResearchSlot("MONITOR_0930", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(9, 30), 10, False),
         ResearchSlot("MONITOR_1000", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(10, 0), 10, False),
         ResearchSlot("MONITOR_1200", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(12, 0), 10, False),
@@ -124,7 +128,7 @@ SCHEDULE_SLOTS = {
     ),
     "US": (
         ResearchSlot("PREMARKET", "PRE_MARKET", "PRE_MARKET", time(9, 15), 10, False),
-        ResearchSlot("PRIMARY", "PRIMARY_TEST", "PRIMARY_TEST", time(9, 35), 10, True),
+        ResearchSlot("PRIMARY", "PRIMARY_TEST", "PRIMARY_TEST", time(9, 35), 24, True),
         ResearchSlot("MONITOR_1000", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(10, 0), 10, False),
         ResearchSlot("MONITOR_1030", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(10, 30), 10, False),
         ResearchSlot("MONITOR_1230", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(12, 30), 10, False),
@@ -238,6 +242,26 @@ def slot_due(local_now: datetime, slot: ResearchSlot) -> bool:
     return start <= local_now <= end
 
 
+def slot_window_end(local_now: datetime, slot: ResearchSlot) -> datetime:
+    start = datetime.combine(local_now.date(), slot.local_time, tzinfo=local_now.tzinfo)
+    return start + timedelta(minutes=slot.window_minutes)
+
+
+def primary_retry_deadline(local_now: datetime, slot: ResearchSlot) -> datetime:
+    start = datetime.combine(local_now.date(), slot.local_time, tzinfo=local_now.tzinfo)
+    return start + timedelta(minutes=20)
+
+
+def retry_times(slot: ResearchSlot) -> list[str]:
+    attempts = []
+    cursor = datetime.combine(date(2000, 1, 1), slot.local_time)
+    end = cursor + timedelta(minutes=20 if slot.key == "PRIMARY" else slot.window_minutes)
+    while cursor <= end:
+        attempts.append(cursor.strftime("%H:%M"))
+        cursor += timedelta(minutes=5)
+    return attempts
+
+
 def due_slots(now: datetime, env: dict[str, str]) -> list[tuple[str, MarketSchedule, ResearchSlot, datetime]]:
     due = []
     for market_key, schedule in MARKETS.items():
@@ -250,6 +274,73 @@ def due_slots(now: datetime, env: dict[str, str]) -> list[tuple[str, MarketSched
             if slot_due(local_now, slot):
                 due.append((market_key, schedule, slot, local_now))
     return due
+
+
+def snapshot_job_id(market_key: str, slot: ResearchSlot, trading_date: str) -> str:
+    return f"{market_key}_{slot.key}_{trading_date}"
+
+
+def terminal_snapshot_status(status_value: str | None) -> bool:
+    return status_value in {JOB_STATUS_COMPLETED, JOB_STATUS_SKIPPED_NO_FRESH_SNAPSHOT}
+
+
+def job_status(job: dict[str, Any] | None) -> str | None:
+    if not job:
+        return None
+    return str(job.get("status") or JOB_STATUS_COMPLETED)
+
+
+def stale_running_job(job: dict[str, Any] | None, now: datetime, minutes: int = 30) -> bool:
+    if job_status(job) != JOB_STATUS_RUNNING:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(str(job.get("updated_at", "")).replace("Z", "+00:00"))
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return True
+    return now - updated_at.astimezone(timezone.utc) > timedelta(minutes=minutes)
+
+
+def update_snapshot_job(
+    state: dict[str, Any],
+    job_id: str,
+    *,
+    market_key: str,
+    slot: ResearchSlot,
+    trading_date: str,
+    status_value: str,
+    reason: str | None = None,
+    reference_timestamp: str | None = None,
+    records: int | None = None,
+    local_now: datetime | None = None,
+) -> dict[str, Any]:
+    completed_jobs = state.setdefault("completed_jobs", {})
+    job = completed_jobs.setdefault(
+        job_id,
+        {
+            "market": market_key,
+            "slot": slot.key,
+            "phase": slot.phase,
+            "snapshot_type": slot.snapshot_type,
+            "trading_date": trading_date,
+            "official_evaluation": slot.official_evaluation,
+            "created_at": utc_now_iso(),
+        },
+    )
+    attempts = job.setdefault("attempts", [])
+    attempt_time = (local_now or datetime.now(timezone.utc)).isoformat(timespec="seconds")
+    if not attempts or attempts[-1].get("attempted_at") != attempt_time or attempts[-1].get("reason") != reason:
+        attempts.append({"attempted_at": attempt_time, "reason": reason or status_value})
+    job["status"] = status_value
+    job["updated_at"] = utc_now_iso()
+    if reason:
+        job["reason"] = reason
+    if reference_timestamp:
+        job["reference_timestamp"] = reference_timestamp
+    if records is not None:
+        job["records"] = records
+    return job
 
 
 def due_open_markets(now: datetime, env: dict[str, str]) -> list[tuple[str, MarketSchedule, datetime]]:
@@ -485,6 +576,29 @@ def research_summary_message(records: list[dict[str, Any]], market_key: str, slo
     return "\n".join(lines)
 
 
+def primary_skip_message(market_key: str, slot: ResearchSlot, reason: str, attempts: list[str]) -> str:
+    flag = "🇰🇷" if market_key == "KOREA" else "🇺🇸"
+    return "\n".join(
+        [
+            "[RESEARCH LAB]",
+            "",
+            f"{flag} {market_key} PRIMARY TEST",
+            "",
+            "Status:",
+            JOB_STATUS_SKIPPED_NO_FRESH_SNAPSHOT,
+            "",
+            "Reason:",
+            "Fresh Existing Scanner snapshot unavailable.",
+            "",
+            "Last Check:",
+            reason,
+            "",
+            "Retry:",
+            "\n".join(attempts),
+        ]
+    )
+
+
 def send_telegram(token: str, chat_id: str, text: str, timeout: int) -> tuple[bool, str]:
     if not token:
         return False, "TOKEN_MISSING"
@@ -536,20 +650,100 @@ def run_snapshot_slot(
     trading, trading_reason = is_trading_day(schedule, local_now.date(), env)
     if not trading:
         return {"status": "SKIPPED", "market": market_key, "slot": slot.key, "reason": trading_reason}
-    market_df, validation, snapshot_time = validate_snapshot(config, schedule, now, env)
-    if market_df is None:
-        append_log({"event": "slot_skipped", "market": market_key, "slot": slot.key, "reason": validation})
-        if not dry_run:
-            notify_failure(env, config, market_key, slot.phase, validation)
-        return {"status": "SKIPPED", "market": market_key, "slot": slot.key, "reason": validation}
-
-    reference_timestamp = snapshot_time or utc_now_iso()
     trading_date = local_now.date().isoformat()
-    job_id = f"{market_key}_{slot.key}_{trading_date}"
+    job_id = snapshot_job_id(market_key, slot, trading_date)
     state = read_state()
     completed_jobs = state.setdefault("completed_jobs", {})
-    if job_id in completed_jobs:
-        return {"status": "SKIPPED", "market": market_key, "slot": slot.key, "reason": "DUPLICATE", "job_id": job_id}
+    existing_job = completed_jobs.get(job_id)
+    existing_status = job_status(existing_job)
+    if terminal_snapshot_status(existing_status):
+        return {
+            "status": "SKIPPED",
+            "market": market_key,
+            "slot": slot.key,
+            "reason": "DUPLICATE",
+            "job_id": job_id,
+            "job_status": existing_status,
+        }
+    if existing_status == JOB_STATUS_RUNNING:
+        if stale_running_job(existing_job, now):
+            existing_job["status"] = JOB_STATUS_PENDING
+            existing_job["reason"] = "STALE_RUNNING_RECOVERED"
+            existing_job["updated_at"] = utc_now_iso()
+            write_state(state)
+        else:
+            return {
+                "status": "SKIPPED",
+                "market": market_key,
+                "slot": slot.key,
+                "reason": "ALREADY_RUNNING",
+                "job_id": job_id,
+            }
+
+    market_df, validation, snapshot_time = validate_snapshot(config, schedule, now, env)
+    if market_df is None:
+        is_primary = slot.key == "PRIMARY"
+        final_retry = is_primary and local_now >= primary_retry_deadline(local_now, slot)
+        status_value = JOB_STATUS_SKIPPED_NO_FRESH_SNAPSHOT if final_retry else JOB_STATUS_PENDING
+        append_log(
+            {
+                "event": "slot_snapshot_unavailable",
+                "market": market_key,
+                "slot": slot.key,
+                "reason": validation,
+                "status": status_value,
+                "dry_run": dry_run,
+            }
+        )
+        if not dry_run:
+            update_snapshot_job(
+                state,
+                job_id,
+                market_key=market_key,
+                slot=slot,
+                trading_date=trading_date,
+                status_value=status_value,
+                reason=validation,
+                local_now=local_now,
+            )
+            write_state(state)
+            if final_retry:
+                token = config.telegram_bot_token or env.get("BACKTEST_BOT_TOKEN", "").strip()
+                chat_id = config.allowed_chat_id or env.get("BACKTEST_CHAT_ID", "8749935590").strip()
+                send_telegram(token, chat_id, primary_skip_message(market_key, slot, validation, retry_times(slot)), config.request_timeout)
+            elif not is_primary:
+                notify_failure(env, config, market_key, slot.phase, f"MONITORING_SKIPPED_STALE_DATA: {validation}")
+        if is_primary:
+            return {
+                "status": status_value,
+                "market": market_key,
+                "slot": slot.key,
+                "reason": validation,
+                "job_id": job_id,
+                "retry_until": primary_retry_deadline(local_now, slot).isoformat(timespec="minutes"),
+            }
+        return {
+            "status": "MONITORING_SKIPPED_STALE_DATA" if slot.phase == "INTRADAY_MONITORING" else "SKIPPED",
+            "market": market_key,
+            "slot": slot.key,
+            "reason": validation,
+            "job_id": job_id,
+        }
+
+    reference_timestamp = snapshot_time or utc_now_iso()
+    if not dry_run:
+        update_snapshot_job(
+            state,
+            job_id,
+            market_key=market_key,
+            slot=slot,
+            trading_date=trading_date,
+            status_value=JOB_STATUS_RUNNING,
+            reason="FRESH_SNAPSHOT_FOUND",
+            reference_timestamp=reference_timestamp,
+            local_now=local_now,
+        )
+        write_state(state)
 
     engine = ResearchEngine(config)
     lab = ComparisonLab(config)
@@ -594,20 +788,27 @@ def run_snapshot_slot(
             research_summary_message(records, market_key, slot),
             config.request_timeout,
         )
-        completed_jobs[job_id] = {
-            "market": market_key,
-            "slot": slot.key,
-            "phase": slot.phase,
-            "snapshot_type": slot.snapshot_type,
-            "trading_date": trading_date,
-            "reference_timestamp": reference_timestamp,
-            "records": len(records),
-            "existing_telegram_status": existing_status,
-            "research_telegram_status": research_status,
-            "existing_telegram_sent": int(existing_ok),
-            "research_telegram_sent": int(research_ok),
-            "completed_at": utc_now_iso(),
-        }
+        job = update_snapshot_job(
+            state,
+            job_id,
+            market_key=market_key,
+            slot=slot,
+            trading_date=trading_date,
+            status_value=JOB_STATUS_COMPLETED,
+            reason="COMPLETED",
+            reference_timestamp=reference_timestamp,
+            records=len(records),
+            local_now=local_now,
+        )
+        job.update(
+            {
+                "existing_telegram_status": existing_status,
+                "research_telegram_status": research_status,
+                "existing_telegram_sent": int(existing_ok),
+                "research_telegram_sent": int(research_ok),
+                "completed_at": utc_now_iso(),
+            }
+        )
         write_state(state)
     append_log(
         {
@@ -688,6 +889,11 @@ def status(now: datetime | None = None) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     env = load_env_files()
     state = read_state()
+    completed_jobs = state.get("completed_jobs", {})
+    snapshot_status_counts: dict[str, int] = {}
+    for job in completed_jobs.values():
+        value = job_status(job) or "UNKNOWN"
+        snapshot_status_counts[value] = snapshot_status_counts.get(value, 0) + 1
     markets = {}
     for market_key, schedule in MARKETS.items():
         local_now = now.astimezone(ZoneInfo(schedule.timezone))
@@ -725,7 +931,8 @@ def status(now: datetime | None = None) -> dict[str, Any]:
     return {
         "now_utc": now.isoformat(timespec="seconds"),
         "state_file": str(STATE_FILE),
-        "completed_jobs": len(state.get("completed_jobs", {})),
+        "completed_jobs": len(completed_jobs),
+        "snapshot_status_counts": snapshot_status_counts,
         "daily_jobs": len(state.get("daily_jobs", {})),
         "markets": markets,
     }
