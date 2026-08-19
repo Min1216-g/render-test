@@ -48,6 +48,10 @@ python3 -m research_lab.telegram_bot
 - `/research history`
 - `/research stats`
 - `/research detail TICKER`
+- `/comparison start 40`
+- `/comparison sample 6`
+- `/comparison update`
+- `/comparison report`
 
 허용 Chat ID는 기본값 `8749935590`이며, 다른 Chat ID 요청은 `ACCESS_DENIED`로 처리합니다.
 
@@ -56,3 +60,35 @@ python3 -m research_lab.telegram_bot
 Research 결과는 `research_lab/data/research_history.jsonl`에 저장됩니다. 분석 당시 가격을 `entry_reference`로 저장하고, `/research stats` 또는 `paper-update` 실행 시 1D/3D/5D/10D 경과 여부를 확인해 이후 수익률만 기록합니다.
 
 분석 당시 이후에 생긴 데이터를 과거 판단에 섞지 않도록, 과거 Research 점수와 판단은 재계산하지 않습니다.
+
+## Existing AI vs Research AI 비교 테스트
+
+이 비교 시스템은 기존 scanner 결과 CSV를 같은 시점의 snapshot으로 읽고, 동일한 `reference_timestamp`와 `reference_price`를 기준으로 기존 AI와 Research AI의 판단을 저장합니다.
+
+```bash
+python3 -m research_lab.cli comparison sample --limit 6
+python3 -m research_lab.cli comparison start --limit 40
+python3 -m research_lab.cli comparison update
+python3 -m research_lab.cli comparison report
+```
+
+저장 위치:
+
+```text
+research_lab/data/comparison_history.jsonl
+```
+
+비교 항목:
+
+- 방향성: UP / DOWN / SIDEWAYS
+- 예상 강도: 약한 상승 / 보통 상승 / 강한 상승 / 하락/관망
+- 위험 판단: LOW / MEDIUM / HIGH
+- 1H / 장마감 / 1D / 3D / 5D 수익률
+- 급등주, 급락주, 거래량 급증, 뉴스 발생 종목, 이미 많이 오른 종목
+
+중요 원칙:
+
+- 기존 `market_scanner.py`, 모바일 앱, 기존 SCORE 계산식은 수정하지 않습니다.
+- Research는 기존 CSV를 읽기 전용으로만 사용합니다.
+- 이후 평가를 업데이트할 때도 과거 Research 판단은 재계산하지 않습니다.
+- 처음에는 최대 40개 정도의 다양한 표본으로 시작하고, 최소 100개 이상의 샘플이 쌓인 뒤 성능을 판단합니다.

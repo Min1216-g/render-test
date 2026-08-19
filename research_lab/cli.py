@@ -3,8 +3,20 @@ from __future__ import annotations
 import argparse
 
 from .config import load_config
+from .comparison import ComparisonLab, dump_json
 from .engine import ResearchEngine
-from .messages import compare_result, compact_result, detail_result, history_message, hot_results, stats_message
+from .messages import (
+    compare_result,
+    compact_result,
+    comparison_report_message,
+    comparison_started_message,
+    detail_result,
+    existing_scanner_message,
+    history_message,
+    hot_results,
+    research_lab_message,
+    stats_message,
+)
 
 
 def main() -> None:
@@ -23,6 +35,10 @@ def main() -> None:
     history.add_argument("--limit", type=int, default=10)
     sub.add_parser("stats")
     sub.add_parser("paper-update")
+    comparison = sub.add_parser("comparison")
+    comparison.add_argument("action", choices=["start", "update", "report", "history", "sample"])
+    comparison.add_argument("--limit", type=int, default=40)
+    comparison.add_argument("--json", action="store_true")
     args = parser.parse_args()
 
     engine = ResearchEngine(load_config())
@@ -42,8 +58,30 @@ def main() -> None:
         print(f"\nPaper returns updated: {changed}")
     elif args.command == "paper-update":
         print(f"updated={engine.update_paper_returns()}")
+    elif args.command == "comparison":
+        lab = ComparisonLab(load_config())
+        if args.action == "start":
+            records = [record.to_dict() for record in lab.start(args.limit)]
+            print(dump_json(records) if args.json else comparison_started_message(records))
+        elif args.action == "update":
+            print(f"updated={lab.update_returns()}")
+        elif args.action == "report":
+            report = lab.report()
+            print(dump_json(report) if args.json else comparison_report_message(report))
+        elif args.action == "history":
+            records = lab.history(args.limit)
+            print(dump_json(records) if args.json else comparison_started_message(records))
+        elif args.action == "sample":
+            records = [record.to_dict() for record in lab.start(args.limit, save=False)]
+            if args.json:
+                print(dump_json(records))
+            else:
+                for record in records[:3]:
+                    print(existing_scanner_message(record))
+                    print()
+                    print(research_lab_message(record))
+                    print()
 
 
 if __name__ == "__main__":
     main()
-

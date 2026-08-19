@@ -142,3 +142,102 @@ def stats_message(stats: dict) -> str:
         ]
     )
 
+
+def existing_scanner_message(record: dict) -> str:
+    return "\n".join(
+        [
+            "[EXISTING SCANNER]",
+            "",
+            str(record.get("ticker")),
+            f"Score: {record.get('existing_ai_score')}",
+            f"Decision: {record.get('existing_ai_decision')}",
+            f"Price: {record.get('reference_price')}",
+            f"Direction: {record.get('existing_direction')}",
+            f"Strength: {record.get('existing_strength')}",
+            f"Risk: {record.get('existing_risk')}",
+            f"Reason: {record.get('existing_reason')}",
+            f"Reference: {record.get('reference_data_timestamp')}",
+        ]
+    )
+
+
+def research_lab_message(record: dict) -> str:
+    bull = record.get("bull_case") or {}
+    reasons = bull.get("reasons") or []
+    return "\n".join(
+        [
+            "[RESEARCH LAB]",
+            "",
+            str(record.get("ticker")),
+            f"Research Score: {record.get('research_score')}",
+            f"Decision: {record.get('research_decision')}",
+            f"Continuation Potential: {record.get('continuation_potential')}",
+            f"Risk: {record.get('research_risk')}",
+            f"Bull: {bull.get('score')}",
+            f"Bear: {(record.get('bear_case') or {}).get('score')}",
+            f"Reason: {reasons[0] if reasons else 'DATA_UNAVAILABLE'}",
+            f"Reference: {record.get('reference_data_timestamp')}",
+        ]
+    )
+
+
+def comparison_started_message(records: list[dict]) -> str:
+    if not records:
+        return "DAILY AI COMPARISON\n\nDATA_UNAVAILABLE"
+    lines = [
+        "DAILY AI COMPARISON STARTED",
+        "",
+        f"Tested: {len(records)} stocks",
+        f"Reference timestamp: {records[0].get('reference_timestamp')}",
+        f"Reference data: {records[0].get('reference_data_timestamp')}",
+        "",
+    ]
+    for record in records[:12]:
+        lines.append(
+            f"{record.get('ticker')} · Existing {record.get('existing_ai_score')}/{record.get('existing_ai_decision')} vs Research {record.get('research_score')}/{record.get('research_decision')}"
+        )
+    if len(records) > 12:
+        lines.append(f"... +{len(records) - 12} more")
+    return "\n".join(lines)
+
+
+def comparison_report_message(report: dict) -> str:
+    if report.get("status") != "OK":
+        return "\n".join(
+            [
+                "DAILY AI COMPARISON",
+                "",
+                "DATA_UNAVAILABLE",
+                f"Total samples: {report.get('total_samples', 0)}",
+                f"Completed 5D: {report.get('completed_5d', 0)}",
+                str(report.get("message", "")),
+            ]
+        )
+    metrics = report.get("metrics") or {}
+    lines = [
+        "DAILY AI COMPARISON",
+        "",
+        f"Tested: {report.get('total_samples')}",
+        f"Evaluated: {report.get('evaluated_samples')}",
+        f"Completed 5D: {report.get('completed_5d')}",
+        "",
+    ]
+    for window in ("1H", "CLOSE", "1D", "3D", "5D"):
+        item = metrics.get(window)
+        if not item:
+            continue
+        lines.extend(
+            [
+                f"{window} Result",
+                f"Existing Accuracy: {item.get('existing_accuracy')}%",
+                f"Research Accuracy: {item.get('research_accuracy')}%",
+                f"Average Return: {item.get('average_return')}%",
+                "",
+            ]
+        )
+    lines.append("Top Differences:")
+    for item in (report.get("top_differences") or [])[:5]:
+        lines.append(
+            f"- {item.get('ticker')}: Existing {item.get('existing_score')} vs Research {item.get('research_score')}"
+        )
+    return "\n".join(lines)

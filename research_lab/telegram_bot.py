@@ -7,8 +7,20 @@ from typing import Any
 import requests
 
 from .config import load_config
+from .comparison import ComparisonLab
 from .engine import ResearchEngine
-from .messages import compare_result, compact_result, detail_result, history_message, hot_results, stats_message
+from .messages import (
+    compare_result,
+    compact_result,
+    comparison_report_message,
+    comparison_started_message,
+    detail_result,
+    existing_scanner_message,
+    history_message,
+    hot_results,
+    research_lab_message,
+    stats_message,
+)
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -22,6 +34,7 @@ class TelegramResearchBot:
         if not self.config.telegram_ready:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
         self.engine = ResearchEngine(self.config)
+        self.comparison = ComparisonLab(self.config)
         self.session = requests.Session()
         self.base_url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}"
 
@@ -71,6 +84,25 @@ class TelegramResearchBot:
                 return help_message()
             if command == "/hot":
                 return hot_results(self.engine.hot())
+            if command == "/comparison" and len(parts) > 1:
+                action = parts[1].lower()
+                if action == "start":
+                    limit = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 40
+                    return comparison_started_message([record.to_dict() for record in self.comparison.start(limit)])
+                if action == "update":
+                    return f"COMPARISON RETURNS UPDATED: {self.comparison.update_returns()}"
+                if action == "report":
+                    return comparison_report_message(self.comparison.report())
+                if action == "sample":
+                    limit = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 6
+                    records = [record.to_dict() for record in self.comparison.start(limit, save=False)]
+                    lines: list[str] = []
+                    for record in records[:3]:
+                        lines.append(existing_scanner_message(record))
+                        lines.append("")
+                        lines.append(research_lab_message(record))
+                        lines.append("")
+                    return "\n".join(lines).strip()
             if command == "/compare" and ticker:
                 return compare_result(self.engine.research(ticker))
             if command == "/research" and ticker == "HISTORY":
@@ -119,6 +151,10 @@ def help_message() -> str:
             "/research history",
             "/research stats",
             "/research detail NVDA",
+            "/comparison start 40",
+            "/comparison sample 6",
+            "/comparison update",
+            "/comparison report",
         ]
     )
 
@@ -129,4 +165,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
