@@ -487,92 +487,148 @@ def _short(value: Any, limit: int = 170) -> str:
     return text if len(text) <= limit else text[: limit - 1] + "…"
 
 
+def market_flag(market_key: str) -> str:
+    return "🇰🇷" if market_key == "KOREA" else "🇺🇸" if market_key == "US" else "🌎"
+
+
+def format_reference_price(value: Any, market_key: str) -> str:
+    price = _num(value)
+    if price is None:
+        return "DATA_UNAVAILABLE"
+    if market_key == "KOREA":
+        return f"₩{price:,.0f}"
+    return f"${price:,.2f}"
+
+
+def format_reference_time(value: Any, market_key: str) -> str:
+    parsed = parse_snapshot_time(value)
+    if parsed is None:
+        return str(value or "DATA_UNAVAILABLE")
+    tz_name = MARKETS.get(market_key, MARKETS["US"]).timezone
+    suffix = "KST" if market_key == "KOREA" else "ET" if market_key == "US" else parsed.astimezone().tzname()
+    return f"{parsed.astimezone(ZoneInfo(tz_name)).strftime('%H:%M')} {suffix}"
+
+
+def compact_decision_pair(record: dict[str, Any]) -> tuple[str, str]:
+    existing = str(record.get("existing_ai_decision") or "N/A").upper()
+    research = str(record.get("research_decision") or "N/A").upper()
+    return existing, research
+
+
+def is_conflict(record: dict[str, Any]) -> bool:
+    existing, research = compact_decision_pair(record)
+    return existing != research
+
+
+def compact_comparison_line(record: dict[str, Any]) -> str:
+    existing, research = compact_decision_pair(record)
+    return (
+        f"{record.get('ticker')} · Existing: {existing} · {record.get('existing_ai_score')} / "
+        f"Research: {research} · {record.get('research_score')}"
+    )
+
+
 def existing_message(record: dict[str, Any], market_key: str) -> str:
+    existing, research = compact_decision_pair(record)
     return "\n".join(
         [
-            "[EXISTING SCANNER AUTO]",
+            "⚔️ AI CONFLICT" if existing != research else "📊 AI COMPARISON",
             "",
-            f"Market: {market_key}",
-            f"Ticker: {record.get('ticker')}",
-            f"Name: {record.get('name')}",
-            f"Price: {record.get('reference_price')}",
-            f"Existing AI Score: {record.get('existing_ai_score')}",
-            f"Decision: {record.get('existing_ai_decision')}",
+            f"{market_flag(market_key)} {record.get('ticker')}",
+            str(record.get("name") or ""),
+            "",
+            "Reference:",
+            format_reference_price(record.get("reference_price"), market_key),
+            format_reference_time(record.get("reference_timestamp"), market_key),
+            "",
+            "EXISTING",
+            f"{existing} · {record.get('existing_ai_score')}",
             f"Risk: {record.get('existing_risk')}",
-            f"Reference Timestamp: {record.get('reference_timestamp')}",
-            f"Reference Data: {record.get('reference_data_timestamp')}",
-            f"Reason: {_short(record.get('existing_reason'))}",
+            "",
+            "RESEARCH",
+            f"{research} · {record.get('research_score')}",
+            f"Risk: {record.get('research_risk')}",
+            "",
+            "Decision:",
+            "DIFFERENT" if existing != research else "SAME",
+            "",
+            "Result:",
+            "PENDING",
         ]
     )
 
 
 def research_message(record: dict[str, Any], market_key: str) -> str:
-    bull = record.get("bull_case") or {}
-    bear = record.get("bear_case") or {}
-    return "\n".join(
-        [
-            "[RESEARCH LAB AUTO]",
-            "",
-            f"Market: {market_key}",
-            f"Ticker: {record.get('ticker')}",
-            f"Name: {record.get('name')}",
-            f"Reference Price: {record.get('reference_price')}",
-            f"Reference Timestamp: {record.get('reference_timestamp')}",
-            f"Research Score: {record.get('research_score')}",
-            f"Decision: {record.get('research_decision')}",
-            f"Risk: {record.get('research_risk')}",
-            f"Continuation Potential: {record.get('continuation_potential')}",
-            f"Bull Case: {_short((bull.get('reasons') or ['DATA_UNAVAILABLE'])[0])}",
-            f"Bear Case: {_short((bear.get('reasons') or ['DATA_UNAVAILABLE'])[0])}",
-        ]
-    )
+    return existing_message(record, market_key)
 
 
 def existing_summary_message(records: list[dict[str, Any]], market_key: str, slot: ResearchSlot) -> str:
+    if slot.phase == "INTRADAY_MONITORING":
+        return intraday_update_message(records, market_key, slot)
+    conflicts = [record for record in records if is_conflict(record)]
+    same_count = len(records) - len(conflicts)
+    ref_time = format_reference_time(records[0].get("reference_timestamp"), market_key) if records else "DATA_UNAVAILABLE"
     lines = [
-        "[EXISTING SCANNER]" if slot.official_evaluation else "[INTRADAY MONITOR]",
+        "📊 PRIMARY TEST" if slot.snapshot_type == "PRIMARY_TEST" else "📊 AI SNAPSHOT",
         "",
-        f"Market: {market_key}",
-        f"Phase: {slot.phase}",
-        f"Slot: {slot.key}",
-        f"Tracked: {len(records)}",
-        f"Reference Timestamp: {records[0].get('reference_timestamp') if records else 'DATA_UNAVAILABLE'}",
+        f"{market_flag(market_key)} {market_key}",
+        ref_time,
         "",
+        "Tested:",
+        str(len(records)),
+        "",
+        "Same Decision:",
+        str(same_count),
+        "",
+        "Conflict:",
+        str(len(conflicts)),
+        "",
+        "Status:",
+        "COMPLETED" if slot.official_evaluation else "PENDING",
     ]
-    for record in records[:10]:
-        lines.append(
-            f"- {record.get('ticker')} · {record.get('existing_ai_decision')} · "
-            f"score {record.get('existing_ai_score')} · risk {record.get('existing_risk')} · "
-            f"price {record.get('reference_price')}"
-        )
-    if len(records) > 10:
-        lines.append(f"... +{len(records) - 10} more")
+    if conflicts:
+        lines.extend(["", "━━━━━━━━━━━━━━", "", "⚔️ CONFLICT CASES", ""])
+        for record in conflicts[:12]:
+            lines.append(compact_comparison_line(record))
+        if len(conflicts) > 12:
+            lines.append(f"... +{len(conflicts) - 12} more")
     return "\n".join(lines)
 
 
 def research_summary_message(records: list[dict[str, Any]], market_key: str, slot: ResearchSlot) -> str:
+    return existing_summary_message(records, market_key, slot)
+
+
+def intraday_update_message(records: list[dict[str, Any]], market_key: str, slot: ResearchSlot) -> str:
+    conflicts = [record for record in records if is_conflict(record)]
+    major_moves = []
+    for record in records:
+        change_pct = _num(record.get("close_return")) or _num(record.get("change_pct")) or _num(record.get("reference_change_pct"))
+        if change_pct is not None and abs(change_pct) >= 2:
+            major_moves.append((record, change_pct))
+    if not conflicts and not major_moves:
+        return ""
+    ref_time = format_reference_time(records[0].get("reference_timestamp"), market_key) if records else slot.local_time.strftime("%H:%M")
     lines = [
-        "[RESEARCH LAB]" if slot.official_evaluation else "[INTRADAY MONITOR]",
+        "📈 INTRADAY UPDATE",
         "",
-        f"Market: {market_key}",
-        f"Phase: {slot.phase}",
-        f"Slot: {slot.key}",
-        f"Tracked: {len(records)}",
-        f"Reference Timestamp: {records[0].get('reference_timestamp') if records else 'DATA_UNAVAILABLE'}",
+        f"{market_flag(market_key)} {market_key}",
+        ref_time,
         "",
+        "Tracked:",
+        str(len(records)),
+        "",
+        "Signal Changes:",
+        str(len(conflicts)),
+        "",
+        "Major Moves:",
     ]
-    changes = 0
-    for record in records[:10]:
-        if record.get("existing_ai_decision") != record.get("research_decision"):
-            changes += 1
-        lines.append(
-            f"- {record.get('ticker')} · Research {record.get('research_decision')} "
-            f"score {record.get('research_score')} · Existing {record.get('existing_ai_decision')} · "
-            f"risk {record.get('research_risk')}"
-        )
-    if len(records) > 10:
-        lines.append(f"... +{len(records) - 10} more")
-    lines.append(f"Decision Differences: {changes}")
+    if major_moves:
+        for record, change_pct in major_moves[:8]:
+            lines.append(f"{record.get('ticker')} {change_pct:+.1f}%")
+    else:
+        lines.append("None")
+    lines.extend(["", "Research Changes:", str(len(conflicts)), "", "Existing Changes:", str(len(conflicts))])
     return "\n".join(lines)
 
 
@@ -776,18 +832,16 @@ def run_snapshot_slot(
         market_chat = env.get("MARKET_SCANNER_CHAT_ID", "8749935590").strip() or "8749935590"
         research_token = config.telegram_bot_token
         research_chat = config.allowed_chat_id
-        existing_ok, existing_status = send_telegram(
-            market_token,
-            market_chat,
-            existing_summary_message(records, market_key, slot),
-            config.request_timeout,
-        )
-        research_ok, research_status = send_telegram(
-            research_token,
-            research_chat,
-            research_summary_message(records, market_key, slot),
-            config.request_timeout,
-        )
+        existing_text = existing_summary_message(records, market_key, slot)
+        research_text = research_summary_message(records, market_key, slot)
+        if existing_text:
+            existing_ok, existing_status = send_telegram(market_token, market_chat, existing_text, config.request_timeout)
+        else:
+            existing_ok, existing_status = False, "NO_MEANINGFUL_INTRADAY_CHANGE"
+        if research_text:
+            research_ok, research_status = send_telegram(research_token, research_chat, research_text, config.request_timeout)
+        else:
+            research_ok, research_status = False, "NO_MEANINGFUL_INTRADAY_CHANGE"
         job = update_snapshot_job(
             state,
             job_id,

@@ -629,48 +629,42 @@ def daily_result_message(result: dict[str, Any]) -> str:
     cfg = MARKET_CONFIG.get(str(result.get("market")), {"emoji": "🌎", "title": "GLOBAL"})
     winner = result.get("daily_winner")
     diff = result.get("score_difference")
+    existing_return = result.get("existing_average_return")
+    research_return = result.get("research_average_return")
     lines = [
         "📊 DAILY AI COMPARISON",
         "",
-        f"{cfg['emoji']} {cfg['title']} MARKET",
+        f"{cfg['emoji']} {cfg['title']}",
         str(result.get("date")),
         "",
-        "━━━━━━━━━━━━━━",
+        "Tested:",
+        str(result.get("total_tested")),
         "",
-        f"Tested: {result.get('total_tested')} stocks",
-        "",
-        "Existing AI",
+        "EXISTING AI",
         f"Accuracy: {result.get('existing_accuracy')}%",
-        f"Avg Return: {result.get('existing_average_return')}%",
-        f"Daily Score: {result.get('existing_daily_score')}",
+        f"Avg Return: {existing_return:+.1f}" if isinstance(existing_return, (int, float)) else f"Avg Return: {existing_return}",
+        f"Score: {result.get('existing_daily_score')}",
         "",
-        "Research AI",
+        "RESEARCH AI",
         f"Accuracy: {result.get('research_accuracy')}%",
-        f"Avg Return: {result.get('research_average_return')}%",
-        f"Daily Score: {result.get('research_daily_score')}",
+        f"Avg Return: {research_return:+.1f}" if isinstance(research_return, (int, float)) else f"Avg Return: {research_return}",
+        f"Score: {result.get('research_daily_score')}",
         "",
         "━━━━━━━━━━━━━━",
         "",
         "🏆 WINNER",
-        "",
         str(winner).upper(),
-        "",
-        f"Difference: {diff:+.1f} points" if isinstance(diff, (int, float)) else "Difference: N/A",
-        "",
-        "━━━━━━━━━━━━━━",
         "",
         f"Both Correct: {result.get('both_correct')}",
         f"Existing Only: {result.get('existing_only')}",
         f"Research Only: {result.get('research_only')}",
         f"Both Wrong: {result.get('both_wrong')}",
+        "",
+        "━━━━━━━━━━━━━━",
+        "",
+        "Result:",
+        f"{winner} {diff:+.1f}" if isinstance(diff, (int, float)) else f"{winner} N/A",
     ]
-    best = result.get("best_research_call")
-    worst = result.get("worst_research_call")
-    if best:
-        lines.extend(["", "🔥 BEST RESEARCH CALL", "", f"{best.get('ticker')} · {best.get('close_return')}%"])
-    if worst:
-        lines.extend(["", "⚠️ WORST RESEARCH CALL", "", f"{worst.get('ticker')} · {worst.get('close_return')}%"])
-    lines.extend(["", "━━━━━━━━━━━━━━", "", f"{winner} performed better today." if winner not in {"Tie", "DATA_UNAVAILABLE"} else "No clear winner today."])
     return "\n".join(lines)
 
 

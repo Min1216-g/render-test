@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from datetime import datetime
+from zoneinfo import ZoneInfo
+
 from .models import ResearchResult
 
 
@@ -7,6 +10,88 @@ def _money(value: float | None) -> str:
     if value is None:
         return "DATA_UNAVAILABLE"
     return f"{value:,.2f}"
+
+
+def _market_flag(market: str | None) -> str:
+    text = str(market or "")
+    if text in {"국장", "한국", "KOREA"}:
+        return "🇰🇷"
+    if text in {"미장", "US", "USA", "미국"}:
+        return "🇺🇸"
+    return "🌎"
+
+
+def _market_key(market: str | None) -> str:
+    text = str(market or "")
+    if text in {"국장", "한국", "KOREA"}:
+        return "KOREA"
+    if text in {"미장", "US", "USA", "미국"}:
+        return "US"
+    return text or "MARKET"
+
+
+def _format_price(value: object, market: str | None) -> str:
+    try:
+        price = float(value)
+    except (TypeError, ValueError):
+        return "DATA_UNAVAILABLE"
+    if _market_key(market) == "KOREA":
+        return f"₩{price:,.0f}"
+    return f"${price:,.2f}"
+
+
+def _format_time(value: object, market: str | None) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return "DATA_UNAVAILABLE"
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        if _market_key(market) == "KOREA":
+            return parsed.astimezone(ZoneInfo("Asia/Seoul")).strftime("%H:%M KST")
+        if _market_key(market) == "US":
+            return parsed.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M ET")
+    except ValueError:
+        pass
+    return text
+
+
+def _decision_pair(record: dict) -> tuple[str, str]:
+    return str(record.get("existing_ai_decision") or "N/A").upper(), str(record.get("research_decision") or "N/A").upper()
+
+
+def compact_ai_comparison_message(record: dict) -> str:
+    market = str(record.get("market") or "")
+    existing, research = _decision_pair(record)
+    different = existing != research
+    title = "⚔️ AI CONFLICT" if different else "📊 AI COMPARISON"
+    return "\n".join(
+        [
+            title,
+            "",
+            f"{_market_flag(market)} {record.get('ticker')}",
+            str(record.get("name") or ""),
+            "",
+            "Reference:",
+            _format_price(record.get("reference_price"), market),
+            _format_time(record.get("reference_timestamp"), market),
+            "",
+            "EXISTING",
+            f"{existing} · {record.get('existing_ai_score')}",
+            f"Risk: {record.get('existing_risk')}",
+            "",
+            "RESEARCH",
+            f"{research} · {record.get('research_score')}",
+            f"Risk: {record.get('research_risk')}",
+            "",
+            "Decision:",
+            "DIFFERENT" if different else "SAME",
+            "",
+            "Result:",
+            "PENDING",
+        ]
+    )
 
 
 def compact_result(result: ResearchResult) -> str:
@@ -144,60 +229,47 @@ def stats_message(stats: dict) -> str:
 
 
 def existing_scanner_message(record: dict) -> str:
-    return "\n".join(
-        [
-            "[EXISTING SCANNER]",
-            "",
-            str(record.get("ticker")),
-            f"Score: {record.get('existing_ai_score')}",
-            f"Decision: {record.get('existing_ai_decision')}",
-            f"Price: {record.get('reference_price')}",
-            f"Direction: {record.get('existing_direction')}",
-            f"Strength: {record.get('existing_strength')}",
-            f"Risk: {record.get('existing_risk')}",
-            f"Reason: {record.get('existing_reason')}",
-            f"Reference: {record.get('reference_data_timestamp')}",
-        ]
-    )
+    return compact_ai_comparison_message(record)
 
 
 def research_lab_message(record: dict) -> str:
-    bull = record.get("bull_case") or {}
-    reasons = bull.get("reasons") or []
-    return "\n".join(
-        [
-            "[RESEARCH LAB]",
-            "",
-            str(record.get("ticker")),
-            f"Research Score: {record.get('research_score')}",
-            f"Decision: {record.get('research_decision')}",
-            f"Continuation Potential: {record.get('continuation_potential')}",
-            f"Risk: {record.get('research_risk')}",
-            f"Bull: {bull.get('score')}",
-            f"Bear: {(record.get('bear_case') or {}).get('score')}",
-            f"Reason: {reasons[0] if reasons else 'DATA_UNAVAILABLE'}",
-            f"Reference: {record.get('reference_data_timestamp')}",
-        ]
-    )
+    return compact_ai_comparison_message(record)
 
 
 def comparison_started_message(records: list[dict]) -> str:
     if not records:
         return "DAILY AI COMPARISON\n\nDATA_UNAVAILABLE"
+    conflicts = [record for record in records if _decision_pair(record)[0] != _decision_pair(record)[1]]
+    same_count = len(records) - len(conflicts)
+    market = _market_key(records[0].get("market"))
     lines = [
-        "DAILY AI COMPARISON STARTED",
+        "📊 PRIMARY TEST SUMMARY",
         "",
-        f"Tested: {len(records)} stocks",
-        f"Reference timestamp: {records[0].get('reference_timestamp')}",
-        f"Reference data: {records[0].get('reference_data_timestamp')}",
+        f"{_market_flag(records[0].get('market'))} {market}",
+        _format_time(records[0].get("reference_timestamp"), records[0].get("market")),
         "",
+        "Tested:",
+        str(len(records)),
+        "",
+        "Same Decision:",
+        str(same_count),
+        "",
+        "Conflict:",
+        str(len(conflicts)),
+        "",
+        "Status:",
+        "RUNNING",
     ]
-    for record in records[:12]:
-        lines.append(
-            f"{record.get('ticker')} · Existing {record.get('existing_ai_score')}/{record.get('existing_ai_decision')} vs Research {record.get('research_score')}/{record.get('research_decision')}"
-        )
-    if len(records) > 12:
-        lines.append(f"... +{len(records) - 12} more")
+    if conflicts:
+        lines.extend(["", "━━━━━━━━━━━━━━", "", "⚔️ CONFLICT CASES", ""])
+        for record in conflicts[:12]:
+            existing, research = _decision_pair(record)
+            lines.append(
+                f"{record.get('ticker')} · Existing: {existing} · {record.get('existing_ai_score')} / "
+                f"Research: {research} · {record.get('research_score')}"
+            )
+        if len(conflicts) > 12:
+            lines.append(f"... +{len(conflicts) - 12} more")
     return "\n".join(lines)
 
 
