@@ -84,11 +84,7 @@ def main() -> None:
             if args.json:
                 print(dump_json(records))
             else:
-                for record in records[:3]:
-                    print(existing_scanner_message(record))
-                    print()
-                    print(research_lab_message(record))
-                    print()
+                print(comparison_started_message(records))
     elif args.command == "daily":
         lab = DailyComparisonLab(load_config())
         if args.action == "due":

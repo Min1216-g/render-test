@@ -5,6 +5,12 @@ from zoneinfo import ZoneInfo
 
 from .models import ResearchResult
 
+MARKET_ORDER = (
+    ("KOREA", "🇰🇷 국내장", {"국장", "한국", "KOREA"}),
+    ("US", "🇺🇸 미국장", {"미장", "US", "USA", "미국"}),
+    ("CANADA", "🇨🇦 캐나다장", {"캐나다", "CANADA", "TSX", "TSXV"}),
+)
+
 
 def _money(value: float | None) -> str:
     if value is None:
@@ -46,10 +52,10 @@ def _format_price(value: object, market: str | None) -> str:
     return f"${price:,.2f}"
 
 
-def _format_time(value: object, market: str | None) -> str:
+def _parse_time(value: object) -> datetime | None:
     text = str(value or "").strip()
     if not text:
-        return "DATA_UNAVAILABLE"
+        return None
     timezone_suffixes = {
         "PDT": "-07:00",
         "PST": "-08:00",
@@ -64,13 +70,23 @@ def _format_time(value: object, market: str | None) -> str:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
+        return parsed
+    except ValueError:
+        return None
+
+
+def _format_time(value: object, market: str | None) -> str:
+    parsed = _parse_time(value)
+    if parsed is None:
+        return "데이터 없음"
+    try:
         if _market_key(market) == "KOREA":
             return parsed.astimezone(ZoneInfo("Asia/Seoul")).strftime("%H:%M KST")
         if _market_key(market) in {"US", "CANADA"}:
             return parsed.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M ET")
     except ValueError:
         pass
-    return text
+    return parsed.isoformat(timespec="minutes")
 
 
 def _decision_pair(record: dict) -> tuple[str, str]:
@@ -119,6 +135,122 @@ def _kr_news_status(record: dict) -> str:
         "NEWS_UNAVAILABLE": "뉴스 없음",
     }
     return mapping.get(status, status or "뉴스 상태 확인 필요")
+
+
+def _market_open(market_key: str, now: datetime | None = None) -> bool:
+    zones = {
+        "KOREA": ZoneInfo("Asia/Seoul"),
+        "US": ZoneInfo("America/New_York"),
+        "CANADA": ZoneInfo("America/New_York"),
+    }
+    local_now = (now or datetime.now(ZoneInfo("UTC"))).astimezone(zones.get(market_key, ZoneInfo("UTC")))
+    if local_now.weekday() >= 5:
+        return False
+    open_time = (9, 0) if market_key == "KOREA" else (9, 30)
+    close_time = (15, 30) if market_key == "KOREA" else (16, 0)
+    current = local_now.hour * 60 + local_now.minute
+    open_minutes = open_time[0] * 60 + open_time[1]
+    close_minutes = close_time[0] * 60 + close_time[1]
+    return open_minutes <= current < close_minutes
+
+
+def _market_records(records: list[dict], aliases: set[str]) -> list[dict]:
+    return [record for record in records if str(record.get("market") or "") in aliases]
+
+
+def _record_has_current_data(record: dict, market_key: str, now: datetime | None = None) -> bool:
+    quality = record.get("data_quality")
+    if isinstance(quality, dict):
+        if quality.get("status") != "VALID":
+            return False
+        timestamp = quality.get("reference_timestamp") or record.get("reference_data_timestamp") or record.get("reference_timestamp")
+    else:
+        if record.get("reference_price") is None or not record.get("reference_timestamp"):
+            return False
+        timestamp = record.get("reference_data_timestamp") or record.get("reference_timestamp")
+    parsed = _parse_time(timestamp)
+    if parsed is None:
+        return False
+    current = (now or datetime.now(ZoneInfo("UTC"))).astimezone(ZoneInfo("UTC"))
+    age_minutes = (current - parsed.astimezone(ZoneInfo("UTC"))).total_seconds() / 60
+    return 0 <= age_minutes <= 180
+
+
+def _display_name(record: dict | None) -> str:
+    if not record:
+        return "데이터 없음"
+    name = str(record.get("name") or "").strip()
+    ticker = str(record.get("ticker") or "").strip()
+    return name or ticker or "데이터 없음"
+
+
+def _scanner_pick(records: list[dict], market_key: str, now: datetime | None = None) -> dict | None:
+    bullish = {"BUY CANDIDATE", "WATCH"}
+    candidates = [
+        record
+        for record in records
+        if _record_has_current_data(record, market_key, now)
+        and str(record.get("existing_ai_decision") or "").upper() in bullish
+    ]
+    return max(candidates, key=lambda record: float(record.get("existing_ai_score") or 0), default=None)
+
+
+def _research_pick(records: list[dict], market_key: str, now: datetime | None = None) -> dict | None:
+    bullish = {"BUY CANDIDATE", "WATCH"}
+    candidates = [
+        record
+        for record in records
+        if _record_has_current_data(record, market_key, now)
+        and str(record.get("research_decision") or "").upper() in bullish
+    ]
+    return max(candidates, key=lambda record: float(record.get("research_score") or 0), default=None)
+
+
+def _market_line(label: str, records: list[dict], picker, *, now: datetime | None = None) -> str:
+    market_key = next((key for key, market_label, _ in MARKET_ORDER if market_label == label), "")
+    if market_key and not _market_open(market_key, now):
+        return f"{label}: 장 마감"
+    if not records:
+        return f"{label}: 데이터 없음"
+    if not any(_record_has_current_data(record, market_key, now) for record in records):
+        return f"{label}: 데이터 없음"
+    picked = picker(records, market_key, now)
+    if not picked:
+        return f"{label}: 강세 후보 없음"
+    return f"{label}: {_display_name(picked)}"
+
+
+def scanner_prediction_message(records: list[dict], *, now: datetime | None = None) -> str:
+    lines = [
+        "[scanner.py]",
+        "현재 기준 강세로 예측되는 종목",
+        "",
+    ]
+    grouped = [(key, label, _market_records(records, aliases)) for key, label, aliases in MARKET_ORDER]
+    for _, label, market_records in grouped:
+        lines.append(_market_line(label, market_records, _scanner_pick, now=now))
+    return "\n".join(lines)
+
+
+def research_prediction_message(records: list[dict], *, now: datetime | None = None) -> str:
+    lines = [
+        "[research]",
+        "현재 기준 강세로 예측되는 종목",
+        "",
+    ]
+    grouped = [(key, label, _market_records(records, aliases)) for key, label, aliases in MARKET_ORDER]
+    for _, label, market_records in grouped:
+        lines.append(_market_line(label, market_records, _research_pick, now=now))
+    return "\n".join(lines)
+
+
+def prediction_summary_message(records: list[dict], *, now: datetime | None = None) -> str:
+    return "\n\n".join(
+        [
+            scanner_prediction_message(records, now=now),
+            research_prediction_message(records, now=now),
+        ]
+    )
 
 
 def compact_ai_comparison_message(record: dict) -> str:
@@ -289,48 +421,17 @@ def stats_message(stats: dict) -> str:
 
 
 def existing_scanner_message(record: dict) -> str:
-    return compact_ai_comparison_message(record)
+    return scanner_prediction_message([record])
 
 
 def research_lab_message(record: dict) -> str:
-    return compact_ai_comparison_message(record)
+    return research_prediction_message([record])
 
 
 def comparison_started_message(records: list[dict]) -> str:
     if not records:
-        return "일일 AI 비교\n\nDATA_UNAVAILABLE"
-    conflicts = [record for record in records if _decision_pair(record)[0] != _decision_pair(record)[1]]
-    same_count = len(records) - len(conflicts)
-    market = _market_key(records[0].get("market"))
-    lines = [
-        "📊 PRIMARY 테스트 요약",
-        "",
-        f"{_market_flag(records[0].get('market'))} {market}",
-        _format_time(records[0].get("reference_timestamp"), records[0].get("market")),
-        "",
-        "테스트:",
-        str(len(records)),
-        "",
-        "같은 의견:",
-        str(same_count),
-        "",
-        "다른 의견:",
-        str(len(conflicts)),
-        "",
-        "상태:",
-        "진행 중",
-    ]
-    if conflicts:
-        lines.extend(["", "━━━━━━━━━━━━━━", "", "⚔️ 의견 다른 종목", ""])
-        for record in conflicts[:12]:
-            existing, research = _decision_pair(record)
-            lines.append(
-                f"{record.get('ticker')} · 기존: {_kr_decision(existing)} · {record.get('existing_ai_score')} / "
-                f"Research AI: {_kr_decision(research)} · {record.get('research_score')}"
-            )
-        if len(conflicts) > 12:
-            lines.append(f"... 외 {len(conflicts) - 12}개")
-    return "\n".join(lines)
+        return prediction_summary_message([])
+    return prediction_summary_message(records)
 
 
 def comparison_report_message(report: dict) -> str:

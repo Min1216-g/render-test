@@ -16,6 +16,7 @@ from .comparison import ComparisonLab
 from .config import DATA_DIR, DEFAULT_MARKET_RESULTS, ResearchLabConfig
 from .daily_comparison import DailyComparisonLab
 from .engine import ResearchEngine, _num, validate_market_row, validate_news_row
+from .messages import prediction_summary_message
 from .storage import JsonlStore
 
 
@@ -621,34 +622,7 @@ def research_message(record: dict[str, Any], market_key: str) -> str:
 def existing_summary_message(records: list[dict[str, Any]], market_key: str, slot: ResearchSlot) -> str:
     if slot.phase == "INTRADAY_MONITORING":
         return intraday_update_message(records, market_key, slot)
-    conflicts = [record for record in records if is_conflict(record)]
-    same_count = len(records) - len(conflicts)
-    ref_time = format_reference_time(records[0].get("reference_timestamp"), market_key) if records else "DATA_UNAVAILABLE"
-    lines = [
-        "📊 PRIMARY 테스트" if slot.snapshot_type == "PRIMARY_TEST" else "📊 AI 스냅샷",
-        "",
-        f"{market_flag(market_key)} {market_key}",
-        ref_time,
-        "",
-        "테스트:",
-        str(len(records)),
-        "",
-        "같은 의견:",
-        str(same_count),
-        "",
-        "다른 의견:",
-        str(len(conflicts)),
-        "",
-        "상태:",
-        "완료" if slot.official_evaluation else "대기 중",
-    ]
-    if conflicts:
-        lines.extend(["", "━━━━━━━━━━━━━━", "", "⚔️ 의견 다른 종목", ""])
-        for record in conflicts[:12]:
-            lines.append(compact_comparison_line(record))
-        if len(conflicts) > 12:
-            lines.append(f"... 외 {len(conflicts) - 12}개")
-    return "\n".join(lines)
+    return prediction_summary_message(records)
 
 
 def research_summary_message(records: list[dict[str, Any]], market_key: str, slot: ResearchSlot) -> str:

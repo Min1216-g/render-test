@@ -51,6 +51,9 @@ class ComparisonRecord:
     bull_case: dict[str, Any]
     bear_case: dict[str, Any]
     insight_comparison: dict[str, Any]
+    data_quality: dict[str, Any] = field(default_factory=dict)
+    news_quality: dict[str, Any] = field(default_factory=dict)
+    score_inputs: dict[str, Any] = field(default_factory=dict)
     returns: dict[str, float | None] = field(default_factory=lambda: {key: None for key in RETURN_WINDOWS})
     correctness: dict[str, dict[str, bool | None]] = field(
         default_factory=lambda: {key: {"existing": None, "research": None} for key in RETURN_WINDOWS}
@@ -192,6 +195,9 @@ class ComparisonLab:
                 "test_focus": "already_risen_continuation" if research.already_risen else category,
                 "lookahead_guard": "same_snapshot_reference_only",
             },
+            data_quality=research.reasoning.get("data_quality", {}),
+            news_quality=research.reasoning.get("news_quality", {}),
+            score_inputs=research.reasoning.get("score_inputs", {}),
         )
 
     def _select_sample(self, df: pd.DataFrame, limit: int) -> list[tuple[str, pd.Series]]:
