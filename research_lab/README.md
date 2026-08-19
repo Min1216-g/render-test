@@ -70,6 +70,9 @@ python3 -m research_lab.cli comparison sample --limit 6
 python3 -m research_lab.cli comparison start --limit 40
 python3 -m research_lab.cli comparison update
 python3 -m research_lab.cli comparison report
+python3 -m research_lab.cli daily due
+python3 -m research_lab.cli daily run --send-telegram
+python3 -m research_lab.cli daily cumulative --days 30
 ```
 
 저장 위치:
@@ -92,3 +95,37 @@ research_lab/data/comparison_history.jsonl
 - Research는 기존 CSV를 읽기 전용으로만 사용합니다.
 - 이후 평가를 업데이트할 때도 과거 Research 판단은 재계산하지 않습니다.
 - 처음에는 최대 40개 정도의 다양한 표본으로 시작하고, 최소 100개 이상의 샘플이 쌓인 뒤 성능을 판단합니다.
+
+## 장마감 Daily Winner
+
+장 종료 후 자동 runner가 실행되면 당일 `comparison_history.jsonl`에 저장된 같은 snapshot 기준 분석을 불러와 실제 종가/장중 고가/저가를 조회하고 Daily Winner를 계산합니다.
+
+```bash
+python3 -m research_lab.daily_runner
+```
+
+수동 점검:
+
+```bash
+python3 -m research_lab.cli daily due
+python3 -m research_lab.cli daily run
+python3 -m research_lab.cli daily calculate --market US --date 2026-08-18
+python3 -m research_lab.cli daily cumulative --days 7
+python3 -m research_lab.cli daily cumulative --days 14
+python3 -m research_lab.cli daily cumulative --days 30
+```
+
+저장 위치:
+
+```text
+research_lab/data/daily_comparison_results.jsonl
+```
+
+중복 방지:
+
+- `US_DAILY_RESULT_YYYY-MM-DD`
+- `KOREA_DAILY_RESULT_YYYY-MM-DD`
+
+이미 저장된 Daily Result는 다시 생성하거나 Telegram으로 중복 전송하지 않습니다. 서버 재시작 후에도 같은 저장 파일을 확인해서 중복 전송을 막습니다.
+
+Daily Score는 Direction, Return, Risk, Momentum, News, Continuation 항목으로 계산하고, `DATA_UNAVAILABLE` 항목은 제외한 뒤 남은 항목 비율로 재계산합니다.

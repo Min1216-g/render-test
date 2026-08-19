@@ -8,6 +8,7 @@ import requests
 
 from .config import load_config
 from .comparison import ComparisonLab
+from .daily_comparison import DailyComparisonLab, cumulative_message, daily_result_message
 from .engine import ResearchEngine
 from .messages import (
     compare_result,
@@ -35,6 +36,7 @@ class TelegramResearchBot:
             raise RuntimeError("TELEGRAM_BOT_TOKEN is not configured")
         self.engine = ResearchEngine(self.config)
         self.comparison = ComparisonLab(self.config)
+        self.daily = DailyComparisonLab(self.config)
         self.session = requests.Session()
         self.base_url = f"https://api.telegram.org/bot{self.config.telegram_bot_token}"
 
@@ -103,6 +105,18 @@ class TelegramResearchBot:
                         lines.append(research_lab_message(record))
                         lines.append("")
                     return "\n".join(lines).strip()
+            if command == "/daily" and len(parts) > 1:
+                action = parts[1].lower()
+                if action == "run":
+                    results = [result.to_dict() for result in self.daily.run_due(send_telegram=False)]
+                    return "\n\n".join(daily_result_message(result) for result in results) or "NO_DAILY_RESULT_DUE"
+                if action == "report" and len(parts) > 3:
+                    market = parts[2].upper()
+                    result = self.daily.calculate(market, parts[3])
+                    return daily_result_message(result.to_dict()) if result else "NO_DAILY_RESULT_CREATED"
+                if action == "cumulative":
+                    days = int(parts[2]) if len(parts) > 2 and parts[2].isdigit() else 30
+                    return cumulative_message(self.daily.cumulative(days))
             if command == "/compare" and ticker:
                 return compare_result(self.engine.research(ticker))
             if command == "/research" and ticker == "HISTORY":
@@ -155,6 +169,8 @@ def help_message() -> str:
             "/comparison sample 6",
             "/comparison update",
             "/comparison report",
+            "/daily run",
+            "/daily cumulative 30",
         ]
     )
 
