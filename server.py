@@ -438,12 +438,72 @@ def _write_bug_reports_store(reports: List[Dict[str, object]]) -> Dict[str, obje
     return payload
 
 
+def _bug_report_counts(reports: List[Dict[str, object]]) -> Dict[str, object]:
+    status_counts: Dict[str, int] = {}
+    priority_counts: Dict[str, int] = {}
+    for report in reports:
+        status = str(report.get("status") or "reported")
+        priority = str(report.get("priority") or "")
+        status_counts[status] = status_counts.get(status, 0) + 1
+        if priority:
+            priority_counts[priority] = priority_counts.get(priority, 0) + 1
+    done_statuses = {"actionDone", "resolved", "deployed", "verified"}
+    unresolved_statuses = {"reported", "open", "checking", "inProgress", "testing"}
+    return {
+        "total_count": len(reports),
+        "reported_count": status_counts.get("reported", 0) + status_counts.get("open", 0),
+        "action_done_count": status_counts.get("actionDone", 0),
+        "resolved_count": sum(status_counts.get(status, 0) for status in done_statuses),
+        "urgent_count": priority_counts.get("urgent", 0),
+        "unresolved_count": sum(status_counts.get(status, 0) for status in unresolved_statuses),
+        "status_counts": status_counts,
+        "priority_counts": priority_counts,
+    }
+
+
+def _bug_reports_response(
+    reports: List[Dict[str, object]],
+    *,
+    updated_at: object,
+    changed: Optional[int] = None,
+    git_changed: int = 0,
+    git_error: Optional[str] = None,
+    unmatched_ids: Optional[List[str]] = None,
+) -> Dict[str, object]:
+    now = _now_iso()
+    counts = _bug_report_counts(reports)
+    response: Dict[str, object] = {
+        "ok": True,
+        "reports": reports,
+        "count": len(reports),
+        "git_changed": git_changed,
+        "git_sync_error": git_error,
+        "git_unmatched_ids": unmatched_ids or [],
+        "updated_at": updated_at,
+        "last_updated": updated_at,
+        "server_updated_at": now,
+        "server_timestamp": now,
+        "data_version": str(updated_at or now),
+    }
+    response.update(counts)
+    if changed is not None:
+        response["changed"] = changed
+    return response
+
+
 def _bug_report_sort_value(report: Dict[str, object]) -> float:
     for key in ("updatedAt", "createdAt"):
         value = report.get(key)
         if isinstance(value, (int, float)):
             return float(value)
     return 0.0
+
+
+def _bug_report_id_order_value(report: Dict[str, object]) -> float:
+    value = report.get("createdAt")
+    if isinstance(value, (int, float)):
+        return float(value)
+    return _bug_report_sort_value(report)
 
 
 def _merge_bug_reports(
@@ -489,6 +549,43 @@ def _bug_report_display_id(report: Dict[str, object]) -> str:
     except (TypeError, ValueError):
         sequence_int = 0
     return f"{_bug_report_prefix(report)}-{sequence_int:03d}"
+
+
+def _ensure_unique_bug_report_ids(reports: List[Dict[str, object]]) -> tuple[List[Dict[str, object]], int]:
+    ordered = sorted(reports, key=_bug_report_id_order_value)
+    max_sequence: Dict[str, int] = {}
+    for report in ordered:
+        prefix = _bug_report_prefix(report)
+        try:
+            sequence = int(report.get("sequence") or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        max_sequence[prefix] = max(max_sequence.get(prefix, 0), sequence)
+
+    used: set[str] = set()
+    changed = 0
+    for report in ordered:
+        prefix = _bug_report_prefix(report)
+        try:
+            sequence = int(report.get("sequence") or 0)
+        except (TypeError, ValueError):
+            sequence = 0
+        if sequence <= 0:
+            sequence = max_sequence.get(prefix, 0) + 1
+            max_sequence[prefix] = sequence
+        display_id = f"{prefix}-{sequence:03d}"
+        requested_id = str(report.get("bugID") or "").strip().upper()
+        is_duplicate = display_id in used or (requested_id and requested_id in used and requested_id != display_id)
+        if is_duplicate:
+            sequence = max_sequence.get(prefix, 0) + 1
+            max_sequence[prefix] = sequence
+            display_id = f"{prefix}-{sequence:03d}"
+        used.add(display_id)
+        if report.get("sequence") != sequence or str(report.get("bugID") or "") != display_id:
+            report["sequence"] = sequence
+            report["bugID"] = display_id
+            changed += 1
+    return sorted(ordered, key=_bug_report_sort_value, reverse=True), changed
 
 
 BUG_ID_PATTERN = re.compile(r"\b(?:BUG|FIX|IMP|DATA|UI)-\d{1,5}\b", re.IGNORECASE)
@@ -950,6 +1047,16 @@ def _filter_result_rows_streaming(
     return _filter_rows(_read_rows(), market=market, q=q, limit=limit)
 
 
+def _filtered_result_total(market: Optional[str] = None, q: Optional[str] = None) -> Dict[str, object]:
+    rows = _filter_rows(_read_rows(), market=market, q=q, limit=RESULTS_CACHE_MAX_ROWS)
+    counts = market_counts(rows)
+    return {
+        "total_count": len(rows),
+        "total_canada_rows": counts.get(CANADA_MARKET_LABEL, 0),
+        "total_market_counts": counts,
+    }
+
+
 def _parse_csv_bytes(payload: bytes) -> List[Dict[str, str]]:
     try:
         text = payload.decode("utf-8-sig")
@@ -1099,7 +1206,24 @@ def _write_scanner_status(**payload: object) -> None:
         "updated_at": _now_iso(),
     }
     status.update(payload)
-    SCANNER_STATUS_FILE.write_text(json.dumps(status, ensure_ascii=False, indent=2), encoding="utf-8")
+    SCANNER_STATUS_FILE.parent.mkdir(parents=True, exist_ok=True)
+    serialized = json.dumps(status, ensure_ascii=False, indent=2)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{SCANNER_STATUS_FILE.name}.",
+        suffix=".tmp",
+        dir=str(SCANNER_STATUS_FILE.parent),
+        text=True,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(serialized)
+            handle.flush()
+            os.fsync(handle.fileno())
+        tmp_path.replace(SCANNER_STATUS_FILE)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
 
 
 def _scanner_completed_age_seconds(status: Optional[Dict[str, object]] = None) -> Optional[float]:
@@ -1610,22 +1734,24 @@ async def bug_reports(request: Request) -> Dict[str, object]:
     await guarded(request)
     with _bug_reports_lock:
         store = _read_bug_reports_store()
+        reports, id_changed = _ensure_unique_bug_report_ids(store["reports"])
+        if id_changed:
+            store = _write_bug_reports_store(reports)
+        else:
+            store["reports"] = reports
         reports, git_changed, git_error, unmatched_ids = _apply_git_commit_links(store["reports"])
         if git_changed:
             store = _write_bug_reports_store(reports)
         else:
             store["reports"] = reports
     reports = store["reports"]
-    return {
-        "ok": True,
-        "reports": reports,
-        "count": len(reports),
-        "git_changed": git_changed,
-        "git_sync_error": git_error,
-        "git_unmatched_ids": unmatched_ids,
-        "updated_at": store.get("updated_at"),
-        "server_updated_at": _now_iso(),
-    }
+    return _bug_reports_response(
+        reports,
+        updated_at=store.get("updated_at"),
+        git_changed=git_changed,
+        git_error=git_error,
+        unmatched_ids=unmatched_ids,
+    )
 
 
 @app.post("/api/bug-reports/sync")
@@ -1639,18 +1765,17 @@ async def sync_bug_reports(request: Request) -> Dict[str, object]:
     with _bug_reports_lock:
         store = _read_bug_reports_store()
         merged, changed = _merge_bug_reports(store["reports"], incoming_reports)
+        merged, id_changed = _ensure_unique_bug_report_ids(merged)
         merged, git_changed, git_error, unmatched_ids = _apply_git_commit_links(merged)
         saved = _write_bug_reports_store(merged)
-    return {
-        "ok": True,
-        "reports": saved["reports"],
-        "count": saved["count"],
-        "changed": changed + git_changed,
-        "git_changed": git_changed,
-        "git_sync_error": git_error,
-        "git_unmatched_ids": unmatched_ids,
-        "updated_at": saved["updated_at"],
-    }
+    return _bug_reports_response(
+        saved["reports"],
+        updated_at=saved["updated_at"],
+        changed=changed + id_changed + git_changed,
+        git_changed=git_changed,
+        git_error=git_error,
+        unmatched_ids=unmatched_ids,
+    )
 
 
 @app.post("/api/bug-reports/git-sync")
@@ -1660,40 +1785,38 @@ async def sync_bug_reports_from_git(request: Request) -> Dict[str, object]:
     supplied_commits = _normalize_supplied_git_commits(payload.get("commits"))
     with _bug_reports_lock:
         store = _read_bug_reports_store()
+        reports, id_changed = _ensure_unique_bug_report_ids(store["reports"])
         reports, changed, git_error, unmatched_ids = _apply_git_commit_links(
-            store["reports"],
+            reports,
             supplied_commits=supplied_commits,
         )
         if git_error:
-            return {
-                "ok": False,
-                "reports": store["reports"],
-                "count": len(store["reports"]),
-                "changed": 0,
-                "git_changed": 0,
-                "git_sync_error": git_error,
-                "git_unmatched_ids": unmatched_ids,
-                "received_commits": len(supplied_commits),
-                "updated_at": store.get("updated_at"),
-                "server_updated_at": _now_iso(),
-            }
-        saved = _write_bug_reports_store(reports) if changed else {
+            response = _bug_reports_response(
+                reports,
+                updated_at=store.get("updated_at"),
+                changed=0,
+                git_changed=0,
+                git_error=git_error,
+                unmatched_ids=unmatched_ids,
+            )
+            response["ok"] = False
+            response["received_commits"] = len(supplied_commits)
+            return response
+        saved = _write_bug_reports_store(reports) if id_changed or changed else {
             "reports": reports,
             "count": len(reports),
             "updated_at": store.get("updated_at"),
         }
-    return {
-        "ok": True,
-        "reports": saved["reports"],
-        "count": saved["count"],
-        "changed": changed,
-        "git_changed": changed,
-        "git_sync_error": None,
-        "git_unmatched_ids": unmatched_ids,
-        "received_commits": len(supplied_commits),
-        "updated_at": saved["updated_at"],
-        "server_updated_at": _now_iso(),
-    }
+    response = _bug_reports_response(
+        saved["reports"],
+        updated_at=saved["updated_at"],
+        changed=id_changed + changed,
+        git_changed=changed,
+        git_error=None,
+        unmatched_ids=unmatched_ids,
+    )
+    response["received_commits"] = len(supplied_commits)
+    return response
 
 
 @app.post("/api/admin/verify")
@@ -1905,11 +2028,15 @@ async def results(
     path = _result_path()
     file_updated_at = _file_mtime_iso(path)
     rows = _filter_result_rows_streaming(market=market, q=q, limit=limit)
+    totals = _filtered_result_total(market=market, q=q)
     generated_at = max((row.get("mobile_intel_generated_at", "") for row in rows), default="")
     counts = market_counts(rows)
     return {
         "ok": True,
         "count": len(rows),
+        **totals,
+        "limited": len(rows) < int(totals.get("total_count") or 0),
+        "limit": limit,
         "rows": rows,
         "canada_rows": counts.get(CANADA_MARKET_LABEL, 0),
         "market_counts": counts,

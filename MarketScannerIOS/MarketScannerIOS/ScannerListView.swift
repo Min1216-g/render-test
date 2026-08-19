@@ -857,12 +857,10 @@ struct ScannerListView: View {
                                     Task { await checkBugReportServerStatus() }
                                 },
                                 updateBugStatus: { report, status in
-                                    bugReports = BugReportStore.updateStatus(report.id, status: status)
-                                    Task { await uploadBugReportsToServer(verifyIDs: [report.id]) }
+                                    Task { await updateBugReportStatusOnServer(report, status: status) }
                                 },
                                 updateBugReport: { report in
-                                    bugReports = BugReportStore.update(report)
-                                    Task { await uploadBugReportsToServer(verifyIDs: [report.id]) }
+                                    Task { await updateBugReportOnServer(report) }
                                 },
                                 runQuickScan: {
                                     Task { await runRemoteScannerAndReload(mode: .quick) }
@@ -896,12 +894,10 @@ struct ScannerListView: View {
                                     Task { await checkBugReportServerStatus() }
                                 },
                                 updateStatus: { report, status in
-                                    bugReports = BugReportStore.updateStatus(report.id, status: status)
-                                    Task { await uploadBugReportsToServer(verifyIDs: [report.id]) }
+                                    Task { await updateBugReportStatusOnServer(report, status: status) }
                                 },
                                 updateReport: { report in
-                                    bugReports = BugReportStore.update(report)
-                                    Task { await uploadBugReportsToServer(verifyIDs: [report.id]) }
+                                    Task { await updateBugReportOnServer(report) }
                                 }
                             )
                             .padding(.horizontal, 16)
@@ -1071,8 +1067,7 @@ struct ScannerListView: View {
             }
             .sheet(isPresented: $showBugReportSheet) {
                 BugReportEditorView(context: makeBugReportContext()) { report in
-                    bugReports = BugReportStore.add(report)
-                    Task { await uploadBugReportsToServer(verifyIDs: [report.id]) }
+                    Task { await submitBugReportToServer(report) }
                 }
             }
             .overlay {
@@ -1129,17 +1124,78 @@ struct ScannerListView: View {
             return
         }
         do {
-            let localReports = bugReports
             _ = try? await BugReportRemoteSync.gitSync(config: remoteConfig)
-            let downloadedReports = try await BugReportRemoteSync.fetch(config: remoteConfig).reports
-            let preMerged = BugReportStore.merge(localReports, downloadedReports)
-            let remoteReports = try await BugReportRemoteSync.sync(reports: preMerged, config: remoteConfig).reports
-            let merged = BugReportStore.merge(localReports, remoteReports)
-            bugReports = merged
+            let response = try await BugReportRemoteSync.fetch(config: remoteConfig)
+            bugReports = BugReportStore.replaceFromServer(response.reports)
             let timeText = AppDateTime.localString(from: Date(), format: "HH:mm:ss")
-            bugReportSyncText = "전체 동기화 완료 · 서버 \(remoteReports.count)건 · 로컬 \(merged.count)건 · \(timeText)"
+            bugReportSyncText = bugSyncStatusText(prefix: "전체 동기화 완료", response: response, localCount: bugReports.count, timeText: timeText)
         } catch {
             bugReportSyncText = "신고 동기화 실패 · \(BugReportRemoteSync.userMessage(for: error))"
+        }
+    }
+
+    @MainActor
+    private func submitBugReportToServer(_ report: BugReport) async {
+        guard remoteConfig.isReady else {
+            bugReportSyncText = "신고 등록 실패 · 서버 설정 필요"
+            return
+        }
+        var nextReport = report
+        nextReport.markUpdated(action: "신고 등록", detail: report.titleText)
+        do {
+            _ = try await BugReportRemoteSync.sync(reports: [nextReport], config: remoteConfig)
+            let fetched = try await BugReportRemoteSync.fetch(config: remoteConfig)
+            bugReports = BugReportStore.replaceFromServer(fetched.reports)
+            let serverIDs = Set(fetched.reports.map(\.id))
+            let timeText = AppDateTime.localString(from: Date(), format: "HH:mm:ss")
+            if serverIDs.contains(nextReport.id) {
+                bugReportSyncText = bugSyncStatusText(prefix: "신고 등록 완료", response: fetched, localCount: bugReports.count, timeText: timeText)
+            } else {
+                bugReportSyncText = "신고 등록 확인 실패 · 서버 \(fetched.reportCount)건 · 로컬 \(bugReports.count)건 · \(timeText)"
+            }
+        } catch {
+            bugReportSyncText = "신고 등록 실패 · \(BugReportRemoteSync.userMessage(for: error))"
+        }
+    }
+
+    @MainActor
+    private func updateBugReportStatusOnServer(_ report: BugReport, status: BugReportStatus) async {
+        guard remoteConfig.isReady else {
+            bugReportSyncText = "상태 변경 실패 · 서버 설정 필요"
+            return
+        }
+        var nextReport = report
+        nextReport.status = status
+        nextReport.markUpdated(action: "상태 변경", detail: status.title)
+        await saveSingleBugReportToServer(nextReport, prefix: "상태 변경 완료")
+    }
+
+    @MainActor
+    private func updateBugReportOnServer(_ report: BugReport) async {
+        guard remoteConfig.isReady else {
+            bugReportSyncText = "수정 이력 저장 실패 · 서버 설정 필요"
+            return
+        }
+        var nextReport = report
+        nextReport.markUpdated(action: "수정 이력 저장", detail: report.status.title)
+        await saveSingleBugReportToServer(nextReport, prefix: "수정 이력 저장 완료")
+    }
+
+    @MainActor
+    private func saveSingleBugReportToServer(_ report: BugReport, prefix: String) async {
+        do {
+            _ = try await BugReportRemoteSync.sync(reports: [report], config: remoteConfig)
+            let fetched = try await BugReportRemoteSync.fetch(config: remoteConfig)
+            bugReports = BugReportStore.replaceFromServer(fetched.reports)
+            let serverIDs = Set(fetched.reports.map(\.id))
+            let timeText = AppDateTime.localString(from: Date(), format: "HH:mm:ss")
+            if serverIDs.contains(report.id) {
+                bugReportSyncText = bugSyncStatusText(prefix: prefix, response: fetched, localCount: bugReports.count, timeText: timeText)
+            } else {
+                bugReportSyncText = "\(prefix) 확인 실패 · 서버 \(fetched.reportCount)건 · 로컬 \(bugReports.count)건 · \(timeText)"
+            }
+        } catch {
+            bugReportSyncText = "\(prefix) 실패 · \(BugReportRemoteSync.userMessage(for: error))"
         }
     }
 
@@ -1150,16 +1206,16 @@ struct ScannerListView: View {
             return
         }
         do {
-            let response = try await BugReportRemoteSync.sync(reports: bugReports, config: remoteConfig)
+            let uploadTargets = verifyIDs.isEmpty ? bugReports : bugReports.filter { verifyIDs.contains($0.id) }
+            let response = try await BugReportRemoteSync.sync(reports: uploadTargets, config: remoteConfig)
             let fetched = try await BugReportRemoteSync.fetch(config: remoteConfig)
-            let merged = BugReportStore.merge(bugReports, fetched.reports)
-            bugReports = merged
+            bugReports = BugReportStore.replaceFromServer(fetched.reports)
             let serverIDs = Set(fetched.reports.map(\.id))
             let missing = verifyIDs.subtracting(serverIDs)
             let timeText = AppDateTime.localString(from: Date(), format: "HH:mm:ss")
             if missing.isEmpty {
                 let verifyText = verifyIDs.isEmpty ? "서버 저장 확인 완료" : "서버 저장 확인 완료 · \(verifyIDs.count)건"
-                bugReportSyncText = "서버 업로드 성공 · \(verifyText) · 서버 \(fetched.reports.count)건 · \(timeText)"
+                bugReportSyncText = "\(bugSyncStatusText(prefix: "서버 업로드 성공", response: fetched, localCount: bugReports.count, timeText: timeText)) · \(verifyText)"
             } else {
                 bugReportSyncText = "업로드 응답 성공 · 서버 저장 확인 실패 · 누락 \(missing.count)건"
             }
@@ -1183,11 +1239,10 @@ struct ScannerListView: View {
             let response = try await BugReportRemoteSync.fetch(config: remoteConfig)
             let incomingIDs = Set(response.reports.map(\.id))
             let newCount = incomingIDs.subtracting(beforeIDs).count
-            let merged = BugReportStore.merge(bugReports, response.reports)
-            bugReports = merged
+            bugReports = BugReportStore.replaceFromServer(response.reports)
             let timeText = AppDateTime.localString(from: Date(), format: "HH:mm:ss")
             let gitText = gitResponse.gitChanged.map { " · Git 자동연결 \($0)건" } ?? ""
-            bugReportSyncText = "다운로드 완료 · 서버 신고 \(response.reports.count)건 · 신규 \(newCount)건\(gitText) · \(timeText)"
+            bugReportSyncText = "\(bugSyncStatusText(prefix: "다운로드 완료", response: response, localCount: bugReports.count, timeText: timeText)) · 신규 \(newCount)건\(gitText)"
         } catch {
             bugReportSyncText = "서버 다운로드 실패 · \(BugReportRemoteSync.userMessage(for: error))"
         }
@@ -1202,14 +1257,14 @@ struct ScannerListView: View {
         do {
             let gitResponse = try await BugReportRemoteSync.gitSync(config: remoteConfig)
             let response = try await BugReportRemoteSync.fetch(config: remoteConfig)
-            bugReports = BugReportStore.merge(bugReports, response.reports)
+            bugReports = BugReportStore.replaceFromServer(response.reports)
             let timeText = AppDateTime.localString(from: Date(), format: "HH:mm:ss")
             if let gitError = gitResponse.gitSyncError, !gitError.isEmpty {
                 bugReportSyncText = "Git 반영 확인 실패 · \(gitError) · \(timeText)"
             } else {
                 let unmatched = gitResponse.gitUnmatchedIDs ?? []
                 let unmatchedText = unmatched.isEmpty ? "" : " · 미매칭 \(unmatched.joined(separator: ","))"
-                bugReportSyncText = "Git 반영 확인 완료 · 자동연결 \(gitResponse.gitChanged ?? 0)건\(unmatchedText) · 서버 신고 \(response.reports.count)건 · \(timeText)"
+                bugReportSyncText = "\(bugSyncStatusText(prefix: "Git 반영 확인 완료", response: response, localCount: bugReports.count, timeText: timeText)) · 자동연결 \(gitResponse.gitChanged ?? 0)건\(unmatchedText)"
             }
         } catch {
             bugReportSyncText = "Git 반영 확인 실패 · \(BugReportRemoteSync.userMessage(for: error))"
@@ -1224,11 +1279,20 @@ struct ScannerListView: View {
         }
         do {
             let response = try await BugReportRemoteSync.fetch(config: remoteConfig)
+            bugReports = BugReportStore.replaceFromServer(response.reports)
             let timeText = AppDateTime.localString(from: Date(), format: "HH:mm:ss")
-            bugReportSyncText = "서버 연결 🟢 · 인증 🟢 · 버그 API 🟢 · 서버 신고 \(response.reports.count)건 · \(timeText)"
+            bugReportSyncText = bugSyncStatusText(prefix: "서버 연결 🟢 · 인증 🟢 · 버그 API 🟢", response: response, localCount: bugReports.count, timeText: timeText)
         } catch {
             bugReportSyncText = "서버 상태 확인 실패 · \(BugReportRemoteSync.userMessage(for: error))"
         }
+    }
+
+    private func bugSyncStatusText(prefix: String, response: BugReportSyncResponse, localCount: Int, timeText: String) -> String {
+        let serverCount = response.reportCount
+        let syncState = serverCount == localCount ? "정상" : "SYNC_MISMATCH"
+        let counts = "reported \(response.reportedCount ?? 0) · actionDone \(response.actionDoneCount ?? 0) · resolved \(response.resolvedCount ?? 0) · urgent \(response.urgentCount ?? 0)"
+        let version = response.dataVersion ?? response.serverTimestamp ?? response.updatedAt ?? "version 없음"
+        return "\(prefix) · 서버 \(serverCount)건 · 로컬 \(localCount)건 · \(syncState) · \(counts) · \(timeText) · \(version)"
     }
 
     private func relatedBugResult(from visible: [ScannerResult]) -> ScannerResult? {
@@ -12347,14 +12411,11 @@ private enum BugReportStore {
     private static let buyRecommendationAuditTitle = "최근 매수 추천이 단 한 건도 발생하지 않는 문제"
 
     static func load() -> [BugReport] {
-        let reports: [BugReport]
         guard let data = UserDefaults.standard.data(forKey: key),
               let decoded = try? JSONDecoder().decode([BugReport].self, from: data) else {
-            reports = []
-            return seededIfNeeded(reports)
+            return []
         }
-        reports = decoded
-        return seededIfNeeded(reports)
+        return decoded.sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
     }
 
     static func add(_ report: BugReport) -> [BugReport] {
@@ -12401,6 +12462,12 @@ private enum BugReportStore {
         let merged = Array(byID.values).sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
         save(merged)
         return seededIfNeeded(merged)
+    }
+
+    static func replaceFromServer(_ reports: [BugReport]) -> [BugReport] {
+        let sorted = reports.sorted { ($0.updatedAt ?? $0.createdAt) > ($1.updatedAt ?? $1.createdAt) }
+        save(sorted)
+        return sorted
     }
 
     static func nextSequence() -> Int {
@@ -12538,26 +12605,42 @@ private enum BugReportRemoteSync {
         }
         let base = config.baseURL.trimmingCharacters(in: .whitespacesAndNewlines).trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: base + path) else {
+            print("BUG_SYNC_ERROR endpoint=\(path) detail=bad URL")
             throw URLError(.badURL)
         }
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.timeoutInterval = 20
         request.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
-        request.setValue(config.token.trimmingCharacters(in: .whitespacesAndNewlines), forHTTPHeaderField: "X-Market-Token")
+        let token = config.token.trimmingCharacters(in: .whitespacesAndNewlines)
+        request.setValue(token, forHTTPHeaderField: "X-Market-Token")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.setValue("application/json", forHTTPHeaderField: "Accept")
         if method != "GET" {
             request.setValue("application/json", forHTTPHeaderField: "Content-Type")
             request.httpBody = body
         }
+        let startedAt = Date()
+        print("BUG_SYNC_REQUEST method=\(method) endpoint=\(path) started_at=\(ISO8601DateFormatter().string(from: startedAt)) timeout=20s")
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse else {
+            print("BUG_SYNC_ERROR endpoint=\(path) detail=bad server response")
             throw URLError(.badServerResponse)
         }
+        print("BUG_SYNC_RESPONSE endpoint=\(path) status=\(http.statusCode) elapsed=\(String(format: "%.2f", Date().timeIntervalSince(startedAt)))s bytes=\(data.count)")
         guard (200..<300).contains(http.statusCode) else {
             throw BugReportSyncError(statusCode: http.statusCode, data: data)
         }
-        return try JSONDecoder().decode(T.self, from: data)
+        do {
+            let decoded = try JSONDecoder().decode(T.self, from: data)
+            if let payload = decoded as? BugReportSyncResponse {
+                print("BUG_SYNC_PARSE endpoint=\(path) server_count=\(payload.reportCount) local_payload_rows=\(payload.reports.count) reported=\(payload.reportedCount ?? -1) actionDone=\(payload.actionDoneCount ?? -1) resolved=\(payload.resolvedCount ?? -1) urgent=\(payload.urgentCount ?? -1) data_version=\(payload.dataVersion ?? "")")
+            }
+            return decoded
+        } catch {
+            print("BUG_SYNC_PARSE_ERROR endpoint=\(path) detail=\(error.localizedDescription) sample=\(String(data: data.prefix(160), encoding: .utf8) ?? "")")
+            throw error
+        }
     }
 }
 
@@ -12600,16 +12683,38 @@ private struct BugReportSyncResponse: Decodable {
     let ok: Bool
     let reports: [BugReport]
     let count: Int?
+    let totalCount: Int?
+    let reportedCount: Int?
+    let actionDoneCount: Int?
+    let resolvedCount: Int?
+    let urgentCount: Int?
+    let unresolvedCount: Int?
+    let lastUpdated: String?
+    let serverTimestamp: String?
+    let dataVersion: String?
     let changed: Int?
     let gitChanged: Int?
     let gitSyncError: String?
     let gitUnmatchedIDs: [String]?
     let updatedAt: String?
 
+    var reportCount: Int {
+        totalCount ?? count ?? reports.count
+    }
+
     enum CodingKeys: String, CodingKey {
         case ok
         case reports
         case count
+        case totalCount = "total_count"
+        case reportedCount = "reported_count"
+        case actionDoneCount = "action_done_count"
+        case resolvedCount = "resolved_count"
+        case urgentCount = "urgent_count"
+        case unresolvedCount = "unresolved_count"
+        case lastUpdated = "last_updated"
+        case serverTimestamp = "server_timestamp"
+        case dataVersion = "data_version"
         case changed
         case gitChanged = "git_changed"
         case gitSyncError = "git_sync_error"
