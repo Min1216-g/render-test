@@ -147,19 +147,29 @@ com.m2.stock.researchlab.automation
 동작:
 
 - 5분마다 due 상태만 확인합니다.
-- 한국장 open: `Asia/Seoul` 09:05~09:50
-- 미국장 open: `America/New_York` 09:35~10:20
-- 한국장 close daily: `Asia/Seoul` 15:50~17:20
-- 미국장 close daily: `America/New_York` 16:20~17:50
+- 한국장 pre-market: `Asia/Seoul` 08:45
+- 한국장 primary test: `Asia/Seoul` 09:05
+- 한국장 monitoring: `Asia/Seoul` 09:30 / 10:00 / 12:00 / 14:30
+- 한국장 close evaluation: `Asia/Seoul` 15:30
+- 미국장 pre-market: `America/New_York` 09:15
+- 미국장 primary test: `America/New_York` 09:35
+- 미국장 monitoring: `America/New_York` 10:00 / 10:30 / 12:30 / 15:30
+- 미국장 close evaluation: `America/New_York` 16:00
 
-장 시작 작업은 snapshot 존재, market row, reference price, reference timestamp, stale 여부를 검증한 뒤 같은 `market + trading_date + reference_timestamp` job ID로 중복 실행을 막습니다.
+`PRIMARY_TEST`만 공식 Daily Winner 평가에 사용합니다. `PRE_MARKET`과 `INTRADAY_MONITORING`은 `monitoring_history.jsonl`에 별도로 저장하며, 같은 종목을 여러 번 분석해도 공식 점수 표본으로 중복 계산하지 않습니다.
+
+각 작업은 snapshot 존재, market row, reference price, reference timestamp, stale 여부를 검증한 뒤 같은 `market + slot + trading_date` job ID로 중복 실행을 막습니다.
 
 수동 검증:
 
 ```bash
 python3 -m research_lab.automation status
+python3 -m research_lab.automation slot --market KOREA --slot PREMARKET --dry-run --now 2026-08-19T08:45:00+09:00
 python3 -m research_lab.automation open --market KOREA --dry-run --now 2026-08-19T09:05:00+09:00
+python3 -m research_lab.automation monitor --market KOREA --slot MONITOR_0930 --dry-run --now 2026-08-19T09:30:00+09:00
+python3 -m research_lab.automation slot --market US --slot PREMARKET --dry-run --now 2026-08-19T09:15:00-04:00
 python3 -m research_lab.automation open --market US --dry-run --now 2026-08-19T09:35:00-04:00
+python3 -m research_lab.automation monitor --market US --slot MONITOR_1030 --dry-run --now 2026-08-19T10:30:00-04:00
 python3 -m research_lab.automation daily --market KOREA --dry-run --now 2026-08-19T15:50:00+09:00
 python3 -m research_lab.automation daily --market US --dry-run --now 2026-08-19T16:20:00-04:00
 ```
@@ -169,4 +179,5 @@ python3 -m research_lab.automation daily --market US --dry-run --now 2026-08-19T
 ```text
 research_lab/data/automation_log.jsonl
 research_lab/data/automation_state.json
+research_lab/data/monitoring_history.jsonl
 ```

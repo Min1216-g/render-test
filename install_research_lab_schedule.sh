@@ -53,6 +53,6 @@ launchctl load "$PLIST_PATH"
 
 echo "설치 완료: $PLIST_PATH"
 echo "Research Lab 자동화는 5분마다 시장별 due 상태만 확인합니다."
-echo "한국장: Asia/Seoul 09:05~09:50 open, 15:50~17:20 daily"
-echo "미국장: America/New_York 09:35~10:20 open, 16:20~17:50 daily"
+echo "한국장: Asia/Seoul 08:45 pre, 09:05 primary, 09:30/10:00/12:00/14:30 monitoring, 15:30 close"
+echo "미국장: America/New_York 09:15 pre, 09:35 primary, 10:00/10:30/12:30/15:30 monitoring, 16:00 close"
 echo "로그: $STDOUT_LOG / $STDERR_LOG"

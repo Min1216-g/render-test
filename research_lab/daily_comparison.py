@@ -318,7 +318,12 @@ class DailyComparisonLab:
                 continue
             if reference_time.astimezone(tz).date() == market_date:
                 records.append(record)
-        return records
+        primary_records = [
+            record
+            for record in records
+            if record.get("snapshot_type") == "PRIMARY_TEST" or record.get("official_evaluation") is True
+        ]
+        return primary_records or records
 
     def _fetch_market_day_prices(self, records: list[dict], market_date: date) -> dict[str, dict[str, float | None]]:
         result = {}

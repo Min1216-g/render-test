@@ -16,16 +16,29 @@ from .comparison import ComparisonLab
 from .config import DATA_DIR, DEFAULT_MARKET_RESULTS, ResearchLabConfig
 from .daily_comparison import DailyComparisonLab
 from .engine import ResearchEngine, _num
+from .storage import JsonlStore
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 STATE_FILE = DATA_DIR / "automation_state.json"
 LOG_FILE = DATA_DIR / "automation_log.jsonl"
 LOCK_FILE = DATA_DIR / ".automation.lock"
+MONITORING_FILE = DATA_DIR / "monitoring_history.jsonl"
 
 TELEGRAM_MAX_LENGTH = 3900
-DEFAULT_SAMPLE_LIMIT = 6
+DEFAULT_PRIMARY_LIMIT = 40
+DEFAULT_MONITORING_LIMIT = 40
 DEFAULT_SNAPSHOT_MAX_AGE_MINUTES = 180
+
+
+@dataclass(frozen=True)
+class ResearchSlot:
+    key: str
+    phase: str
+    snapshot_type: str
+    local_time: time
+    window_minutes: int
+    official_evaluation: bool
 
 
 @dataclass(frozen=True)
@@ -95,6 +108,28 @@ MARKETS = {
             "2026-11-26",
             "2026-12-25",
         },
+    ),
+}
+
+
+SCHEDULE_SLOTS = {
+    "KOREA": (
+        ResearchSlot("PREMARKET", "PRE_MARKET", "PRE_MARKET", time(8, 45), 10, False),
+        ResearchSlot("PRIMARY", "PRIMARY_TEST", "PRIMARY_TEST", time(9, 5), 10, True),
+        ResearchSlot("MONITOR_0930", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(9, 30), 10, False),
+        ResearchSlot("MONITOR_1000", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(10, 0), 10, False),
+        ResearchSlot("MONITOR_1200", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(12, 0), 10, False),
+        ResearchSlot("MONITOR_1430", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(14, 30), 10, False),
+        ResearchSlot("CLOSE", "CLOSE_EVALUATION", "CLOSE_EVALUATION", time(15, 30), 90, True),
+    ),
+    "US": (
+        ResearchSlot("PREMARKET", "PRE_MARKET", "PRE_MARKET", time(9, 15), 10, False),
+        ResearchSlot("PRIMARY", "PRIMARY_TEST", "PRIMARY_TEST", time(9, 35), 10, True),
+        ResearchSlot("MONITOR_1000", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(10, 0), 10, False),
+        ResearchSlot("MONITOR_1030", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(10, 30), 10, False),
+        ResearchSlot("MONITOR_1230", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(12, 30), 10, False),
+        ResearchSlot("MONITOR_1530", "INTRADAY_MONITORING", "INTRADAY_MONITORING", time(15, 30), 10, False),
+        ResearchSlot("CLOSE", "CLOSE_EVALUATION", "CLOSE_EVALUATION", time(16, 0), 90, True),
     ),
 }
 
@@ -197,6 +232,26 @@ def in_window(local_now: datetime, target: time, delay_minutes: int, window_minu
     return start <= local_now <= end
 
 
+def slot_due(local_now: datetime, slot: ResearchSlot) -> bool:
+    start = datetime.combine(local_now.date(), slot.local_time, tzinfo=local_now.tzinfo)
+    end = start + timedelta(minutes=slot.window_minutes)
+    return start <= local_now <= end
+
+
+def due_slots(now: datetime, env: dict[str, str]) -> list[tuple[str, MarketSchedule, ResearchSlot, datetime]]:
+    due = []
+    for market_key, schedule in MARKETS.items():
+        tz = ZoneInfo(schedule.timezone)
+        local_now = now.astimezone(tz)
+        trading, _ = is_trading_day(schedule, local_now.date(), env)
+        if not trading:
+            continue
+        for slot in SCHEDULE_SLOTS[market_key]:
+            if slot_due(local_now, slot):
+                due.append((market_key, schedule, slot, local_now))
+    return due
+
+
 def due_open_markets(now: datetime, env: dict[str, str]) -> list[tuple[str, MarketSchedule, datetime]]:
     due = []
     for market_key, schedule in MARKETS.items():
@@ -223,7 +278,13 @@ def parse_snapshot_time(value: Any) -> datetime | None:
     text = str(value or "").strip()
     if not text:
         return None
-    for suffix, tz_name in [(" PDT", "America/Vancouver"), (" PST", "America/Vancouver")]:
+    for suffix, tz_name in [
+        (" KST", "Asia/Seoul"),
+        (" EDT", "America/New_York"),
+        (" EST", "America/New_York"),
+        (" PDT", "America/Vancouver"),
+        (" PST", "America/Vancouver"),
+    ]:
         if text.endswith(suffix):
             clean = text[: -len(suffix)]
             try:
@@ -274,18 +335,26 @@ def validate_snapshot(
         return None, "SNAPSHOT_PRICE_MISSING", None
 
     fallback_mtime = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc)
-    timestamps = [parse_snapshot_time(snapshot_timestamp(row, fallback_mtime)) for _, row in market_df.iterrows()]
-    valid_times = [item for item in timestamps if item is not None]
-    if not valid_times:
+    timed_rows = []
+    for index, row in market_df.iterrows():
+        parsed_time = parse_snapshot_time(snapshot_timestamp(row, fallback_mtime))
+        if parsed_time is not None:
+            timed_rows.append((index, parsed_time))
+    if not timed_rows:
         return None, "SNAPSHOT_TIMESTAMP_MISSING", None
-    newest = max(valid_times)
+    usable_rows = [(index, item) for index, item in timed_rows if (item - now).total_seconds() <= 300]
+    usable_times = [item for _, item in usable_rows]
+    if not usable_times:
+        newest_future = min(item for _, item in timed_rows)
+        age_minutes = (now - newest_future).total_seconds() / 60
+        return None, f"SNAPSHOT_FROM_FUTURE: {age_minutes:.1f}m", newest_future.isoformat(timespec="seconds")
+    newest = max(usable_times)
     max_age = int(env.get("RESEARCH_SNAPSHOT_MAX_AGE_MINUTES", str(DEFAULT_SNAPSHOT_MAX_AGE_MINUTES)))
     age_minutes = (now - newest).total_seconds() / 60
-    if age_minutes < -5:
-        return None, f"SNAPSHOT_FROM_FUTURE: {age_minutes:.1f}m", newest.isoformat(timespec="seconds")
     if age_minutes > max_age:
         return None, f"SNAPSHOT_STALE: {age_minutes:.1f}m > {max_age}m", newest.isoformat(timespec="seconds")
-    return market_df, "OK", newest.isoformat(timespec="seconds")
+    usable_index = [index for index, item in usable_rows if now - item <= timedelta(minutes=max_age)]
+    return market_df.loc[usable_index].copy(), "OK", newest.isoformat(timespec="seconds")
 
 
 def select_market_sample(df: pd.DataFrame, limit: int) -> list[tuple[str, pd.Series]]:
@@ -368,6 +437,54 @@ def research_message(record: dict[str, Any], market_key: str) -> str:
     )
 
 
+def existing_summary_message(records: list[dict[str, Any]], market_key: str, slot: ResearchSlot) -> str:
+    lines = [
+        "[EXISTING SCANNER]" if slot.official_evaluation else "[INTRADAY MONITOR]",
+        "",
+        f"Market: {market_key}",
+        f"Phase: {slot.phase}",
+        f"Slot: {slot.key}",
+        f"Tracked: {len(records)}",
+        f"Reference Timestamp: {records[0].get('reference_timestamp') if records else 'DATA_UNAVAILABLE'}",
+        "",
+    ]
+    for record in records[:10]:
+        lines.append(
+            f"- {record.get('ticker')} · {record.get('existing_ai_decision')} · "
+            f"score {record.get('existing_ai_score')} · risk {record.get('existing_risk')} · "
+            f"price {record.get('reference_price')}"
+        )
+    if len(records) > 10:
+        lines.append(f"... +{len(records) - 10} more")
+    return "\n".join(lines)
+
+
+def research_summary_message(records: list[dict[str, Any]], market_key: str, slot: ResearchSlot) -> str:
+    lines = [
+        "[RESEARCH LAB]" if slot.official_evaluation else "[INTRADAY MONITOR]",
+        "",
+        f"Market: {market_key}",
+        f"Phase: {slot.phase}",
+        f"Slot: {slot.key}",
+        f"Tracked: {len(records)}",
+        f"Reference Timestamp: {records[0].get('reference_timestamp') if records else 'DATA_UNAVAILABLE'}",
+        "",
+    ]
+    changes = 0
+    for record in records[:10]:
+        if record.get("existing_ai_decision") != record.get("research_decision"):
+            changes += 1
+        lines.append(
+            f"- {record.get('ticker')} · Research {record.get('research_decision')} "
+            f"score {record.get('research_score')} · Existing {record.get('existing_ai_decision')} · "
+            f"risk {record.get('research_risk')}"
+        )
+    if len(records) > 10:
+        lines.append(f"... +{len(records) - 10} more")
+    lines.append(f"Decision Differences: {changes}")
+    return "\n".join(lines)
+
+
 def send_telegram(token: str, chat_id: str, text: str, timeout: int) -> tuple[bool, str]:
     if not token:
         return False, "TOKEN_MISSING"
@@ -395,66 +512,127 @@ def send_telegram(token: str, chat_id: str, text: str, timeout: int) -> tuple[bo
 
 
 def run_market_open(market_key: str, *, dry_run: bool = False, now: datetime | None = None) -> dict[str, Any]:
+    return run_snapshot_slot(market_key, "PRIMARY", dry_run=dry_run, now=now)
+
+
+def run_snapshot_slot(
+    market_key: str,
+    slot_key: str,
+    *,
+    dry_run: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     now = now or datetime.now(timezone.utc)
     env = load_env_files()
     config = load_config(env)
     schedule = MARKETS[market_key]
+    slot = next((item for item in SCHEDULE_SLOTS[market_key] if item.key == slot_key), None)
+    if slot is None:
+        return {"status": "SKIPPED", "market": market_key, "reason": f"UNKNOWN_SLOT:{slot_key}"}
+    if slot.phase == "CLOSE_EVALUATION":
+        return run_daily_close(market_key, dry_run=dry_run, now=now)
+
     local_now = now.astimezone(ZoneInfo(schedule.timezone))
     trading, trading_reason = is_trading_day(schedule, local_now.date(), env)
     if not trading:
-        return {"status": "SKIPPED", "market": market_key, "reason": trading_reason}
-
+        return {"status": "SKIPPED", "market": market_key, "slot": slot.key, "reason": trading_reason}
     market_df, validation, snapshot_time = validate_snapshot(config, schedule, now, env)
     if market_df is None:
-        append_log({"event": "open_skipped", "market": market_key, "reason": validation})
+        append_log({"event": "slot_skipped", "market": market_key, "slot": slot.key, "reason": validation})
         if not dry_run:
-            notify_failure(env, config, market_key, "OPEN", validation)
-        return {"status": "SKIPPED", "market": market_key, "reason": validation}
+            notify_failure(env, config, market_key, slot.phase, validation)
+        return {"status": "SKIPPED", "market": market_key, "slot": slot.key, "reason": validation}
 
     reference_timestamp = snapshot_time or utc_now_iso()
     trading_date = local_now.date().isoformat()
-    job_id = f"{market_key}_{trading_date}_{reference_timestamp}"
+    job_id = f"{market_key}_{slot.key}_{trading_date}"
     state = read_state()
     completed_jobs = state.setdefault("completed_jobs", {})
     if job_id in completed_jobs:
-        return {"status": "SKIPPED", "market": market_key, "reason": "DUPLICATE", "job_id": job_id}
+        return {"status": "SKIPPED", "market": market_key, "slot": slot.key, "reason": "DUPLICATE", "job_id": job_id}
 
     engine = ResearchEngine(config)
     lab = ComparisonLab(config)
+    limit_key = "RESEARCH_AUTO_PRIMARY_LIMIT" if slot.official_evaluation else "RESEARCH_AUTO_MONITORING_LIMIT"
+    default_limit = DEFAULT_PRIMARY_LIMIT if slot.official_evaluation else DEFAULT_MONITORING_LIMIT
     records = []
-    for category, row in select_market_sample(market_df, int(env.get("RESEARCH_AUTO_SAMPLE_LIMIT", DEFAULT_SAMPLE_LIMIT))):
+    for category, row in select_market_sample(market_df, int(env.get(limit_key, default_limit))):
         research = engine._build_result(row)
-        records.append(lab._build_record(job_id, category, row, research, reference_timestamp).to_dict())
+        record = lab._build_record(job_id, category, row, research, reference_timestamp).to_dict()
+        record.update(
+            {
+                "job_id": job_id,
+                "trading_date": trading_date,
+                "schedule_slot": slot.key,
+                "snapshot_type": slot.snapshot_type,
+                "official_evaluation": slot.official_evaluation,
+                "lookahead_guard": "fixed_snapshot_no_recalculation",
+            }
+        )
+        records.append(record)
     if not records:
-        append_log({"event": "open_skipped", "market": market_key, "reason": "NO_SAMPLE"})
-        return {"status": "SKIPPED", "market": market_key, "reason": "NO_SAMPLE"}
+        append_log({"event": "slot_skipped", "market": market_key, "slot": slot.key, "reason": "NO_SAMPLE"})
+        return {"status": "SKIPPED", "market": market_key, "slot": slot.key, "reason": "NO_SAMPLE"}
 
     if not dry_run:
+        target_store = lab.store if slot.official_evaluation else JsonlStore(MONITORING_FILE)
         for record in records:
-            lab.store.append(record)
+            target_store.append(record)
         market_token = env.get("MARKET_SCANNER_BOT_TOKEN", "").strip()
         market_chat = env.get("MARKET_SCANNER_CHAT_ID", "8749935590").strip() or "8749935590"
         research_token = config.telegram_bot_token
         research_chat = config.allowed_chat_id
-        existing_ok = 0
-        research_ok = 0
-        for record in records:
-            ok, _ = send_telegram(market_token, market_chat, existing_message(record, market_key), config.request_timeout)
-            existing_ok += int(ok)
-            ok, _ = send_telegram(research_token, research_chat, research_message(record, market_key), config.request_timeout)
-            research_ok += int(ok)
+        existing_ok, existing_status = send_telegram(
+            market_token,
+            market_chat,
+            existing_summary_message(records, market_key, slot),
+            config.request_timeout,
+        )
+        research_ok, research_status = send_telegram(
+            research_token,
+            research_chat,
+            research_summary_message(records, market_key, slot),
+            config.request_timeout,
+        )
         completed_jobs[job_id] = {
             "market": market_key,
+            "slot": slot.key,
+            "phase": slot.phase,
+            "snapshot_type": slot.snapshot_type,
             "trading_date": trading_date,
             "reference_timestamp": reference_timestamp,
             "records": len(records),
-            "existing_telegram_sent": existing_ok,
-            "research_telegram_sent": research_ok,
+            "existing_telegram_status": existing_status,
+            "research_telegram_status": research_status,
+            "existing_telegram_sent": int(existing_ok),
+            "research_telegram_sent": int(research_ok),
             "completed_at": utc_now_iso(),
         }
         write_state(state)
-    append_log({"event": "open_processed", "market": market_key, "job_id": job_id, "records": len(records), "dry_run": dry_run})
-    return {"status": "OK", "market": market_key, "job_id": job_id, "records": len(records), "dry_run": dry_run}
+    append_log(
+        {
+            "event": "slot_processed",
+            "market": market_key,
+            "slot": slot.key,
+            "job_id": job_id,
+            "records": len(records),
+            "snapshot_type": slot.snapshot_type,
+            "dry_run": dry_run,
+        }
+    )
+    return {
+        "status": "OK",
+        "market": market_key,
+        "slot": slot.key,
+        "snapshot_type": slot.snapshot_type,
+        "job_id": job_id,
+        "records": len(records),
+        "dry_run": dry_run,
+    }
+
+
+def run_monitoring_slot(market_key: str, slot_key: str, *, dry_run: bool = False, now: datetime | None = None) -> dict[str, Any]:
+    return run_snapshot_slot(market_key, slot_key, dry_run=dry_run, now=now)
 
 
 def run_daily_close(market_key: str, *, dry_run: bool = False, now: datetime | None = None) -> dict[str, Any]:
@@ -496,10 +674,11 @@ def run_due(*, dry_run: bool = False, now: datetime | None = None) -> list[dict[
     now = now or datetime.now(timezone.utc)
     env = load_env_files()
     results: list[dict[str, Any]] = []
-    for market_key, _, _ in due_open_markets(now, env):
-        results.append(run_market_open(market_key, dry_run=dry_run, now=now))
-    for market_key, _, _ in due_close_markets(now, env):
-        results.append(run_daily_close(market_key, dry_run=dry_run, now=now))
+    for market_key, _, slot, _ in due_slots(now, env):
+        if slot.phase == "CLOSE_EVALUATION":
+            results.append(run_daily_close(market_key, dry_run=dry_run, now=now))
+        else:
+            results.append(run_snapshot_slot(market_key, slot.key, dry_run=dry_run, now=now))
     if not results:
         append_log({"event": "no_due_jobs", "dry_run": dry_run})
     return results
@@ -521,6 +700,26 @@ def status(now: datetime | None = None) -> dict[str, Any]:
             "close_due": trading and in_window(local_now, schedule.close_time, schedule.close_delay_minutes, schedule.close_window_minutes),
             "open_time": schedule.open_time.strftime("%H:%M"),
             "close_time": schedule.close_time.strftime("%H:%M"),
+            "due_slots": [
+                {
+                    "slot": slot.key,
+                    "phase": slot.phase,
+                    "snapshot_type": slot.snapshot_type,
+                    "local_time": slot.local_time.strftime("%H:%M"),
+                }
+                for slot in SCHEDULE_SLOTS[market_key]
+                if trading and slot_due(local_now, slot)
+            ],
+            "schedule_slots": [
+                {
+                    "slot": slot.key,
+                    "phase": slot.phase,
+                    "snapshot_type": slot.snapshot_type,
+                    "local_time": slot.local_time.strftime("%H:%M"),
+                    "official_evaluation": slot.official_evaluation,
+                }
+                for slot in SCHEDULE_SLOTS[market_key]
+            ],
             "timezone": schedule.timezone,
         }
     return {
@@ -543,8 +742,9 @@ def parse_now(value: str | None) -> datetime | None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Research Lab market-open and daily comparison automation.")
-    parser.add_argument("action", choices=["run-due", "open", "daily", "status"])
+    parser.add_argument("action", choices=["run-due", "slot", "open", "monitor", "daily", "status"])
     parser.add_argument("--market", choices=sorted(MARKETS), default=None)
+    parser.add_argument("--slot", default=None)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--now", default=None, help="ISO timestamp for scheduler validation tests.")
     args = parser.parse_args()
@@ -562,10 +762,18 @@ def main() -> None:
     try:
         if args.action == "run-due":
             payload = run_due(dry_run=args.dry_run, now=now)
+        elif args.action == "slot":
+            if not args.market or not args.slot:
+                raise SystemExit("--market and --slot are required for slot")
+            payload = run_snapshot_slot(args.market, args.slot, dry_run=args.dry_run, now=now)
         elif args.action == "open":
             if not args.market:
                 raise SystemExit("--market is required for open")
             payload = run_market_open(args.market, dry_run=args.dry_run, now=now)
+        elif args.action == "monitor":
+            if not args.market or not args.slot:
+                raise SystemExit("--market and --slot are required for monitor")
+            payload = run_monitoring_slot(args.market, args.slot, dry_run=args.dry_run, now=now)
         elif args.action == "daily":
             if not args.market:
                 raise SystemExit("--market is required for daily")
