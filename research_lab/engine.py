@@ -284,7 +284,7 @@ class ResearchEngine:
             overheat_risk=overheat,
             continuation_potential=continuation,
             reasoning=reasoning,
-            data_timestamp=_text(row.get("mobile_intel_generated_at"), _text(row.get("data_generated_at"))),
+            data_timestamp=_text(row.get("mobile_intel_generated_at"), _text(row.get("data_generated_at"), _text(row.get("file_updated_at")))),
             entry_reference=_num(row.get("price")),
         )
 

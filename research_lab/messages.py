@@ -18,6 +18,8 @@ def _market_flag(market: str | None) -> str:
         return "🇰🇷"
     if text in {"미장", "US", "USA", "미국"}:
         return "🇺🇸"
+    if text in {"캐나다", "CANADA", "TSX", "TSXV"}:
+        return "🇨🇦"
     return "🌎"
 
 
@@ -27,6 +29,8 @@ def _market_key(market: str | None) -> str:
         return "KOREA"
     if text in {"미장", "US", "USA", "미국"}:
         return "US"
+    if text in {"캐나다", "CANADA", "TSX", "TSXV"}:
+        return "CANADA"
     return text or "MARKET"
 
 
@@ -37,6 +41,8 @@ def _format_price(value: object, market: str | None) -> str:
         return "DATA_UNAVAILABLE"
     if _market_key(market) == "KOREA":
         return f"₩{price:,.0f}"
+    if _market_key(market) == "CANADA":
+        return f"C${price:,.2f}"
     return f"${price:,.2f}"
 
 
@@ -44,13 +50,23 @@ def _format_time(value: object, market: str | None) -> str:
     text = str(value or "").strip()
     if not text:
         return "DATA_UNAVAILABLE"
+    timezone_suffixes = {
+        "PDT": "-07:00",
+        "PST": "-08:00",
+        "EDT": "-04:00",
+        "EST": "-05:00",
+        "KST": "+09:00",
+    }
+    parts = text.rsplit(" ", 1)
+    if len(parts) == 2 and parts[1] in timezone_suffixes:
+        text = f"{parts[0]}{timezone_suffixes[parts[1]]}"
     try:
         parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=ZoneInfo("UTC"))
         if _market_key(market) == "KOREA":
             return parsed.astimezone(ZoneInfo("Asia/Seoul")).strftime("%H:%M KST")
-        if _market_key(market) == "US":
+        if _market_key(market) in {"US", "CANADA"}:
             return parsed.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M ET")
     except ValueError:
         pass
