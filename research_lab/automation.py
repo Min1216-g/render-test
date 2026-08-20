@@ -30,6 +30,7 @@ TELEGRAM_MAX_LENGTH = 3900
 DEFAULT_PRIMARY_LIMIT = 40
 DEFAULT_MONITORING_LIMIT = 40
 DEFAULT_SNAPSHOT_MAX_AGE_MINUTES = 180
+DEFAULT_PRIMARY_RETRY_MINUTES = 60
 JOB_STATUS_PENDING = "PENDING"
 JOB_STATUS_RUNNING = "RUNNING"
 JOB_STATUS_COMPLETED = "COMPLETED"
@@ -237,9 +238,18 @@ def in_window(local_now: datetime, target: time, delay_minutes: int, window_minu
     return start <= local_now <= end
 
 
+def primary_retry_minutes() -> int:
+    try:
+        configured = int(os.getenv("RESEARCH_PRIMARY_RETRY_MINUTES", str(DEFAULT_PRIMARY_RETRY_MINUTES)))
+    except ValueError:
+        configured = DEFAULT_PRIMARY_RETRY_MINUTES
+    return max(20, min(90, configured))
+
+
 def slot_due(local_now: datetime, slot: ResearchSlot) -> bool:
     start = datetime.combine(local_now.date(), slot.local_time, tzinfo=local_now.tzinfo)
-    end = start + timedelta(minutes=slot.window_minutes)
+    minutes = primary_retry_minutes() if slot.key == "PRIMARY" else slot.window_minutes
+    end = start + timedelta(minutes=minutes)
     return start <= local_now <= end
 
 
@@ -250,13 +260,13 @@ def slot_window_end(local_now: datetime, slot: ResearchSlot) -> datetime:
 
 def primary_retry_deadline(local_now: datetime, slot: ResearchSlot) -> datetime:
     start = datetime.combine(local_now.date(), slot.local_time, tzinfo=local_now.tzinfo)
-    return start + timedelta(minutes=20)
+    return start + timedelta(minutes=primary_retry_minutes())
 
 
 def retry_times(slot: ResearchSlot) -> list[str]:
     attempts = []
     cursor = datetime.combine(date(2000, 1, 1), slot.local_time)
-    end = cursor + timedelta(minutes=20 if slot.key == "PRIMARY" else slot.window_minutes)
+    end = cursor + timedelta(minutes=primary_retry_minutes() if slot.key == "PRIMARY" else slot.window_minutes)
     while cursor <= end:
         attempts.append(cursor.strftime("%H:%M"))
         cursor += timedelta(minutes=5)

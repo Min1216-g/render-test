@@ -11,6 +11,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -35,6 +36,7 @@ STATE_FILE = BASE_DIR / ".market_scanner_update_state"
 VANCOUVER_TZ = ZoneInfo("America/Vancouver")
 VANCOUVER_RUN_TIMES = {(15, 0), (15, 30), (16, 0)}
 VANCOUVER_SKIP_WEEKDAYS = {5, 6}  # Saturday, Sunday. Python: Monday=0.
+SCHEDULE_DELAY_WINDOW_MINUTES = max(0, int(os.getenv("MARKET_SCANNER_SCHEDULE_DELAY_WINDOW_MINUTES", "10")))
 MIN_TOTAL_ROWS_FOR_APP_SYNC = 500
 MIN_OK_ROWS_FOR_APP_SYNC = 50
 REMOTE_UPLOAD_URL = os.getenv("MARKET_SCANNER_REMOTE_UPLOAD_URL", "https://market-scanner-api-fo2m.onrender.com/api/results/upload").strip()
@@ -42,22 +44,34 @@ REMOTE_API_TOKEN = os.getenv("MARKET_API_TOKEN", "").strip()
 LOCK_STALE_SECONDS = int(os.getenv("MARKET_SCANNER_UPDATE_LOCK_STALE_SECONDS", "7200"))
 
 
-def should_run_now(force: bool) -> tuple[bool, str]:
-    now = datetime.now(VANCOUVER_TZ)
+def scheduled_run_key(now: datetime) -> Optional[str]:
+    for hour, minute in sorted(VANCOUVER_RUN_TIMES, reverse=True):
+        scheduled = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        delay_minutes = (now - scheduled).total_seconds() / 60
+        if 0 <= delay_minutes <= SCHEDULE_DELAY_WINDOW_MINUTES:
+            return f"{scheduled:%Y-%m-%d-%H-%M}"
+    return None
+
+
+def should_run_now(force: bool, now: Optional[datetime] = None) -> Tuple[bool, str, str]:
+    now = (now or datetime.now(VANCOUVER_TZ)).astimezone(VANCOUVER_TZ)
     if force:
-        return True, f"force run at Vancouver {now:%Y-%m-%d %H:%M %Z}"
+        run_key = f"{now:%Y-%m-%d-%H-%M}"
+        return True, f"force run at Vancouver {now:%Y-%m-%d %H:%M %Z}", run_key
 
     if now.weekday() in VANCOUVER_SKIP_WEEKDAYS:
-        return False, f"skip on Vancouver {now:%A} {now:%Y-%m-%d %H:%M %Z}"
+        return False, f"skip on Vancouver {now:%A} {now:%Y-%m-%d %H:%M %Z}", ""
 
-    run_key = f"{now:%Y-%m-%d-%H-%M}"
+    run_key = scheduled_run_key(now)
+    if not run_key:
+        return False, f"skip at Vancouver {now:%Y-%m-%d %H:%M %Z}", ""
     last_run_key = STATE_FILE.read_text(encoding="utf-8").strip() if STATE_FILE.exists() else ""
-    if (now.hour, now.minute) in VANCOUVER_RUN_TIMES and last_run_key != run_key:
-        return True, f"scheduled run at Vancouver {now:%Y-%m-%d %H:%M %Z}"
-    return False, f"skip at Vancouver {now:%Y-%m-%d %H:%M %Z}"
+    if last_run_key != run_key:
+        return True, f"scheduled run at Vancouver {now:%Y-%m-%d %H:%M %Z} for {run_key}", run_key
+    return False, f"skip duplicate scheduled run {run_key} at Vancouver {now:%Y-%m-%d %H:%M %Z}", run_key
 
 
-def result_file_is_safe_for_app(path: Path, previous_rows: list[dict] | None = None) -> tuple[bool, str]:
+def result_file_is_safe_for_app(path: Path, previous_rows: Optional[List[Dict]] = None) -> Tuple[bool, str]:
     if not path.exists():
         return False, f"missing result file: {path}"
     try:
@@ -127,7 +141,7 @@ def process_is_alive(pid: int) -> bool:
         return True
 
 
-def acquire_update_lock() -> tuple[bool, str]:
+def acquire_update_lock() -> Tuple[bool, str]:
     now = time.time()
     while True:
         try:
@@ -159,7 +173,7 @@ def main() -> int:
     parser.add_argument("--force", action="store_true", help="Run regardless of KST schedule.")
     args = parser.parse_args()
 
-    run, reason = should_run_now(args.force)
+    run, reason, run_key = should_run_now(args.force)
     print(reason, flush=True)
     if not run:
         return 0
@@ -196,7 +210,7 @@ def main() -> int:
         shutil.copy2(RESULT_FILE, IOS_RESULT_FILE)
         print(f"synced {RESULT_FILE.name} -> {IOS_RESULT_FILE}", flush=True)
         upload_results_to_remote(RESULT_FILE)
-        STATE_FILE.write_text(datetime.now(VANCOUVER_TZ).strftime("%Y-%m-%d-%H-%M"), encoding="utf-8")
+        STATE_FILE.write_text(run_key or datetime.now(VANCOUVER_TZ).strftime("%Y-%m-%d-%H-%M"), encoding="utf-8")
     finally:
         LOCK_FILE.unlink(missing_ok=True)
 
