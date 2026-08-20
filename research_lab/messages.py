@@ -187,6 +187,10 @@ def _display_name(record: dict | None) -> str:
     return name or ticker or "현재 유효한 강세 후보 없음"
 
 
+def _ticker_key(record: dict) -> str:
+    return str(record.get("ticker") or "").strip().upper()
+
+
 def _scanner_picks(records: list[dict], market_key: str, now: datetime | None = None, limit: int = 5) -> list[dict]:
     bullish = {"BUY CANDIDATE", "WATCH"}
     candidates = [
@@ -235,6 +239,83 @@ def _research_picks(records: list[dict], market_key: str, now: datetime | None =
     )[:limit]
 
 
+def _rank_map(records: list[dict]) -> dict[str, int]:
+    return {_ticker_key(record): index for index, record in enumerate(records, start=1) if _ticker_key(record)}
+
+
+def _record_map(records: list[dict]) -> dict[str, dict]:
+    return {_ticker_key(record): record for record in records if _ticker_key(record)}
+
+
+def _candidate_lines(records: list[dict]) -> list[str]:
+    if not records:
+        return ["현재 유효한 강세 후보 없음"]
+    return [f"{index}. {_display_name(record)}" for index, record in enumerate(records, start=1)]
+
+
+def _comparison_lines(scanner: list[dict], research: list[dict]) -> list[str]:
+    scanner_ranks = _rank_map(scanner)
+    research_ranks = _rank_map(research)
+    scanner_by_ticker = _record_map(scanner)
+    research_by_ticker = _record_map(research)
+    scanner_tickers = set(scanner_ranks)
+    research_tickers = set(research_ranks)
+
+    both = sorted(
+        scanner_tickers & research_tickers,
+        key=lambda ticker: ((scanner_ranks[ticker] + research_ranks[ticker]) / 2, scanner_ranks[ticker], research_ranks[ticker]),
+    )
+    scanner_only = sorted(scanner_tickers - research_tickers, key=lambda ticker: scanner_ranks[ticker])
+    research_only = sorted(research_tickers - scanner_tickers, key=lambda ticker: research_ranks[ticker])
+
+    lines = ["[비교 결과]", "🏆 BOTH"]
+    if both:
+        for index, ticker in enumerate(both, start=1):
+            record = scanner_by_ticker.get(ticker) or research_by_ticker[ticker]
+            avg_rank = (scanner_ranks[ticker] + research_ranks[ticker]) / 2
+            lines.append(
+                f"{index}. {_display_name(record)} "
+                f"(scanner {scanner_ranks[ticker]}위 / research {research_ranks[ticker]}위 / 평균 {avg_rank:g}위)"
+            )
+    else:
+        lines.append("현재 유효한 공통 후보 없음")
+
+    lines.extend(["", "🔵 SCANNER ONLY"])
+    if scanner_only:
+        for index, ticker in enumerate(scanner_only, start=1):
+            lines.append(f"{index}. {_display_name(scanner_by_ticker[ticker])} (scanner {scanner_ranks[ticker]}위)")
+    else:
+        lines.append("현재 유효한 단독 후보 없음")
+
+    lines.extend(["", "🟣 RESEARCH ONLY"])
+    if research_only:
+        for index, ticker in enumerate(research_only, start=1):
+            lines.append(f"{index}. {_display_name(research_by_ticker[ticker])} (research {research_ranks[ticker]}위)")
+    else:
+        lines.append("현재 유효한 단독 후보 없음")
+    return lines
+
+
+def _market_comparison_block(label: str, records: list[dict], *, now: datetime | None = None, limit: int = 5) -> list[str]:
+    market_key = next((key for key, market_label, _ in MARKET_ORDER if market_label == label), "")
+    scanner = _scanner_picks(records, market_key, now, limit)
+    research = _research_picks(records, market_key, now, limit)
+    lines = [
+        "━━━━━━━━━━━━━━━━━━",
+        label,
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+        "[scanner.py]",
+        *_candidate_lines(scanner),
+        "",
+        "[Research AI]",
+        *_candidate_lines(research),
+        "",
+        *_comparison_lines(scanner, research),
+    ]
+    return lines
+
+
 def _market_block(label: str, records: list[dict], picker, *, now: datetime | None = None, limit: int = 5) -> list[str]:
     market_key = next((key for key, market_label, _ in MARKET_ORDER if market_label == label), "")
     lines = [label, ""]
@@ -280,12 +361,18 @@ def research_prediction_message(records: list[dict] | list[object], *, now: date
 
 def prediction_summary_message(records: list[dict] | list[object], *, now: datetime | None = None) -> str:
     records = _normalize_records(records)
-    return "\n\n".join(
-        [
-            scanner_prediction_message(records, now=now),
-            research_prediction_message(records, now=now),
-        ]
-    )
+    lines = [
+        "📡 Research Lab AI 비교 분석",
+        "기준: 최신 market_scanner_results.csv",
+        "※ Full Scan 미실행",
+        "",
+    ]
+    for _, label, aliases in MARKET_ORDER:
+        lines.extend(_market_comparison_block(label, _market_records(records, aliases), now=now))
+        lines.append("")
+    if lines and not lines[-1]:
+        lines.pop()
+    return "\n".join(lines)
 
 
 def compact_ai_comparison_message(record: dict) -> str:
